@@ -95,6 +95,23 @@ def win_clipboard_get():
     user32 = ctypes.windll.user32
     kernel32 = ctypes.windll.kernel32
     CF_UNICODETEXT = 13
+
+    # ВАЖНО (баг на 64-битной Windows): без явных argtypes/restype ctypes
+    # по умолчанию считает возвращаемое значение 32-битным (c_int) и ОБРЕЗАЕТ
+    # реальный 64-битный хэндл, который возвращает GetClipboardData. Дальше
+    # GlobalLock получает битый хэндл, тихо возвращает NULL, и функция без
+    # какой-либо ошибки отдаёт пустую строку - снаружи выглядит как "вставка
+    # просто не работает". Прописываем указателеразмерные типы явно.
+    user32.OpenClipboard.argtypes = [wintypes.HWND]
+    user32.OpenClipboard.restype = wintypes.BOOL
+    user32.GetClipboardData.argtypes = [wintypes.UINT]
+    user32.GetClipboardData.restype = wintypes.HANDLE
+    kernel32.GlobalLock.argtypes = [wintypes.HGLOBAL]
+    kernel32.GlobalLock.restype = ctypes.c_void_p
+    kernel32.GlobalUnlock.argtypes = [wintypes.HGLOBAL]
+    kernel32.GlobalUnlock.restype = wintypes.BOOL
+    user32.CloseClipboard.restype = wintypes.BOOL
+
     if not user32.OpenClipboard(None):
         return ""
     try:
@@ -123,6 +140,23 @@ def win_clipboard_set(text):
     CF_UNICODETEXT = 13
     GMEM_MOVEABLE = 0x0002
     GMEM_ZEROINIT = 0x0040
+
+    # Та же поправка на 64-битные хэндлы/указатели, что и в win_clipboard_get.
+    kernel32.GlobalAlloc.argtypes = [wintypes.UINT, ctypes.c_size_t]
+    kernel32.GlobalAlloc.restype = wintypes.HGLOBAL
+    kernel32.GlobalLock.argtypes = [wintypes.HGLOBAL]
+    kernel32.GlobalLock.restype = ctypes.c_void_p
+    kernel32.GlobalUnlock.argtypes = [wintypes.HGLOBAL]
+    kernel32.GlobalUnlock.restype = wintypes.BOOL
+    kernel32.GlobalFree.argtypes = [wintypes.HGLOBAL]
+    kernel32.GlobalFree.restype = wintypes.HGLOBAL
+    user32.OpenClipboard.argtypes = [wintypes.HWND]
+    user32.OpenClipboard.restype = wintypes.BOOL
+    user32.EmptyClipboard.restype = wintypes.BOOL
+    user32.SetClipboardData.argtypes = [wintypes.UINT, wintypes.HANDLE]
+    user32.SetClipboardData.restype = wintypes.HANDLE
+    user32.CloseClipboard.restype = wintypes.BOOL
+
     value = str(text or "")
     data = (value + "\x00").encode("utf-16-le")
     hmem = kernel32.GlobalAlloc(GMEM_MOVEABLE | GMEM_ZEROINIT, len(data))
