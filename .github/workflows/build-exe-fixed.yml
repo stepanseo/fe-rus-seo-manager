@@ -1,0 +1,43 @@
+name: Build Windows EXE (FE-RUS SEO Manager)
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - '**.py'
+      - '**.spec'
+      - 'requirements.txt'
+      - '.github/workflows/build-exe.yml'
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          pip install pyinstaller
+
+      - name: Build EXE
+        run: pyinstaller seo_url_workeeper.spec
+
+      - name: Publish build as GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: latest-build
+          name: "FE-RUS SEO Manager - последняя сборка"
+          body: "Автосборка из коммита ${{ github.sha }}. Скачайте exe в Assets ниже."
+          files: dist/*.exe
+          make_latest: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
