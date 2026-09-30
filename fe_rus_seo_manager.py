@@ -24,6 +24,7 @@ import time
 import threading
 import queue
 import webbrowser
+import types
 from pathlib import Path
 from urllib.parse import urlparse, urljoin
 from collections import Counter
@@ -1787,6 +1788,10 @@ class App(tk.Tk):
             # клавиши (не зависит от раскладки): 65=A, 67=C, 86=V, 88=X -
             # вызывает те же entry_copy/entry_paste/entry_cut/entry_select_all.
             widget.bind("<Key>", self.entry_key_by_keycode, add="+")
+            # Контекстное меню правой кнопкой - не зависит вообще ни от
+            # раскладки, ни от кода клавиши: напрямую дёргает те же функции
+            # копирования/вставки по клику мышью. Самый надёжный резерв.
+            self._add_entry_context_menu(widget)
 
         self.bind_class("Text", "<Control-a>", self.text_select_all)
         self.bind_class("Text", "<Control-A>", self.text_select_all)
@@ -1814,6 +1819,23 @@ class App(tk.Tk):
         e.widget.select_range(0, "end")
         e.widget.icursor("end")
         return "break"
+
+    def _add_entry_context_menu(self, widget):
+        fake_event = types.SimpleNamespace(widget=widget)
+        menu = tk.Menu(widget, tearoff=0)
+        menu.add_command(label="Вырезать", command=lambda: self.entry_cut(fake_event))
+        menu.add_command(label="Копировать", command=lambda: self.entry_copy(fake_event))
+        menu.add_command(label="Вставить", command=lambda: self.entry_paste(fake_event))
+        menu.add_separator()
+        menu.add_command(label="Выделить всё", command=lambda: self.entry_select_all(fake_event))
+
+        def show_menu(event):
+            try:
+                menu.tk_popup(event.x_root, event.y_root)
+            finally:
+                menu.grab_release()
+
+        widget.bind("<Button-3>", show_menu, add="+")
 
     def entry_key_by_keycode(self, e):
         """Резервная обработка Ctrl+A/C/V/X по физическому коду клавиши -
