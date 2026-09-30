@@ -1780,6 +1780,13 @@ class App(tk.Tk):
                 ("<Shift-Insert>", self.entry_paste),
             ):
                 widget.bind(seq, fn, add="+")
+            # <Control-c>/<Control-v>/... определяются Tk по СИМВОЛУ, который
+            # печатает клавиша - при русской раскладке физическая Ctrl+C/V/X/A
+            # часто не даёт нужный символ, и привязки выше просто не
+            # срабатывают. Добавляем резервный обработчик по ФИЗИЧЕСКОМУ коду
+            # клавиши (не зависит от раскладки): 65=A, 67=C, 86=V, 88=X -
+            # вызывает те же entry_copy/entry_paste/entry_cut/entry_select_all.
+            widget.bind("<Key>", self.entry_key_by_keycode, add="+")
 
         self.bind_class("Text", "<Control-a>", self.text_select_all)
         self.bind_class("Text", "<Control-A>", self.text_select_all)
@@ -1807,6 +1814,24 @@ class App(tk.Tk):
         e.widget.select_range(0, "end")
         e.widget.icursor("end")
         return "break"
+
+    def entry_key_by_keycode(self, e):
+        """Резервная обработка Ctrl+A/C/V/X по физическому коду клавиши -
+        не зависит от раскладки клавиатуры (см. комментарий в
+        setup_clipboard_shortcuts). Срабатывает, только если зажат Control
+        (e.state & 0x4) и код клавиши совпадает; иначе не мешает обычному
+        вводу текста."""
+        if not (e.state & 0x4):
+            return None
+        if e.keycode == 65:
+            return self.entry_select_all(e)
+        if e.keycode == 67:
+            return self.entry_copy(e)
+        if e.keycode == 86:
+            return self.entry_paste(e)
+        if e.keycode == 88:
+            return self.entry_cut(e)
+        return None
 
     def entry_copy(self, e):
         try:
