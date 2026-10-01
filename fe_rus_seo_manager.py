@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-FE-RUS SEO Manager v1.17
+FE-RUS SEO Manager v1.20
 
 Единое Windows-приложение:
 1. Категория - получает category_id, OCFilter options и значения.
@@ -458,6 +458,333 @@ def get_csrf(html):
     soup = BeautifulSoup(html, "html.parser")
     token = soup.find("input", {"name": "csrf_token"})
     return token.get("value", "") if token else ""
+
+
+def wordkeeper_query_variants(category, value):
+    """Формирует реальные поисковые запросы для одного значения OCFilter.
+
+    Один value = одна каноническая SEO-кандидатная страница, но для WordKeeper
+    допускается несколько вариантов поискового запроса. Это особенно важно для:
+    - Ст0 / Ст 0 / сталь 0;
+    - AISI 304 / AISI304 / аиси 304 / аиси304;
+    - буквенно-цифровых марок с/без пробела.
+
+    Результаты всех вариантов объединяются под одним canonical keyword.
+    """
+    category = re.sub(r"\s+", " ", str(category or "")).strip()
+    value = re.sub(r"\s+", " ", str(value or "")).strip()
+    if not category or not value:
+        return []
+
+    result = []
+    seen = set()
+
+    def add(v):
+        v = re.sub(r"\s+", " ", str(v or "")).strip(" ,;\t\r\n")
+        if not v:
+            return
+        key = norm(v)
+        if key not in seen:
+            seen.add(key)
+            result.append(v)
+
+    add(f"{category} {value}")
+    compact = re.sub(r"\s+", "", value)
+
+    # Сталь: Ст0 / Ст 0 / сталь 0 / ст 0.
+    m = re.fullmatch(r"(?i)ст\s*(.+)", value)
+    if m:
+        tail = m.group(1).strip()
+        if tail:
+            add(f"{category} Ст {tail}")
+            add(f"{category} ст {tail}")
+            add(f"{category} сталь {tail}")
+
+    # AISI может быть записано латиницей и кириллицей.
+    # Это именно варианты запроса, а не разные значения OCFilter.
+    m = re.fullmatch(r"(?i)(?:aisi|аиси)\s*([0-9]+[a-zа-яё]?)", value)
+    if m:
+        code = m.group(1)
+        # Сохраняем буквенный суффикс как в исходном значении.
+        add(f"{category} AISI {code}")
+        add(f"{category} AISI{code}")
+        add(f"{category} аиси {code}")
+        add(f"{category} аиси{code}")
+
+    # Если значение само содержит AISI/аиси внутри более сложной строки.
+    m = re.search(r"(?i)(aisi|аиси)\s*([0-9]+[a-zа-яё]?)", value)
+    if m:
+        code = m.group(2)
+        add(f"{category} AISI {code}")
+        add(f"{category} AISI{code}")
+        add(f"{category} аиси {code}")
+        add(f"{category} аиси{code}")
+
+    # Буквенный префикс + число: М1 -> М 1, АМг2 -> АМг 2, С355 -> С 355.
+    m = re.fullmatch(r"([A-Za-zА-Яа-яЁё]+)([0-9][A-Za-zА-Яа-яЁё0-9.,/-]*)", compact)
+    if m:
+        add(f"{category} {m.group(1)} {m.group(2)}")
+
+    # Начальные цифры + буквенная часть: 09Г2С -> 09 Г2С.
+    m = re.fullmatch(r"([0-9]+)([A-Za-zА-Яа-яЁё].*)", compact)
+    if m:
+        add(f"{category} {m.group(1)} {m.group(2)}")
+
+    # Х18Н10Т -> Х 18Н10Т.
+    m = re.fullmatch(r"([A-Za-zА-Яа-яЁё]+)([0-9]+)([A-Za-zА-Яа-яЁё].*)", compact)
+    if m:
+        add(f"{category} {m.group(1)} {m.group(2)}{m.group(3)}")
+
+    return result
+
+
+# -----------------------------------------------------------------------------
+# SERP PAGE CLASSIFICATION
+# -----------------------------------------------------------------------------
+
+SERP_CLASSIFIER_VERSION = "1.20"
+PRODUCT_PATH_MARKERS = (
+    "/product/", "/products/", "/item/", "/goods/", "/tovar/", "/offer/",
+    "/p/", "/detail/", "/produkt/", "/catalog/product/"
+)
+SEO_PATH_MARKERS = (
+    "/category/", "/categories/", "/catalog/", "/catalogue/", "/filter/",
+    "/filters/", "/marka/", "/brand/", "/tag/", "/tags/", "/razmer/",
+    "/size/", "/diametr/", "/diameter/", "/collection/", "/collections/",
+    "/list/", "/list-", "/shop/", "/catalogs/"
+)
+ARTICLE_PATH_MARKERS = (
+    "/blog/", "/article/", "/articles/", "/news/", "/novosti/", "/stati/",
+    "/statya/", "/journal/"
+)
+
+
+def _url_type_hint(url):
+    path = urlparse(str(url or "")).path.lower()
+    if any(x in path for x in ARTICLE_PATH_MARKERS):
+        return "ARTICLE", 7, 0
+    if any(x in path for x in PRODUCT_PATH_MARKERS):
+        return "PRODUCT", 7, 0
+    if any(x in path for x in SEO_PATH_MARKERS):
+        return "SEO_PAGE", 0, 6
+    # OpenCart-style product query URLs.
+    q = urlparse(str(url or "")).query.lower()
+    if "route=product/product" in q or "product_id=" in q:
+        return "PRODUCT", 8, 0
+    return "UNKNOWN", 0, 0
+
+
+def _jsonld_types(soup):
+    types = []
+    for script in soup.find_all("script", attrs={"type": re.compile(r"application/ld\+json", re.I)}):
+        raw = script.get_text(" ", strip=True)
+        if not raw:
+            continue
+        # Нам достаточно определить тип; строгий JSON не обязателен.
+        for m in re.finditer(r'"@type"\s*:\s*"?([^",}\]]+)', raw, re.I):
+            types.append(m.group(1).strip().lower())
+        for m in re.finditer(r'"@type"\s*:\s*\[([^\]]+)\]', raw, re.I):
+            types.extend(re.findall(r'"([^"\\]+)"', m.group(1)))
+    return set(types)
+
+
+def _classify_serp_page(session, url, title="", snippet="", keyword="", value=""):
+    """Определяет тип результата TOP-30.
+
+    Возвращает PRODUCT / SEO_PAGE / ARTICLE / OTHER / UNKNOWN.
+    Сначала используются URL-сигналы, затем HTML для неоднозначных страниц.
+    """
+    url = str(url or "").strip()
+    title = str(title or "").strip()
+    snippet = str(snippet or "").strip()
+    path = urlparse(url).path.lower()
+    hint, product_score, seo_score = _url_type_hint(url)
+    article_score = 7 if hint == "ARTICLE" else 0
+    signals = []
+
+    if hint == "PRODUCT":
+        signals.append("URL_PRODUCT")
+    elif hint == "SEO_PAGE":
+        signals.append("URL_CATALOG_FILTER")
+    elif hint == "ARTICLE":
+        signals.append("URL_ARTICLE")
+
+    # Сильные URL-сигналы не требуют обязательной загрузки страницы.
+    # Для неоднозначных URL HTML проверяем.
+    need_fetch = hint == "UNKNOWN" or (hint == "SEO_PAGE" and not any(x in path for x in ("/filter/", "/marka/", "/razmer/", "/diametr/", "/list-", "/tag/")))
+    fetched = False
+    http_status = ""
+    final_url = url
+    h1 = ""
+    breadcrumbs = ""
+    product_links = 0
+    filter_controls = 0
+    pagination = False
+    types = set()
+
+    if need_fetch:
+        try:
+            r = session.get(url, timeout=(4, 10), allow_redirects=True)
+            fetched = True
+            http_status = str(r.status_code)
+            final_url = r.url
+            if r.status_code == 200 and r.text:
+                html = r.text[:1800000]
+                soup = BeautifulSoup(html, "html.parser")
+                types = _jsonld_types(soup)
+                h1 = soup.find("h1").get_text(" ", strip=True) if soup.find("h1") else ""
+                crumb = soup.select('[class*="breadcrumb"], [class*="breadcrumbs"], nav[aria-label*="breadcrumb" i]')
+                if crumb:
+                    breadcrumbs = " | ".join(c.get_text(" ", strip=True) for c in crumb[:2])[:1000]
+
+                if any("product" in t.lower() for t in types):
+                    product_score += 10; signals.append("JSONLD_PRODUCT")
+                if any(t.lower() in {"productgroup", "product"} for t in types):
+                    product_score += 3
+                if any(t.lower() == "article" or t.lower().endswith("article") for t in types):
+                    article_score += 9; signals.append("JSONLD_ARTICLE")
+                if any(t.lower() in {"itemlist", "collectionpage", "searchresults"} for t in types):
+                    seo_score += 3; signals.append("JSONLD_LIST")
+
+                # Product microdata.
+                if soup.find(attrs={"itemtype": re.compile(r"schema\.org/(Product|ProductGroup)", re.I)}):
+                    product_score += 7; signals.append("MICRODATA_PRODUCT")
+
+                # Цена / SKU / артикул / корзина - сильные товарные признаки.
+                visible = soup.get_text(" ", strip=True).lower()
+                if re.search(r"(?:\bsku\b|\bmpn\b|артикул|код товара|product code)", visible, re.I):
+                    product_score += 2; signals.append("SKU_OR_ARTICLE")
+                if re.search(r"(?:в\s+корзин|добавить\s+в\s+корзин|купить|add\s+to\s+cart|buy now)", visible, re.I):
+                    product_score += 3; signals.append("CART_OR_BUY")
+                if re.search(r"(?:₽|руб\.?|цена|price)", visible, re.I):
+                    product_score += 2; signals.append("PRICE")
+
+                # Несколько товарных ссылок + фильтры/пагинация = каталог/SEO.
+                seen_links = set()
+                for a in soup.find_all("a", href=True):
+                    ah = a.get("href") or ""
+                    ap = urlparse(urljoin(final_url, ah)).path.lower()
+                    if any(x in ap for x in PRODUCT_PATH_MARKERS):
+                        seen_links.add(ap)
+                    cls = " ".join(a.get("class") or []).lower()
+                    if any(x in cls for x in ("product-card", "product-item", "catalog-item", "goods-item")):
+                        seen_links.add(ap)
+                    if len(seen_links) >= 25:
+                        break
+                product_links = len(seen_links)
+                if product_links >= 3:
+                    seo_score += 6; signals.append(f"MULTI_PRODUCT_LINKS:{product_links}")
+
+                inputs = soup.find_all(["select", "input", "button"])
+                for el in inputs:
+                    blob = (str(el.get("name") or "") + " " + str(el.get("id") or "") + " " + " ".join(el.get("class") or [])).lower()
+                    if any(x in blob for x in ("filter", "ocfilter", "manufacturer", "brand", "marka", "diametr", "razmer", "size")):
+                        filter_controls += 1
+                if filter_controls:
+                    seo_score += min(5, 2 + filter_controls // 3); signals.append(f"FILTER_CONTROLS:{filter_controls}")
+
+                pagination = bool(soup.select('[class*="pagination" i], a[rel="next"], link[rel="next"]')) or bool(re.search(r"(?:[?&]page=|/page/)", html, re.I))
+                if pagination:
+                    seo_score += 3; signals.append("PAGINATION")
+
+                if re.search(r"(?:\bblog\b|стать[яи]|новост|полезн|журнал)", (h1 + " " + breadcrumbs + " " + title).lower()):
+                    article_score += 3
+
+                if h1 and any(x in h1.lower() for x in ("каталог", "лист", "труба", "сетка", "металлопрокат")) and product_links >= 2:
+                    seo_score += 2; signals.append("CATALOG_H1")
+
+        except Exception as e:
+            signals.append("FETCH_ERROR:" + str(e)[:120])
+
+    # Если URL уже дал сильный сигнал, но HTML не загружали, учитываем title.
+    text_hint = " ".join([title, snippet, h1, breadcrumbs]).lower()
+    if re.search(r"(?:артикул|sku|купить|в\s+корзин|цена|руб\.?)", text_hint, re.I):
+        product_score += 1
+    if re.search(r"(?:каталог|фильтр|марка|размер|диаметр|товары|лист[ыа]?|трубы)", text_hint, re.I):
+        seo_score += 1
+
+    if article_score >= max(product_score, seo_score) + 4 and article_score >= 7:
+        page_type = "ARTICLE"
+        confidence = min(0.99, 0.60 + article_score / 30)
+    elif product_score >= 6 and product_score >= seo_score + 3:
+        page_type = "PRODUCT"
+        confidence = min(0.99, 0.58 + (product_score - seo_score) / 20)
+    elif seo_score >= 5 and seo_score >= product_score + 3:
+        page_type = "SEO_PAGE"
+        confidence = min(0.99, 0.58 + (seo_score - product_score) / 20)
+    elif hint in {"PRODUCT", "SEO_PAGE", "ARTICLE"}:
+        page_type = hint
+        confidence = 0.62
+    elif product_score > seo_score and product_score >= 4:
+        page_type = "PRODUCT"
+        confidence = 0.55
+    elif seo_score > product_score and seo_score >= 4:
+        page_type = "SEO_PAGE"
+        confidence = 0.55
+    elif article_score >= 5:
+        page_type = "ARTICLE"
+        confidence = 0.52
+    else:
+        page_type = "UNKNOWN"
+        confidence = 0.35
+
+    if page_type not in {"PRODUCT", "SEO_PAGE", "ARTICLE"}:
+        # Не удалось определить по HTML. Если путь очевидно товарный/SEO - не теряем сигнал.
+        if hint == "PRODUCT":
+            page_type = "PRODUCT"; confidence = max(confidence, 0.58)
+        elif hint == "SEO_PAGE":
+            page_type = "SEO_PAGE"; confidence = max(confidence, 0.58)
+        elif hint == "ARTICLE":
+            page_type = "ARTICLE"; confidence = max(confidence, 0.58)
+        else:
+            page_type = "OTHER"
+
+    return {
+        "url": url,
+        "final_url": final_url,
+        "page_type": page_type,
+        "confidence": round(float(confidence), 2),
+        "signals": "; ".join(dict.fromkeys(signals)),
+        "http_status": http_status,
+        "fetched": "1" if fetched else "0",
+        "h1": h1[:500],
+        "breadcrumbs": breadcrumbs[:1000],
+        "product_links": product_links,
+        "filter_controls": filter_controls,
+        "pagination": "1" if pagination else "0",
+        "classifier_version": SERP_CLASSIFIER_VERSION,
+    }
+
+
+def load_serp_classification_cache(path):
+    path = Path(path)
+    if not path.exists():
+        return {}
+    try:
+        df = pd.read_csv(path, sep=";", encoding="utf-8-sig", dtype=str).fillna("")
+        if "url" not in df.columns:
+            return {}
+        cache = {}
+        for _, r in df.iterrows():
+            if str(r.get("classifier_version", "")) != SERP_CLASSIFIER_VERSION:
+                continue
+            u = str(r.get("url", "")).strip()
+            if u:
+                cache[u.rstrip("/")] = r.to_dict()
+        return cache
+    except Exception:
+        return {}
+
+
+def save_serp_classification_cache(cache, path):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if not cache:
+        return
+    df = pd.DataFrame(list(cache.values()))
+    preferred = ["url", "final_url", "page_type", "confidence", "signals", "http_status", "fetched", "h1", "breadcrumbs", "product_links", "filter_controls", "pagination", "classifier_version"]
+    cols = [c for c in preferred if c in df.columns] + [c for c in df.columns if c not in preferred]
+    df[cols].to_csv(path, sep=";", index=False, encoding="utf-8-sig", lineterminator="\n")
 
 
 def parse_top30(html, keyword):
@@ -1130,6 +1457,112 @@ def post_ocfilter_page(session, token, row, category_id, language_ids, has_statu
     return False, f"Неожиданный ответ: {r.url} | {text[-1000:]}"
 
 
+def matching_value_variants(value):
+    """Безопасные варианты значения для сопоставления URL/H1 конкурента.
+
+    Включает реальные варианты транслитерации и записи AISI/аиси, но не считает
+    разные марки разными значениями.
+    """
+    raw = norm(value).replace("×", "x")
+    vals = set()
+    if raw:
+        vals.add(raw)
+        vals.add(slugify(raw))
+        vals.add(slugify(raw).replace("-", ""))
+
+    # AISI <-> аиси.
+    m = re.fullmatch(r"(?i)(aisi|аиси)\s*([0-9]+[a-zа-яё]?)", raw)
+    if m:
+        code = m.group(2)
+        for prefix in ("aisi", "аиси"):
+            vals.add(f"{prefix} {code}")
+            vals.add(f"{prefix}{code}")
+            vals.add(slugify(f"{prefix} {code}"))
+            vals.add(slugify(f"{prefix} {code}").replace("-", ""))
+
+    # Варианты транслитерации. Генерируем только ограниченный набор.
+    base = slugify(raw)
+    variants = {base}
+    substitutions = [
+        ("ya", ("ja", "ia")),
+        ("yu", ("ju", "iu")),
+        ("kh", ("h", "x")),
+        ("h", ("kh", "x")),
+        ("ts", ("c",)),
+        ("ch", ("c",)),
+        ("sch", ("shch",)),
+        ("zh", ("j",)),
+        ("j", ("i", "y")),
+        ("i", ("j",)),
+    ]
+    for src, alts in substitutions:
+        current = list(variants)
+        for s in current:
+            if src not in s:
+                continue
+            for alt in alts:
+                variants.add(s.replace(src, alt, 1))
+                if len(variants) >= 64:
+                    break
+            if len(variants) >= 64:
+                break
+        if len(variants) >= 64:
+            break
+    vals.update(variants)
+    vals.update(v.replace("-", "") for v in variants)
+    return {str(v).lower() for v in vals if str(v).strip()}
+
+
+def value_in_text(value, text):
+    if not text or value is None:
+        return False
+    variants = matching_value_variants(value)
+    original = norm(text).replace("×", "x").replace("х", "x")
+    slug = slugify(norm(text).replace("×", "x"))
+    compact = re.sub(r"[^a-z0-9а-я]+", "", original)
+    compact_slug = re.sub(r"[^a-z0-9]+", "", slug)
+    for v in variants:
+        vv = re.sub(r"[^a-z0-9а-я]+", "", str(v).lower())
+        if not vv:
+            continue
+        if vv.isdigit():
+            if re.search(rf"(?<!\d){re.escape(vv)}(?!\d)", original) or re.search(rf"(?<!\d){re.escape(vv)}(?!\d)", slug):
+                return True
+        elif vv in compact or vv in compact_slug:
+            return True
+    # Для буквенно-цифровых значений с пробелами: ст 0 == ст0.
+    vt = set(re.findall(r"[a-zа-я0-9]+", norm(value)))
+    tt = set(re.findall(r"[a-zа-я0-9]+", original))
+    if len(vt) > 1 and vt.issubset(tt):
+        return True
+    return False
+
+
+def promotion_type_for_counts(product_domains, seo_domains, article_domains, unknown_domains):
+    """Итоговый тип продвижения для одного поискового запроса.
+
+    Считаем независимые домены, а не количество URL. Это защищает от ситуации,
+    когда один сайт отдаёт много карточек товара и искусственно перевешивает
+    интент.
+    """
+    p = int(product_domains or 0)
+    s = int(seo_domains or 0)
+    total = p + s
+    if total == 0:
+        if article_domains:
+            return "ИНФОРМАЦИОННАЯ"
+        return "НЕДОСТАТОЧНО ДАННЫХ"
+    if p >= 2 and p >= s * 1.5 and p > s:
+        return "ТОВАР"
+    if s >= 2 and s >= p * 1.5 and s > p:
+        return "SEO-СТРАНИЦА"
+    if p >= 2 and s == 0:
+        return "ТОВАР"
+    if s >= 2 and p == 0:
+        return "SEO-СТРАНИЦА"
+    return "СМЕШАННЫЙ"
+
+
 # -----------------------------------------------------------------------------
 # PIPELINE
 # -----------------------------------------------------------------------------
@@ -1172,6 +1605,10 @@ class Pipeline:
                 # не доверяем случайному category_id из публичного HTML.
                 cid = ""
                 self.log("Category ID: точный ID через OpenCart не найден - публичный ID не используется")
+        # Для WordKeeper используем русское название из H1, а не slug URL.
+        # Например: «лист рифленый оцинкованный ст0», а не
+        # «list riflenyj stal otsinkovannaya Ст0».
+        search_category = page_label or cat
         rows = []
         for o in opts:
             for v in o["values"]:
@@ -1179,7 +1616,7 @@ class Pipeline:
                     continue
                 alias = value_alias(o, v)
                 rows.append({
-                    "keyword": f"{cat} {v['name']}",
+                    "keyword": f"{search_category} {v['name']}",
                     "category": cat,
                     "category_id": cid,
                     "filter": o["name"],
@@ -1197,23 +1634,27 @@ class Pipeline:
                 })
         self.log(f"Категория: {cat}")
         self.log(f"Название категории (H1): {page_label or 'не найдено'}")
+        self.log(f"WordKeeper категория: {search_category}")
         self.log(f"Category ID: {cid or 'не найден'}")
         self.log(f"Фильтров: {len(opts)}")
         self.log(f"Значений: {len(rows)}")
-        return {"url": r.url, "category": cat, "category_id": cid, "options": opts, "rows": rows}
+        return {"url": r.url, "category": cat, "search_category": search_category, "category_id": cid, "options": opts, "rows": rows}
 
-    def merge_analysis(self, res, topdf):
-        """Сопоставление TOP-30 с вариантами OCFilter.
+    def merge_analysis(self, res, topdf, progress=None, stop_event=None, cache_path=None):
+        """Сопоставляет TOP-30 с OCFilter и определяет тип продвижения.
 
-        ВАЖНО: конкурентный filter URL засчитывается только тогда, когда
-        сам URL/заголовок явно подтверждает ИМЕННО текущий value.
+        Для каждого URL TOP-30 определяется тип страницы:
+        PRODUCT / SEO_PAGE / ARTICLE / OTHER.
+        Затем по независимым доменам определяется promotion_type:
+        ТОВАР / SEO-СТРАНИЦА / СМЕШАННЫЙ / ИНФОРМАЦИОННАЯ / НЕДОСТАТОЧНО ДАННЫХ.
 
-        Раньше было достаточно, чтобы URL выглядел как filter URL. Из-за этого
-        для «ASTM 301» могли засчитываться, например, фильтр толщины 0.8 мм
-        и фильтр размера 1500x3000. Теперь такие URL не дают сигнал CREATE.
+        CREATE разрешается только для SEO-СТРАНИЦЫ и только при наличии
+        минимум двух независимых подтвержденных SEO-конкурентов, которые
+        действительно соответствуют текущему value.
         """
         if topdf is None or topdf.empty:
             for x in res["rows"]:
+                x["promotion_type"] = "НЕДОСТАТОЧНО ДАННЫХ"
                 x["status"] = "REVIEW"
                 x["reason"] = "TOP-30 не загружен"
             return res
@@ -1226,6 +1667,7 @@ class Pipeline:
 
         category = str(res.get("category") or "").strip()
         category_slug = slugify(category)
+        category_slug_variants = [v for v in matching_value_variants(category) if re.fullmatch(r"[a-z0-9-]+", str(v)) and len(str(v)) >= 4]
         category_tokens = [t for t in category_slug.split("-") if len(t) >= 3]
         generic = {
             "truba","truby","list","lenta","krug","krugi","kruglyi","kruglaya",
@@ -1236,7 +1678,6 @@ class Pipeline:
 
         def row_text(rr):
             vals = []
-            # Берём title/name/snippet/description, если они есть.
             for col in topdf.columns:
                 name = str(col).lower()
                 if any(k in name for k in ("title", "name", "snippet", "description", "заголов", "опис")):
@@ -1245,80 +1686,10 @@ class Pipeline:
                         vals.append(v)
             return " ".join(vals)
 
-        def compact_tokens(text):
-            """Токены для точного сравнения значения в URL/тексте."""
-            s = norm(text)
-            s = s.replace("×", "x").replace("х", "x")
-            s = s.replace("ё", "е")
-            # Сохраняем и исходные словесные куски, и slug-представление.
-            raw = re.findall(r"[a-zа-я0-9]+", s)
-            slug = slugify(text).replace("-", " ").split()
-            return set(raw + slug)
-
-        def value_variants(value):
-            """Набор безопасных вариантов одного значения для URL.
-
-            В частности, 08Х17Т встречается как 08h17t и 08kh17t.
-            Это НЕ таблица аналогов марок: только разные записи одного и того же
-            буквенного значения.
-            """
-            raw = norm(value).replace("×", "x")
-            vals = set()
-            if raw:
-                vals.add(raw)
-                vals.add(slugify(raw))
-                vals.add(slugify(raw).replace("-", ""))
-            sl = slugify(raw)
-            if sl:
-                vals.add(sl)
-                vals.add(sl.replace("-", ""))
-                if "h" in sl:
-                    vals.add(sl.replace("h", "kh"))
-                    vals.add(sl.replace("h", "kh").replace("-", ""))
-                if "kh" in sl:
-                    vals.add(sl.replace("kh", "h"))
-                    vals.add(sl.replace("kh", "h").replace("-", ""))
-            return {v for v in vals if v}
-
-        def exact_value_in_text(value, text):
-            """Проверяет именно value, а не случайное вхождение части строки."""
-            if not text or value is None:
-                return False
-            variants = value_variants(value)
-            if not variants:
-                return False
-
-            original = norm(text).replace("×", "x").replace("х", "x")
-            slug = slugify(original)
-            compact = re.sub(r"[^a-z0-9а-я]+", "", original)
-            compact_slug = re.sub(r"[^a-z0-9]+", "", slug)
-
-            # Сначала точные словесные/slug совпадения.
-            for v in variants:
-                vv = re.sub(r"[^a-z0-9а-я]+", "", v.lower())
-                if not vv:
-                    continue
-                # Для чисел обязательно границы, чтобы 3 не совпадало с 30/13.
-                if vv.isdigit():
-                    if re.search(rf"(?<!\d){re.escape(vv)}(?!\d)", original):
-                        return True
-                    if re.search(rf"(?<!\d){re.escape(vv)}(?!\d)", slug):
-                        return True
-                else:
-                    if vv in compact or vv in compact_slug:
-                        return True
-
-            # Дополнительная проверка составных значений по токенам.
-            vt = compact_tokens(value)
-            tt = compact_tokens(text)
-            if len(vt) > 1 and vt.issubset(tt):
-                return True
-            return False
-
         def score_url(url, title, keyword):
             path_slug = re.sub(r"[^a-z0-9а-яё]+", "-", urlparse(url).path.lower()).strip("-")
             score = 0
-            if category_slug and category_slug in path_slug:
+            if any(v and v in path_slug for v in category_slug_variants):
                 score += 100
             score += sum(20 for t in category_tokens if t in path_slug)
             qslug = slugify(keyword)
@@ -1329,6 +1700,76 @@ class Pipeline:
                 score += min(sum(1 for t in category_tokens if t in ts), 3) * 10
             return score
 
+        # Загружаем постоянный кэш классификации URL.
+        if cache_path is None:
+            cache_path = Path(os.getcwd()) / "seo_serp_page_classification.csv"
+        cache = load_serp_classification_cache(cache_path)
+        session = http_session()
+        page_map = {}
+
+        # Собираем только URL, реально относящиеся к текущим canonical keywords.
+        canonical_keywords = [str(x.get("keyword", "")).strip() for x in res.get("rows", []) if str(x.get("keyword", "")).strip()]
+        keyword_set = {norm(k) for k in canonical_keywords}
+        relevant = topdf[topdf[kc].astype(str).str.strip().str.lower().isin(keyword_set)].copy()
+        if relevant.empty:
+            # Совместимость с CSV, где keyword мог отличаться пробелами/регистром.
+            relevant = topdf[topdf[kc].astype(str).str.lower().apply(lambda z: any(norm(k) in norm(z) for k in canonical_keywords))].copy()
+
+        unique_urls = []
+        seen_urls = set()
+        for _, rr in relevant.iterrows():
+            u = str(rr.get(uc, "")).strip()
+            if not u.startswith("http"):
+                continue
+            key = u.rstrip("/")
+            if key in seen_urls:
+                continue
+            seen_urls.add(key)
+            unique_urls.append((u, str(rr.get("title", "")), str(rr.get("snippet", ""))))
+
+        total_urls = len(unique_urls)
+        new_classified = 0
+        if progress:
+            progress(f"Классификация TOP-30: уникальных URL {total_urls} | кэш: {len(cache)}")
+
+        for idx, (u, title, snippet) in enumerate(unique_urls, 1):
+            if stop_event is not None and stop_event.is_set():
+                break
+            key = u.rstrip("/")
+            if key in cache:
+                page_map[key] = cache[key]
+                continue
+            item = _classify_serp_page(session, u, title, snippet)
+            cache[key] = item
+            page_map[key] = item
+            new_classified += 1
+            if progress and (new_classified == 1 or new_classified % 10 == 0):
+                progress(f"Классификация URL: {idx}/{total_urls} | новых {new_classified} | {item.get('page_type')} | {u}")
+            # Сохраняем регулярно, чтобы остановка/сбой не потеряли работу.
+            if new_classified % 10 == 0:
+                save_serp_classification_cache(cache, cache_path)
+
+        save_serp_classification_cache(cache, cache_path)
+
+        # Добавляем классификацию к исходному TOP-30 DataFrame для полного XLSX.
+        classification_cols = ["page_type","page_confidence","page_signals","page_http_status","page_fetched","page_h1","page_breadcrumbs"]
+        for col in classification_cols:
+            if col not in topdf.columns:
+                topdf[col] = ""
+        for idx, rr in topdf.iterrows():
+            u = str(rr.get(uc, "")).strip().rstrip("/")
+            info = page_map.get(u) or cache.get(u)
+            if not info:
+                continue
+            topdf.at[idx, "page_type"] = info.get("page_type", "")
+            topdf.at[idx, "page_confidence"] = info.get("confidence", "")
+            topdf.at[idx, "page_signals"] = info.get("signals", "")
+            topdf.at[idx, "page_http_status"] = info.get("http_status", "")
+            topdf.at[idx, "page_fetched"] = info.get("fetched", "")
+            topdf.at[idx, "page_h1"] = info.get("h1", "")
+            topdf.at[idx, "page_breadcrumbs"] = info.get("breadcrumbs", "")
+
+        # Повторяем строки анализа.
         for x in res["rows"]:
             q = norm(x["keyword"])
             rows = topdf[topdf[kc].astype(str).str.strip().str.lower() == q].copy()
@@ -1340,50 +1781,80 @@ class Pipeline:
             filter_domains = set()
             landing_urls = []
             landing_domains = set()
-            fe_filter = False
             rejected_filter_urls = []
+            product_urls = []
+            product_domains = set()
+            seo_urls = []
+            seo_domains = set()
+            article_urls = []
+            article_domains = set()
+            other_urls = []
+            unknown_domains = set()
+            fe_filter = False
 
+            seen_result_urls = set()
             for _, rr in rows.iterrows():
                 u = str(rr.get(uc, "")).strip()
                 if not u.startswith("http"):
                     continue
+                uk = u.rstrip("/")
+                if uk in seen_result_urls:
+                    continue
+                seen_result_urls.add(uk)
                 d = (str(rr.get(dc, "")) if dc else urlparse(u).netloc).lower().split(":")[0].removeprefix("www.")
                 if d in {"word-keeper.ru", "yandex.ru"} or "xtool.ru" in u.lower():
                     continue
 
+                info = page_map.get(uk) or cache.get(uk) or {}
+                ptype = str(info.get("page_type") or "UNKNOWN")
                 title = row_text(rr)
-                path = urlparse(u).path.lower()
+                page_text = " ".join([
+                    u,
+                    title,
+                    str(info.get("h1", "")),
+                    str(info.get("breadcrumbs", "")),
+                ])
                 is_our = d == "fe-rus.ru" or d.endswith(".fe-rus.ru")
-                is_filter = any(z in path for z in (
+                path = urlparse(u).path.lower()
+                is_filter_url = any(z in path for z in (
                     "/filter/", "/diametr/", "/diameter/", "/razmer/", "/size/",
-                    "filter-", "diametr-", "diameter-", "razmer-", "size-"
-                ))
+                    "filter-", "diametr-", "diameter-", "razmer-", "size-", "/marka/"
+                )) or ptype == "SEO_PAGE"
+                value_match = value_in_text(value, page_text)
 
-                # Для нашего сайта достаточно обнаружить соответствующий filter URL.
-                if is_our:
-                    if is_filter and exact_value_in_text(value, path + " " + title):
-                        fe_filter = True
+                if ptype == "PRODUCT":
+                    product_urls.append(u)
+                    product_domains.add(d)
+                    continue
+                if ptype == "ARTICLE":
+                    article_urls.append(u)
+                    article_domains.add(d)
+                    continue
+                if ptype == "SEO_PAGE":
+                    seo_urls.append(u)
+                    seo_domains.add(d)
+                    if value_match:
+                        landing_urls.append(u)
+                        landing_domains.add(d)
+                        if is_filter_url:
+                            if is_our:
+                                fe_filter = True
+                            else:
+                                filter_urls.append((score_url(u, title, x.get("keyword", "")), d, u))
                     continue
 
-                score = score_url(u, title, x.get("keyword", ""))
-                if score < 20:
-                    continue
+                if ptype in {"UNKNOWN", "OTHER"}:
+                    other_urls.append(u)
+                    unknown_domains.add(d)
+                    # Старый URL-only сигнал оставляем как fallback, но не считаем его
+                    # сильным конкурентом без подтверждения типа страницы.
+                    if is_filter_url and value_match and not is_our:
+                        filter_urls.append((score_url(u, title, x.get("keyword", "")), d, u))
+                    elif value_match and not is_our:
+                        landing_urls.append(u)
+                        landing_domains.add(d)
 
-                # КЛЮЧЕВОЕ ПРАВИЛО:
-                # filter URL можно засчитывать только при точном соответствии value.
-                if is_filter:
-                    if exact_value_in_text(value, path + " " + title):
-                        filter_urls.append((score, d, u))
-                    else:
-                        rejected_filter_urls.append(u)
-                else:
-                    # Landing URL тоже сохраняем только если он подтверждает value.
-                    if exact_value_in_text(value, path + " " + title):
-                        if d not in landing_domains:
-                            landing_domains.add(d)
-                            landing_urls.append(u)
-
-            # Один домен = один конкурентный сигнал.
+            # Один домен = один сигнал.
             filter_urls.sort(key=lambda z: (-z[0], z[1], z[2]))
             unique_filter_urls = []
             for score, d, u in filter_urls:
@@ -1391,18 +1862,38 @@ class Pipeline:
                     filter_domains.add(d)
                     unique_filter_urls.append(u)
 
-            # Filter URL также является landing URL для внешнего генератора.
+            # SEO URL без обязательного exact value участвуют в определении интента,
+            # но CREATE даём только по exact-value конкурентам.
+            unique_seo_urls = []
+            seen_seo_domains = set()
+            for u in seo_urls:
+                d = urlparse(u).netloc.lower().split(":")[0].removeprefix("www.")
+                if d not in seen_seo_domains:
+                    seen_seo_domains.add(d)
+                    unique_seo_urls.append(u)
+
             for u in unique_filter_urls:
                 if u not in landing_urls:
                     landing_urls.append(u)
 
-            high = len(filter_domains)
-            x["fe_rus_filter"] = fe_filter
+            promotion = promotion_type_for_counts(
+                len(product_domains), len(seo_domains), len(article_domains), len(unknown_domains)
+            )
+
+            x["promotion_type"] = promotion
+            x["product_count"] = len(product_urls)
+            x["product_domains_count"] = len(product_domains)
+            x["seo_page_count"] = len(seo_urls)
+            x["seo_domains_count"] = len(seo_domains)
+            x["article_count"] = len(article_urls)
+            x["article_domains_count"] = len(article_domains)
+            x["other_count"] = len(other_urls)
+            x["unknown_domains_count"] = len(unknown_domains)
             x["filter_count"] = len(unique_filter_urls)
-            x["filter_domains_count"] = high
-            x["relevant_competitor_count"] = len(filter_domains | landing_domains)
+            x["filter_domains_count"] = len(filter_domains)
+            x["fe_rus_filter"] = fe_filter
             x["competitor_filter_urls"] = " | ".join(unique_filter_urls)
-            x["competitor_landing_urls"] = " | ".join(landing_urls)
+            x["competitor_landing_urls"] = " | ".join(dict.fromkeys(landing_urls))
             x["rejected_filter_urls"] = " | ".join(dict.fromkeys(rejected_filter_urls))
             for i in range(1, 6):
                 x[f"competitor_{i}"] = unique_filter_urls[i - 1] if len(unique_filter_urls) >= i else ""
@@ -1410,22 +1901,36 @@ class Pipeline:
             if fe_filter:
                 x["status"] = "EXISTS"
                 x["reason"] = "FE-RUS уже имеет filter URL для этого значения в TOP-30"
-            elif high >= 2:
-                x["status"] = "CREATE"
-                x["reason"] = f"{high} независимых конкурентов с точным filter URL для значения «{value}»"
-            elif high == 1:
+            elif promotion == "ТОВАР":
+                x["status"] = "SKIP"
+                x["reason"] = f"Товарный интент: PRODUCT-доменов={len(product_domains)}, SEO-доменов={len(seo_domains)}"
+            elif promotion == "СМЕШАННЫЙ":
                 x["status"] = "REVIEW"
-                x["reason"] = f"только 1 независимый конкурент с точным filter URL для значения «{value}»"
+                x["reason"] = f"Смешанный интент: PRODUCT-доменов={len(product_domains)}, SEO-доменов={len(seo_domains)}"
+            elif promotion == "ИНФОРМАЦИОННАЯ":
+                x["status"] = "SKIP"
+                x["reason"] = f"Информационный интент: ARTICLE-доменов={len(article_domains)}"
+            elif promotion == "НЕДОСТАТОЧНО ДАННЫХ":
+                x["status"] = "REVIEW"
+                x["reason"] = "Не удалось надежно определить товарный/каталожный интент TOP-30"
+            elif len(filter_domains) >= 2:
+                x["status"] = "CREATE"
+                x["reason"] = f"SEO-интент + {len(filter_domains)} независимых конкурентов с подтвержденным filter URL для значения «{value}»"
+            elif len(filter_domains) == 1:
+                x["status"] = "REVIEW"
+                x["reason"] = f"SEO-интент, но только 1 независимый конкурент с подтвержденным filter URL для значения «{value}»"
+            elif len(seo_domains) >= 2:
+                x["status"] = "REVIEW"
+                x["reason"] = f"SEO-интент подтвержден {len(seo_domains)} доменами, но точных filter URL недостаточно для CREATE"
+            elif len(landing_domains) >= 1:
+                x["status"] = "REVIEW"
+                x["reason"] = f"SEO-интент, найдено посадочных доменов={len(landing_domains)}, но недостаточно точных filter-конкурентов"
             else:
-                # Наличие обычных посадочных страниц может быть полезно для ручного REVIEW,
-                # но само по себе НЕ даёт CREATE.
-                if landing_domains:
-                    x["status"] = "REVIEW"
-                    x["reason"] = f"нет 2 точных filter-конкурентов; найдено посадочных доменов: {len(landing_domains)}"
-                else:
-                    x["status"] = "SKIP"
-                    x["reason"] = "нет точных подтвержденных конкурирующих filter URL для значения"
+                x["status"] = "SKIP"
+                x["reason"] = "SEO-интент не подтвержден независимыми каталожными/filter-конкурентами"
 
+        if progress:
+            progress("Классификация TOP-30 завершена.")
         return res
 
     def check_urls(self, res):
@@ -1562,12 +2067,16 @@ def generator_rows(res):
         # URL = 404 (страницы нет) и OCFilter = READY (категория/alias проверены).
         if x.get("status") != "CREATE":
             continue
+        # Внешний генератор получает только SEO-посадочные, не товарный интент.
+        if x.get("promotion_type") != "SEO-СТРАНИЦА":
+            continue
         if x.get("url_status") not in ("READY_FOR_OCFILTER", "HTTP_404"):
             continue
         if x.get("oc_status") != "READY":
             continue
         row = {
             "keyword": x.get("keyword", ""),
+            "promotion_type": x.get("promotion_type", ""),
             "category": x.get("category", ""),
             "category_id": x.get("oc_category_id") or x.get("category_id", ""),
             "filter": x.get("filter", ""),
@@ -1618,15 +2127,21 @@ def export_excel(res, path, topdf=None):
     ws = wb.active; ws.title = "SUMMARY"
     c = Counter(x.get("status", "") for x in res.get("rows", []))
     ready = len(generator_rows(res))
+    promo = Counter(x.get("promotion_type", "") for x in res.get("rows", []))
     summary = [
         ("Категория", res.get("category", "")), ("Category ID", res.get("category_id", "")),
         ("URL", res.get("url", "")), ("Фильтров", len(res.get("options", []))),
         ("Вариантов", len(res.get("rows", []))), ("ГОТОВО ДЛЯ ГЕНЕРАТОРА", ready),
+        ("ТИП: SEO-СТРАНИЦА", promo.get("SEO-СТРАНИЦА", 0)),
+        ("ТИП: ТОВАР", promo.get("ТОВАР", 0)),
+        ("ТИП: СМЕШАННЫЙ", promo.get("СМЕШАННЫЙ", 0)),
+        ("ТИП: ИНФОРМАЦИОННАЯ", promo.get("ИНФОРМАЦИОННАЯ", 0)),
     ] + [(k, c[k]) for k in ("CREATE", "SKIP", "REVIEW", "EXISTS")]
     for row in summary: ws.append(row)
     ws["A1"].font = Font(bold=True)
     headers = [
-        "keyword","category","category_id","filter","filter_keyword","option_id","value","value_id","params","value_keyword","alias","target_url",
+        "keyword","promotion_type","product_count","product_domains_count","seo_page_count","seo_domains_count","article_count","article_domains_count","other_count","unknown_domains_count",
+        "category","category_id","filter","filter_keyword","option_id","value","value_id","params","value_keyword","alias","target_url",
         "status","reason","filter_count","filter_domains_count","competitor_1","competitor_2","competitor_3","competitor_4","competitor_5",
         "competitor_filter_urls","competitor_landing_urls","rejected_filter_urls","url_status","existing_seo_url","existing_seo_alias","http_status","final_url","redirect","oc_status","oc_category_id","oc_category_found","oc_category_score","oc_message"
     ]
@@ -1637,7 +2152,7 @@ def export_excel(res, path, topdf=None):
     ws = wb.create_sheet("READY_FOR_GENERATOR")
     gen = generator_rows(res)
     gen_headers = list(gen[0].keys()) if gen else [
-        "keyword","category","category_id","filter","filter_keyword","value","value_id","params","value_keyword","alias","filter_result_url","target_url",
+        "keyword","promotion_type","category","category_id","filter","filter_keyword","value","value_id","params","value_keyword","alias","filter_result_url","target_url",
         "competitor_1","competitor_2","competitor_3","competitor_4","competitor_5","competitor_filter_urls","competitor_landing_urls","competitor_count","url_status","oc_status","generator_status"
     ]
     ws.append(gen_headers)
@@ -1667,7 +2182,7 @@ def export_excel(res, path, topdf=None):
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("FE-RUS SEO Manager v1.17")
+        self.title("FE-RUS SEO Manager v1.20")
         self.geometry("1280x860")
         self.q = queue.Queue()
         self.res = None
@@ -1675,6 +2190,8 @@ class App(tk.Tk):
         self.cfg = load_cfg()
         self.wk_stop_event = threading.Event()
         self.wk_running = False
+        self.analysis_stop_event = threading.Event()
+        self.analysis_running = False
         self.url_check_running = False
         self.build()
         self.load_cfg_to_ui()
@@ -1740,10 +2257,14 @@ class App(tk.Tk):
     def build_analysis(self):
         f=self.tabs["3. Анализ"]
         row=ttk.Frame(f); row.pack(fill="x",padx=10,pady=8)
-        ttk.Button(row,text="СОПОСТАВИТЬ С WORDKEEPER",command=self.compare).pack(side="left")
+        self.compare_btn=ttk.Button(row,text="СОПОСТАВИТЬ С WORDKEEPER",command=self.compare); self.compare_btn.pack(side="left")
+        self.analysis_stop_btn=ttk.Button(row,text="ОСТАНОВИТЬ АНАЛИЗ",command=self.stop_analysis,state="disabled"); self.analysis_stop_btn.pack(side="left",padx=8)
         ttk.Button(row,text="ПОКАЗАТЬ CREATE",command=lambda:self.show_status("CREATE")).pack(side="left",padx=8)
         ttk.Button(row,text="ПОКАЗАТЬ SKIP",command=lambda:self.show_status("SKIP")).pack(side="left")
         ttk.Button(row,text="ПОКАЗАТЬ REVIEW",command=lambda:self.show_status("REVIEW")).pack(side="left",padx=8)
+        ttk.Button(row,text="ПОКАЗАТЬ ТОВАРНЫЕ",command=lambda:self.show_promotion_type("ТОВАР")).pack(side="left",padx=8)
+        ttk.Button(row,text="ПОКАЗАТЬ SEO",command=lambda:self.show_promotion_type("SEO-СТРАНИЦА")).pack(side="left")
+        ttk.Button(row,text="ПОКАЗАТЬ СМЕШАННЫЕ",command=lambda:self.show_promotion_type("СМЕШАННЫЙ")).pack(side="left",padx=8)
         self.stats=tk.Text(f,font=("Consolas",10)); self.stats.pack(fill="both",expand=True,padx=10,pady=8)
 
     def build_urls(self):
@@ -1779,7 +2300,7 @@ class App(tk.Tk):
         ttk.Label(f,text="Финальный экспорт для внешней программы генерации контента").pack(anchor="w",padx=10,pady=12)
         ttk.Button(f,text="СОХРАНИТЬ CSV ДЛЯ ГЕНЕРАТОРА",command=self.export_generator).pack(anchor="w",padx=10,pady=4)
         ttk.Button(f,text="ЭКСПОРТИРОВАТЬ ПОЛНЫЙ XLSX",command=self.export).pack(anchor="w",padx=10,pady=4)
-        ttk.Label(f,text="CSV содержит готовые страницы и ИСХОДНЫЕ URL результатов фильтрации. target_url - будущий SEO URL, filter_result_url - старый URL фильтрации.").pack(anchor="w",padx=10,pady=8)
+        ttk.Label(f,text="CSV содержит только готовые SEO-страницы: promotion_type=SEO-СТРАНИЦА + status=CREATE + URL/OCFilter=READY. target_url - будущий SEO URL, filter_result_url - старый URL фильтрации.").pack(anchor="w",padx=10,pady=8)
         self.export_log=tk.Text(f,font=("Consolas",10),height=24)
         self.export_log.pack(fill="both",expand=True,padx=10,pady=8)
         ttk.Button(f,text="ПОКАЗАТЬ ГОТОВЫЕ URL ФИЛЬТРАЦИИ",command=self.show_ready_filter_urls).pack(anchor="w",padx=10,pady=4)
@@ -2111,55 +2632,121 @@ class App(tk.Tk):
             if "/dashboard" not in r.url:
                 raise RuntimeError("Авторизация WordKeeper не удалась.")
 
-            keywords=[x["keyword"] for x in self.res["rows"] if x.get("keyword")]
+            # Запросы именно ТЕКУЩЕЙ категории.
+            # CSV/checkpoint являются накопительным кэшем, но для текущей категории
+            # считаем только её канонические keywords. Один keyword может иметь
+            # несколько вариантов запроса WordKeeper.
+            keywords=list(dict.fromkeys(
+                str(x.get("keyword", "")).strip()
+                for x in self.res["rows"]
+                if x.get("keyword") and str(x.get("keyword", "")).strip()
+            ))
             results=[]
             done=set()
+            done_queries=set()
 
-            # TOP-30 хранится здесь: <рабочая папка>\seo_top30_result.csv
             if out_path.exists():
                 old=pd.read_csv(out_path,encoding="utf-8-sig")
                 if "keyword" in old.columns:
                     results=old.to_dict("records")
                     done.update(old["keyword"].astype(str).str.strip())
+                    if "source_query" in old.columns:
+                        done_queries.update(
+                            old["source_query"].astype(str).str.strip()
+                        )
 
-            # Отдельный checkpoint нужен для запросов, у которых WordKeeper
-            # вернул 0 строк: такой keyword иначе нельзя определить по CSV.
             if progress_path.exists():
                 try:
                     progress=json.loads(progress_path.read_text(encoding="utf-8"))
                     done.update(str(x).strip() for x in progress.get("done_keywords",[]) if str(x).strip())
+                    done_queries.update(str(x).strip() for x in progress.get("done_queries",[]) if str(x).strip())
                 except Exception:
                     pass
 
-            remaining=[k for k in dict.fromkeys(keywords) if k not in done]
+            # Старый checkpoint не знает о вариантах запросов. Его done_keywords
+            # остаётся совместимым: если canonical keyword уже полностью есть в
+            # старом кэше, повторно его не запрашиваем. Для новых русских keywords
+            # будут выполнены все новые варианты.
+            query_plan=[]
+            for row in self.res["rows"]:
+                canonical=str(row.get("keyword", "")).strip()
+                if not canonical or canonical in done:
+                    continue
+                variants=wordkeeper_query_variants(
+                    self.res.get("search_category") or self.res.get("category") or "",
+                    row.get("value", ""),
+                )
+                if not variants:
+                    variants=[canonical]
+                pending=[q for q in variants if q not in done_queries]
+                query_plan.append((canonical, pending))
+
+            current_done={k for k in keywords if k in done}
+            pending_queries=sum(len(v) for _,v in query_plan)
             self.q.put(("wklog",f"TOP-30 CSV: {out_path}"))
             self.q.put(("wklog",f"Checkpoint: {progress_path}"))
-            self.q.put(("wklog",f"Всего запросов: {len(keywords)} | уже обработано: {len(done)} | осталось: {len(remaining)}"))
+            self.q.put(("wklog",f"Всего значений текущей категории: {len(keywords)} | уже полностью обработано: {len(current_done)} | осталось значений: {len(keywords)-len(current_done)}"))
+            self.q.put(("wklog",f"Запросов WordKeeper к выполнению: {pending_queries} | всего в накопительном кэше: {len(done_queries or done)}"))
 
-            for i,k in enumerate(remaining,1):
+            query_index=0
+            total_pending=pending_queries
+            for canonical, variants in query_plan:
                 if self.wk_stop_event.is_set():
                     break
-                try:
-                    rr=s.post(TOP30_WK,data={"word":k,"region":region},headers={"Accept":"text/html, */*; q=0.01","X-Requested-With":"XMLHttpRequest","Referer":"https://word-keeper.ru/core"},timeout=120)
-                    rows=parse_top30(rr.text,k)
-                    results.extend(rows)
-                    done.add(k)
-                    pd.DataFrame(results).to_csv(out_path,index=False,encoding="utf-8-sig")
-                    progress_path.write_text(json.dumps({"done_keywords":sorted(done),"updated_at":time.strftime("%Y-%m-%d %H:%M:%S")},ensure_ascii=False,indent=2),encoding="utf-8")
-                    self.q.put(("wklog",f"[{i}/{len(remaining)}] {k} | HTTP {rr.status_code} | результатов: {len(rows)} | СОХРАНЕНО"))
+                all_variants_done=True
+                for actual_query in variants:
                     if self.wk_stop_event.is_set():
+                        all_variants_done=False
                         break
-                    time.sleep(2)
-                except Exception as e:
-                    # Ошибка конкретного запроса не считается завершённым keyword.
+                    query_index += 1
+                    try:
+                        rr=s.post(TOP30_WK,data={"word":actual_query,"region":region},headers={"Accept":"text/html, */*; q=0.01","X-Requested-With":"XMLHttpRequest","Referer":"https://word-keeper.ru/core"},timeout=120)
+                        rows=parse_top30(rr.text,canonical)
+                        for rrow in rows:
+                            rrow["source_query"]=actual_query
+                        results.extend(rows)
+                        done_queries.add(actual_query)
+                        pd.DataFrame(results).to_csv(out_path,index=False,encoding="utf-8-sig")
+                        # keyword помечаем done только после всех его вариантов.
+                        progress_path.write_text(json.dumps({
+                            "done_keywords":sorted(done),
+                            "done_queries":sorted(done_queries),
+                            "updated_at":time.strftime("%Y-%m-%d %H:%M:%S")
+                        },ensure_ascii=False,indent=2),encoding="utf-8")
+                        self.q.put(("wklog",f"[{query_index}/{total_pending}] {canonical} | запрос: {actual_query} | HTTP {rr.status_code} | результатов: {len(rows)} | СОХРАНЕНО"))
+                        if self.wk_stop_event.is_set():
+                            all_variants_done=False
+                            break
+                        time.sleep(2)
+                    except Exception as e:
+                        all_variants_done=False
+                        pd.DataFrame(results).to_csv(out_path,index=False,encoding="utf-8-sig")
+                        progress_path.write_text(json.dumps({
+                            "done_keywords":sorted(done),
+                            "done_queries":sorted(done_queries),
+                            "updated_at":time.strftime("%Y-%m-%d %H:%M:%S")
+                        },ensure_ascii=False,indent=2),encoding="utf-8")
+                        self.q.put(("wklog",f"ОШИБКА {actual_query}: {e} | текущая категория: обработано {len(set(keywords) & done)} из {len(keywords)}"))
+                        break
+
+                if all_variants_done:
+                    done.add(canonical)
                     pd.DataFrame(results).to_csv(out_path,index=False,encoding="utf-8-sig")
-                    progress_path.write_text(json.dumps({"done_keywords":sorted(done),"updated_at":time.strftime("%Y-%m-%d %H:%M:%S")},ensure_ascii=False,indent=2),encoding="utf-8")
-                    self.q.put(("wklog",f"ОШИБКА {k}: {e} | уже сохранено: {len(done)}"))
+                    progress_path.write_text(json.dumps({
+                        "done_keywords":sorted(done),
+                        "done_queries":sorted(done_queries),
+                        "updated_at":time.strftime("%Y-%m-%d %H:%M:%S")
+                    },ensure_ascii=False,indent=2),encoding="utf-8")
+                    self.q.put(("wklog",f"ЗАВЕРШЕНО ЗНАЧЕНИЕ: {canonical} | вариантов запроса: {len(variants)}"))
 
             pd.DataFrame(results).to_csv(out_path,index=False,encoding="utf-8-sig")
-            progress_path.write_text(json.dumps({"done_keywords":sorted(done),"updated_at":time.strftime("%Y-%m-%d %H:%M:%S")},ensure_ascii=False,indent=2),encoding="utf-8")
+            progress_path.write_text(json.dumps({
+                "done_keywords":sorted(done),
+                "done_queries":sorted(done_queries),
+                "updated_at":time.strftime("%Y-%m-%d %H:%M:%S")
+            },ensure_ascii=False,indent=2),encoding="utf-8")
             if self.wk_stop_event.is_set():
-                self.q.put(("wkstop",{"path":out_path,"progress":progress_path,"done":len(done),"total":len(keywords)}))
+                self.q.put(("wkstop",{"path":out_path,"progress":progress_path,"done":len(set(keywords) & done),"total":len(keywords)}))
             else:
                 self.q.put(("wkdone",out_path))
         except Exception as e:
@@ -2168,26 +2755,88 @@ class App(tk.Tk):
             self.wk_running=False
 
     def compare(self):
-        if not self.res: messagebox.showwarning("Сначала категория","Сначала выполните анализ категории."); return
+        if not self.res:
+            messagebox.showwarning("Сначала категория", "Сначала выполните анализ категории.")
+            return
+        if self.analysis_running:
+            return
         try:
+            # Выбор характеристик фиксируем до запуска фонового анализа.
             self.apply_selected_filters()
             if not self.res.get("rows"):
                 return
-            self.res=Pipeline().merge_analysis(self.res,self.topdf)
-            c=Counter(x.get("status") for x in self.res["rows"])
-            self.stats.delete("1.0","end")
-            self.stats.insert("end",f"Категория: {self.res['category']}\nCategory ID: {self.res['category_id']}\nВариантов: {len(self.res['rows'])}\n\n")
-            for k in ("CREATE","SKIP","REVIEW","EXISTS"):self.stats.insert("end",f"{k}: {c[k]}\n")
-            self.stats.insert("end","\nCREATE создаются только после живой проверки URL и OCFilter.\n\n")
-            for x in self.res["rows"]:
-                if x.get("status")=="CREATE":self.stats.insert("end",f"- {x['keyword']} | {x['filter']} | {x['value']} | конкурентов={x.get('filter_domains_count',0)}\n")
-        except Exception as e:messagebox.showerror("Анализ",str(e))
+        except Exception:
+            return
+        if self.topdf is None or self.topdf.empty:
+            messagebox.showwarning("WordKeeper", "Сначала загрузите или получите TOP-30 WordKeeper.")
+            return
+        self.analysis_stop_event.clear()
+        self.analysis_running=True
+        self.compare_btn.config(state="disabled")
+        self.analysis_stop_btn.config(state="normal")
+        self.stats.delete("1.0","end")
+        self.stats.insert("end", "Запуск анализа TOP-30...\n\n")
+        threading.Thread(target=self.worker_compare,daemon=True).start()
+
+    def stop_analysis(self):
+        if self.analysis_running:
+            self.analysis_stop_event.set()
+            self.stats.insert("end", "\nЗапрошена остановка анализа. Уже классифицированные URL сохранены.\n")
+            self.stats.see("end")
+
+    def worker_compare(self):
+        try:
+            folder=Path(self.folder.get() or os.getcwd())
+            cache_path=folder / "seo_serp_page_classification.csv"
+            res=Pipeline().merge_analysis(
+                self.res,
+                self.topdf,
+                progress=lambda msg:self.q.put(("analysislog",msg)),
+                stop_event=self.analysis_stop_event,
+                cache_path=cache_path,
+            )
+            self.q.put(("analysisdone", {"res":res, "cache":str(cache_path), "stopped":self.analysis_stop_event.is_set()}))
+        except Exception as e:
+            self.q.put(("analysiserr",str(e)))
+        finally:
+            self.analysis_running=False
+
+    def _render_analysis(self):
+        if not self.res:
+            return
+        c=Counter(x.get("status") for x in self.res["rows"])
+        p=Counter(x.get("promotion_type") for x in self.res["rows"])
+        self.stats.delete("1.0","end")
+        self.stats.insert("end",f"Категория: {self.res['category']}\nCategory ID: {self.res['category_id']}\nВариантов: {len(self.res['rows'])}\n\n")
+        self.stats.insert("end", "ТИП ПРОДВИЖЕНИЯ:\n")
+        for k in ("SEO-СТРАНИЦА","ТОВАР","СМЕШАННЫЙ","ИНФОРМАЦИОННАЯ","НЕДОСТАТОЧНО ДАННЫХ"):
+            self.stats.insert("end",f"{k}: {p[k]}\n")
+        self.stats.insert("end", "\nСТАТУС SEO-СТРАНИЦ:\n")
+        for k in ("CREATE","SKIP","REVIEW","EXISTS"):
+            self.stats.insert("end",f"{k}: {c[k]}\n")
+        self.stats.insert("end", "\nCREATE = только SEO-интент + минимум 2 независимых точных filter-конкурента.\n")
+        self.stats.insert("end", "ТОВАР = запрос преимущественно ведет на карточки товаров; отдельную SEO-посадочную не создаем.\n\n")
+        self.stats.insert("end", "СПИСОК:\n")
+        for x in self.res["rows"]:
+            self.stats.insert(
+                "end",
+                f"- {x['keyword']} | {x['filter']} | {x['value']} | ТИП={x.get('promotion_type','')} | STATUS={x.get('status','')} | PRODUCT={x.get('product_domains_count',0)} | SEO={x.get('seo_domains_count',0)} | конкуренты={x.get('filter_domains_count',0)} | {x.get('reason','')}\n"
+            )
+        self.stats.see("1.0")
 
     def show_status(self,status):
         if not self.res:return
         self.stats.delete("1.0","end")
         for x in self.res["rows"]:
-            if x.get("status")==status:self.stats.insert("end",f"{x['keyword']} | {x['filter']} | {x['value']} | {x.get('reason','')}\n")
+            if x.get("status")==status:
+                self.stats.insert("end",f"{x['keyword']} | {x['filter']} | {x['value']} | ТИП={x.get('promotion_type','')} | {x.get('reason','')}\n")
+
+    def show_promotion_type(self,promotion_type):
+        if not self.res:return
+        self.stats.delete("1.0","end")
+        for x in self.res["rows"]:
+            if x.get("promotion_type")==promotion_type:
+                self.stats.insert("end",f"{x['keyword']} | {x['filter']} | {x['value']} | ТИП={x.get('promotion_type','')} | STATUS={x.get('status','')} | PRODUCT={x.get('product_domains_count',0)} | SEO={x.get('seo_domains_count',0)} | {x.get('reason','')}\n")
 
     def url_audit_path(self):
         return Path(self.folder.get() or os.getcwd()) / "seo_url_check_audit.csv"
@@ -2665,6 +3314,25 @@ class App(tk.Tk):
                     p=x["path"]; self.topdf=pd.read_csv(p,encoding="utf-8-sig") if Path(p).exists() and Path(p).stat().st_size else pd.DataFrame(); self.wkstatus.config(text=f"ОСТАНОВЛЕНО: {len(self.topdf)} строк | {Path(p).name}"); self.wk_start_btn.config(state="normal"); self.wk_stop_btn.config(state="disabled"); self.wklog.insert("end",f"\nАНАЛИЗ ОСТАНОВЛЕН.\nTOP-30: {p}\nCheckpoint: {x['progress']}\nЗавершено запросов: {x['done']} из {x['total']}\nМожно нажать ПОЛУЧИТЬ TOP-30 снова - продолжит с последнего сохранённого запроса.\n")
                 elif t=="wkerr":
                     self.wk_running=False; self.wk_start_btn.config(state="normal"); self.wk_stop_btn.config(state="disabled"); messagebox.showerror("WordKeeper",x)
+                elif t=="analysislog":
+                    self.stats.insert("end",str(x)+"\n"); self.stats.see("end")
+                elif t=="analysisdone":
+                    self.res=x["res"]
+                    self.analysis_running=False
+                    self.compare_btn.config(state="normal")
+                    self.analysis_stop_btn.config(state="disabled")
+                    self._render_analysis()
+                    cache_txt=x.get("cache","")
+                    if x.get("stopped"):
+                        self.stats.insert("end",f"\nАНАЛИЗ ОСТАНОВЛЕН. Кэш классификации сохранен: {cache_txt}\n")
+                    else:
+                        self.stats.insert("end",f"\nКлассификация сохранена: {cache_txt}\n")
+                    self.stats.see("end")
+                elif t=="analysiserr":
+                    self.analysis_running=False
+                    self.compare_btn.config(state="normal")
+                    self.analysis_stop_btn.config(state="disabled")
+                    messagebox.showerror("Анализ",x)
                 elif t=="urllog":self.urllog.insert("end",str(x)+"\n");self.urllog.see("end")
                 elif t=="urlstatus":self.urlstatus.config(text=str(x))
                 elif t=="urldone":
