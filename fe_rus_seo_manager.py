@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-FE-RUS SEO Manager v1.20
+FE-RUS SEO Manager v1.20.3
 
 Единое Windows-приложение:
 1. Категория - получает category_id, OCFilter options и значения.
@@ -2085,10 +2085,13 @@ class Pipeline:
             if progress:
                 progress(f"[{idx}/{total}] {x.get('keyword','')} | {x.get('filter','')}={x.get('value','')} | проверка категории...")
             alias = choose_alias(existing, base_alias, category)
-            # Для вариантов, полученных из одной родительской страницы,
-            # используем реальный category_id самой страницы. Это надежнее,
-            # чем повторно искать категорию по slug/транслитерации через autocomplete.
+            # Для вариантов одной родительской страницы сначала используем
+            # сохраненный category_id. Если анализ категории был выполнен до
+            # сохранения авторизаций или точный ID тогда не определился,
+            # ОБЯЗАТЕЛЬНО повторно разрешаем родительскую категорию здесь,
+            # уже имея рабочую авторизацию OpenCart.
             parent_cid = str(res.get("category_id") or "").strip()
+            parent_slug = str(res.get("category_slug") or "").strip()
             if parent_cid and parent_cid.isdigit():
                 resolved = {
                     "category_id": parent_cid,
@@ -2099,13 +2102,40 @@ class Pipeline:
                 if progress:
                     progress(f"[{idx}/{total}] CATEGORY ID={parent_cid} | из родительской категории")
             else:
-                resolved = oc_resolve_category(s, token, category)
+                if progress:
+                    progress(
+                        f"[{idx}/{total}] CATEGORY ID у анализа отсутствует | "
+                        f"повторно ищем родительскую категорию: {category}"
+                    )
+                resolved = oc_resolve_category(
+                    s, token, category,
+                    category_slug=parent_slug,
+                    log=(lambda msg: progress(f"[{idx}/{total}] {msg}") if progress else None),
+                )
+                # Второй fallback: если H1 отличается от имени категории в
+                # OpenCart, пробуем получить ID через тот же надежный resolver,
+                # но без жесткого требования совпадения SEO slug.
+                if not resolved:
+                    resolved = oc_resolve_category(
+                        s, token, category,
+                        category_slug="",
+                        log=(lambda msg: progress(f"[{idx}/{total}] {msg}") if progress else None),
+                    )
 
             if not resolved:
                 x["oc_status"] = "CATEGORY_NOT_FOUND"
-                x["oc_message"] = "Категория не найдена через OpenCart autocomplete и не задан category_id"
+                x["oc_message"] = (
+                    "Категория не найдена через OpenCart autocomplete; "
+                    f"category={category}; category_slug={parent_slug or '-'}; "
+                    f"category_id_from_analysis={parent_cid or '-'}"
+                )
                 results.append(x)
-                if progress: progress(f"[{idx}/{total}] CATEGORY_NOT_FOUND")
+                if progress:
+                    progress(
+                        f"[{idx}/{total}] CATEGORY_NOT_FOUND | "
+                        f"category={category} | slug={parent_slug or '-'} | "
+                        f"analysis_category_id={parent_cid or '-'}"
+                    )
                 continue
             x["oc_category_id"] = resolved["category_id"]
             x["oc_category_found"] = resolved["name"]
@@ -3410,6 +3440,37 @@ class App(tk.Tk):
 
         if urls:
             self.export_log.insert("1.0", "\n".join(urls))
+        else:
+            rows = self.res.get("rows", [])
+            create = sum(1 for x in rows if x.get("status") == "CREATE")
+            seo_create = sum(
+                1 for x in rows
+                if x.get("status") == "CREATE"
+                and x.get("promotion_type") == "SEO-СТРАНИЦА"
+            )
+            url_ready = sum(
+                1 for x in rows
+                if x.get("status") == "CREATE"
+                and x.get("promotion_type") == "SEO-СТРАНИЦА"
+                and x.get("url_status") in ("READY_FOR_OCFILTER", "HTTP_404")
+            )
+            oc_ready = sum(
+                1 for x in rows
+                if x.get("status") == "CREATE"
+                and x.get("promotion_type") == "SEO-СТРАНИЦА"
+                and x.get("url_status") in ("READY_FOR_OCFILTER", "HTTP_404")
+                and x.get("oc_status") == "READY"
+            )
+            self.export_log.insert(
+                "1.0",
+                "Готовых URL фильтрации пока нет.\n\n"
+                f"CREATE: {create}\n"
+                f"SEO + CREATE: {seo_create}\n"
+                f"URL прошли проверку: {url_ready}\n"
+                f"OCFilter READY: {oc_ready}\n\n"
+                "Чтобы URL появились здесь, они должны пройти проверку URL "
+                "и OCFilter (DRY-RUN)."
+            )
 
     def copy_ready_filter_urls(self):
         """Копирует только готовые исходные URL фильтрации, по одному в строке."""
