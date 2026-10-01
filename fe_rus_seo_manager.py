@@ -3247,29 +3247,75 @@ class App(tk.Tk):
             self.url_check_running=False
 
     def show_ready_filter_urls(self):
-        """Показывает только исходные URL результатов фильтрации,
-        которые относятся к страницам, прошедшим проверку и готовым
-        для внешнего генератора. Один URL в одной строке, без нумерации.
+        """Показывает исходные URL фильтрации только для полностью готовых строк.
+
+        Раньше при отсутствии готовых строк функция просто завершалась, поэтому
+        пользователю казалось, что кнопка не работает. Теперь в этом случае
+        показывается понятная причина и текущие счетчики этапов проверки.
         """
         self.export_log.delete("1.0", "end")
+
         if not self.res:
-            return
+            messagebox.showwarning(
+                "Нет данных",
+                "Сначала выполните анализ категории.\n\n"
+                "После анализа запустите Проверку URL и ПРОВЕРИТЬ OCFILTER (DRY-RUN)."
+            )
+            return False
+
+        all_rows = self.res.get("rows", []) or []
+        ready_rows = generator_rows(self.res)
 
         urls = []
         seen = set()
-        for row in generator_rows(self.res):
+        for row in ready_rows:
             url = str(row.get("filter_result_url") or "").strip()
             if not url or url in seen:
                 continue
             seen.add(url)
             urls.append(url)
 
-        if urls:
-            self.export_log.insert("1.0", "\n".join(urls))
+        if not urls:
+            create_count = sum(1 for r in all_rows if r.get("status") == "CREATE")
+            seo_create_count = sum(
+                1 for r in all_rows
+                if r.get("status") == "CREATE" and r.get("promotion_type") == "SEO-СТРАНИЦА"
+            )
+            url_ready_count = sum(
+                1 for r in all_rows
+                if r.get("status") == "CREATE"
+                and r.get("promotion_type") == "SEO-СТРАНИЦА"
+                and r.get("url_status") in ("READY_FOR_OCFILTER", "HTTP_404")
+            )
+            oc_ready_count = sum(
+                1 for r in all_rows
+                if r.get("status") == "CREATE"
+                and r.get("promotion_type") == "SEO-СТРАНИЦА"
+                and r.get("url_status") in ("READY_FOR_OCFILTER", "HTTP_404")
+                and r.get("oc_status") == "READY"
+            )
+
+            diagnostic = (
+                "Готовых URL фильтрации пока нет.\n\n"
+                f"CREATE: {create_count}\n"
+                f"SEO + CREATE: {seo_create_count}\n"
+                f"URL прошли проверку: {url_ready_count}\n"
+                f"OCFilter READY: {oc_ready_count}\n\n"
+                "Для вывода URL должны пройти оба этапа: "
+                "Проверка URL и Проверка OCFilter (DRY-RUN)."
+            )
+            self.export_log.insert("1.0", diagnostic)
+            messagebox.showwarning("Нет готовых URL", diagnostic)
+            return False
+
+        self.export_log.insert("1.0", "\n".join(urls))
+        self.export_log.see("1.0")
+        return True
 
     def copy_ready_filter_urls(self):
         """Копирует только готовые исходные URL фильтрации, по одному в строке."""
-        self.show_ready_filter_urls()
+        if not self.show_ready_filter_urls():
+            return
         value=self.export_log.get("1.0", "end-1c").strip()
         if not value:
             messagebox.showwarning("Нет URL", "Нет URL результатов фильтрации, прошедших проверку.")
@@ -3277,6 +3323,7 @@ class App(tk.Tk):
         self.clipboard_clear()
         self.clipboard_append(value)
         self.update()
+        messagebox.showinfo("Скопировано", f"Скопировано URL: {len(value.splitlines())}")
 
     def export_generator(self):
         if not self.res:
