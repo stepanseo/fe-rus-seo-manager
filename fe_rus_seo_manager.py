@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-FE-RUS SEO Manager v1.20.4
+FE-RUS SEO Manager v1.20.5
 
 Единое Windows-приложение:
 1. Категория - получает category_id, OCFilter options и значения.
@@ -55,6 +55,36 @@ def norm(x):
     x = str(x or "").lower().replace("ё", "е")
     x = re.sub(r"\s+", " ", x).strip()
     return x
+
+
+def canonical_value(x):
+    """Нормализует значение характеристики для сопоставления строк.
+
+    В CSV/Excel число может прийти как 1.0, а результат OCFilter как "1".
+    Для сопоставления это должно считаться одним и тем же значением.
+    Остальные значения сравниваются через norm().
+    """
+    s = norm(x)
+    if not s:
+        return ""
+    sn = s.replace(",", ".")
+    if re.fullmatch(r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)", sn):
+        try:
+            from decimal import Decimal
+            d = Decimal(sn)
+            return format(d, "f").rstrip("0").rstrip(".") or "0"
+        except Exception:
+            pass
+    return s
+
+
+def result_row_key(x):
+    """Стабильный ключ строки для объединения результатов OCFilter с анализом."""
+    return (
+        norm(x.get("keyword", "")),
+        norm(x.get("filter", "")),
+        canonical_value(x.get("value", "")),
+    )
 
 
 def slugify(text):
@@ -2399,7 +2429,7 @@ def export_excel(res, path, topdf=None):
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("FE-RUS SEO Manager v1.20.4")
+        self.title("FE-RUS SEO Manager v1.20.5")
         self.geometry("1280x860")
         self.q = queue.Queue()
         self.res = None
@@ -3347,6 +3377,92 @@ class App(tk.Tk):
             self.url_check_running=False
 
 
+    def ocfilter_audit_path(self):
+        return Path(self.folder.get() or os.getcwd()) / "seo_ocfilter_check_audit.json"
+
+    def _save_ocfilter_audit(self, results):
+        """Сохраняет результат DRY-RUN OCFilter, чтобы он не терялся между запусками."""
+        try:
+            path = self.ocfilter_audit_path()
+            old = {}
+            if path.exists():
+                try:
+                    old = json.loads(path.read_text(encoding="utf-8"))
+                except Exception:
+                    old = {}
+            if not isinstance(old, dict):
+                old = {}
+            category_url = str(self.res.get("url", "")).strip() if self.res else ""
+            now = time.strftime("%Y-%m-%d %H:%M:%S")
+            for r in results:
+                key = "|".join([
+                    category_url,
+                    norm(r.get("keyword", "")),
+                    norm(r.get("filter", "")),
+                    canonical_value(r.get("value", "")),
+                ])
+                old[key] = {
+                    "category_url": category_url,
+                    "keyword": r.get("keyword", ""),
+                    "filter": r.get("filter", ""),
+                    "value": r.get("value", ""),
+                    "target_url": r.get("target_url", ""),
+                    "url_status": r.get("url_status", ""),
+                    "oc_status": r.get("oc_status", ""),
+                    "oc_message": r.get("oc_message", ""),
+                    "oc_category_id": r.get("oc_category_id", ""),
+                    "oc_category_found": r.get("oc_category_found", ""),
+                    "oc_category_score": r.get("oc_category_score", ""),
+                    "alias": r.get("alias", ""),
+                    "verified_at": now,
+                    "verification_state": "VERIFIED",
+                    "verification_version": "2",
+                }
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(old, ensure_ascii=False, indent=2), encoding="utf-8")
+            return path
+        except Exception:
+            return None
+
+    def _apply_ocfilter_audit(self):
+        """Подтягивает сохраненные результаты OCFilter в текущий анализ."""
+        if not self.res:
+            return 0
+        try:
+            path = self.ocfilter_audit_path()
+            if not path.exists():
+                return 0
+            data = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(data, dict):
+                return 0
+            category_url = str(self.res.get("url", "")).strip()
+            applied = 0
+            for row in self.res.get("rows", []):
+                key = "|".join([
+                    category_url,
+                    norm(row.get("keyword", "")),
+                    norm(row.get("filter", "")),
+                    canonical_value(row.get("value", "")),
+                ])
+                saved = data.get(key)
+                if not isinstance(saved, dict):
+                    continue
+                # Не переносим старый результат на другой target URL.
+                saved_target = str(saved.get("target_url", "")).strip()
+                current_target = str(row.get("target_url", "")).strip()
+                if saved_target and current_target and saved_target != current_target:
+                    continue
+                for field in (
+                    "url_status", "oc_status", "oc_message", "oc_category_id",
+                    "oc_category_found", "oc_category_score", "alias", "target_url"
+                ):
+                    if field in saved and saved.get(field) not in (None, ""):
+                        row[field] = saved.get(field)
+                applied += 1
+            return applied
+        except Exception:
+            return 0
+
     def run_oc(self):
         if not self.res:
             messagebox.showwarning("Нет данных","Сначала выполните анализ и проверку URL.")
@@ -3530,6 +3646,7 @@ class App(tk.Tk):
         if not self.res:
             return
 
+        self._apply_ocfilter_audit()
         urls = []
         seen = set()
         for row in generator_rows(self.res):
@@ -3562,13 +3679,21 @@ class App(tk.Tk):
                 and x.get("url_status") in ("READY_FOR_OCFILTER", "HTTP_404")
                 and x.get("oc_status") == "READY"
             )
+            oc_statuses = {}
+            for x in rows:
+                if x.get("status") != "CREATE" or x.get("promotion_type") != "SEO-СТРАНИЦА":
+                    continue
+                st = str(x.get("oc_status", "")) or "EMPTY"
+                oc_statuses[st] = oc_statuses.get(st, 0) + 1
+            oc_status_text = ", ".join(f"{k}={v}" for k,v in sorted(oc_statuses.items())) or "нет данных"
             self.export_log.insert(
                 "1.0",
                 "Готовых URL фильтрации пока нет.\n\n"
                 f"CREATE: {create}\n"
                 f"SEO + CREATE: {seo_create}\n"
                 f"URL прошли проверку: {url_ready}\n"
-                f"OCFilter READY: {oc_ready}\n\n"
+                f"OCFilter READY: {oc_ready}\n"
+                f"OCFilter статусы: {oc_status_text}\n\n"
                 "Чтобы URL появились здесь, они должны пройти проверку URL "
                 "и OCFilter (DRY-RUN)."
             )
@@ -3588,6 +3713,7 @@ class App(tk.Tk):
         if not self.res:
             messagebox.showwarning("Нет данных","Сначала выполните анализ категории.")
             return
+        self._apply_ocfilter_audit()
         ready = generator_rows(self.res)
         if not ready:
             messagebox.showwarning("Нет готовых страниц","Сначала выполните Проверку URL и Проверку OCFilter (DRY-RUN).")
@@ -3603,6 +3729,7 @@ class App(tk.Tk):
 
     def export(self):
         if not self.res:messagebox.showwarning("Нет данных","Сначала выполните анализ.");return
+        self._apply_ocfilter_audit()
         p=filedialog.asksaveasfilename(defaultextension=".xlsx",initialfile="fe_rus_seo_pages.xlsx",filetypes=[("Excel","*.xlsx")])
         if p:
             export_excel(self.res,p,self.topdf); messagebox.showinfo("Готово","Файл сохранен:\n"+p)
@@ -3664,13 +3791,35 @@ class App(tk.Tk):
                 elif t=="ocdone":
                     self.oc_running=False
                     self.oc_check_btn.config(state="normal")
+                    rows_by_key = {}
+                    for rr in self.res.get("rows", []):
+                        rows_by_key.setdefault(result_row_key(rr), []).append(rr)
+                    matched = 0
                     for r in x:
-                        for rr in self.res.get("rows", []):
-                            if rr.get("keyword") == r.get("keyword") and rr.get("filter") == r.get("filter") and str(rr.get("value")) == str(r.get("value")):
-                                rr.update(r)
-                                break
+                        candidates = rows_by_key.get(result_row_key(r), [])
+                        if len(candidates) == 1:
+                            candidates[0].update(r)
+                            matched += 1
+                        elif candidates:
+                            # Резерв: если ключ совпал несколько раз, target_url
+                            # позволяет выбрать конкретную строку.
+                            target = str(r.get("target_url", "")).strip()
+                            found = next((rr for rr in candidates if str(rr.get("target_url", "")).strip() == target), None)
+                            if found is not None:
+                                found.update(r)
+                                matched += 1
+                    audit_path = self._save_ocfilter_audit(x)
+                    self._apply_ocfilter_audit()
                     ready = len(generator_rows(self.res))
-                    self.oclog.insert("end",f"\nГотово. Проверено CREATE: {len(x)}\nГОТОВО ДЛЯ ГЕНЕРАТОРА: {ready}\n\n")
+                    statuses = {}
+                    for rr in self.res.get("rows", []):
+                        st = str(rr.get("oc_status", "")) or "EMPTY"
+                        statuses[st] = statuses.get(st, 0) + 1
+                    status_text = ", ".join(f"{k}={v}" for k,v in sorted(statuses.items()))
+                    self.oclog.insert("end",f"\nГотово. Проверено CREATE: {len(x)} | сопоставлено с анализом: {matched}\nГОТОВО ДЛЯ ГЕНЕРАТОРА: {ready}\nOCFilter статусы: {status_text}\n")
+                    if audit_path:
+                        self.oclog.insert("end",f"Проверка OCFilter сохранена: {audit_path}\n")
+                    self.oclog.insert("end","\n")
                     for r in x:self.oclog.insert("end",f"{r.get('keyword')} -> {r.get('oc_status')} | {r.get('target_url','')}\n")
                     self.oclog.insert("end",f"\nСледующий шаг: вкладка 6. Экспорт -> СОХРАНИТЬ CSV ДЛЯ ГЕНЕРАТОРА.\n")
                     self.oclog.see("end")
