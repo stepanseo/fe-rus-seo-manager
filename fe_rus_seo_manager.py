@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-FE-RUS SEO Manager v1.20.3
+FE-RUS SEO Manager v1.20.4
 
 Единое Windows-приложение:
 1. Категория - получает category_id, OCFilter options и значения.
@@ -1136,6 +1136,88 @@ def oc_resolve_category(session, token, category, category_slug="", log=lambda x
         return best
     return None
 
+def oc_category_from_admin_list(session, token, category, log=lambda x: None):
+    """Резервный поиск реального category_id через список категорий OpenCart.
+
+    Используется, если штатный autocomplete не вернул кандидатов. Поиск идет
+    по фильтру админского списка категорий, после чего проверяется точное
+    соответствие имени. Случайный похожий category_id не принимается.
+    """
+    url = f"{ADMIN}?route=catalog/category&user_token={token}"
+    best = None
+    seen = set()
+
+    for term in oc_category_terms(category):
+        try:
+            r = session.get(url, params={"filter_name": term}, timeout=30)
+            if log:
+                log(f"OpenCart category list: {term!r} -> HTTP {r.status_code}")
+            if r.status_code != 200:
+                continue
+
+            soup = BeautifulSoup(r.text, "html.parser")
+            candidates = []
+
+            for tr in soup.find_all("tr"):
+                row_text = tr.get_text(" ", strip=True)
+                cid = ""
+                for a in tr.find_all("a", href=True):
+                    href = a.get("href", "")
+                    if "catalog/category/edit" in href and "category_id=" in href:
+                        m = re.search(r"[?&]category_id=(\d+)", href)
+                        if m:
+                            cid = m.group(1)
+                            break
+                if not cid:
+                    for inp in tr.find_all("input"):
+                        val = str(inp.get("value") or "").strip()
+                        name = str(inp.get("name") or "")
+                        if val.isdigit() and (name.startswith("selected") or name == "category_id"):
+                            cid = val
+                            break
+                if cid and cid not in seen:
+                    seen.add(cid)
+                    candidates.append((cid, row_text))
+
+            if not candidates:
+                for a in soup.find_all("a", href=True):
+                    href = a.get("href", "")
+                    if "catalog/category/edit" not in href or "category_id=" not in href:
+                        continue
+                    m = re.search(r"[?&]category_id=(\d+)", href)
+                    if not m:
+                        continue
+                    cid = m.group(1)
+                    if cid in seen:
+                        continue
+                    seen.add(cid)
+                    parent = a.parent
+                    txt = parent.get_text(" ", strip=True) if parent else a.get_text(" ", strip=True)
+                    candidates.append((cid, txt))
+
+            for cid, name in candidates:
+                score = oc_category_score(name, category)
+                if oc_category_safe(category, name):
+                    score += 2000
+                candidate = {
+                    "score": score,
+                    "category_id": cid,
+                    "name": name,
+                    "term": f"admin-category-list:{term}",
+                }
+                if best is None or score > best["score"]:
+                    best = candidate
+        except Exception as e:
+            if log:
+                log(f"OpenCart category list: ошибка {term!r}: {e}")
+
+    if best and oc_category_safe(category, best.get("name", "")):
+        if log:
+            log(f"OpenCart category resolver: ADMIN LIST -> {best['category_id']} | {best['name']}")
+        return best
+    return None
+
+
 def resolve_public_category_id_via_admin(category_label, basic_user, basic_pass, oc_user, oc_pass, log=lambda x: None, category_slug=''):
     """Надежно определяет category_id из самой базы OpenCart.
 
@@ -1167,6 +1249,20 @@ def resolve_public_category_id_via_admin(category_label, basic_user, basic_pass,
             return str(best["category_id"])
         if best:
             log(f"OpenCart resolver найден кандидат, но не прошел проверку: {best}")
+
+        # Если autocomplete не дал точного ID, читаем административный список
+        # категорий OpenCart. Это резервный путь для конкретных сборок, где
+        # autocomplete может не возвращать нужную категорию.
+        admin_best = oc_category_from_admin_list(s, token, category_label, log=log)
+        if not admin_best and category_slug:
+            slug_words = re.sub(r"[-_]+", " ", str(category_slug)).strip()
+            if slug_words:
+                admin_best = oc_category_from_admin_list(s, token, slug_words, log=log)
+        if admin_best:
+            expected_name = re.sub(r"\s+(?:в|во)\s+.*$", "", category_label, flags=re.I).strip() or category_label
+            if oc_category_safe(expected_name, admin_best.get("name", "")):
+                log(f"OpenCart category resolver: {category_label} -> {admin_best['category_id']} | {admin_best['name']}")
+                return str(admin_best["category_id"])
     except Exception as e:
         log(f"OpenCart category resolver: ошибка {e}")
     return None
@@ -2137,6 +2233,11 @@ class Pipeline:
                         f"analysis_category_id={parent_cid or '-'}"
                     )
                 continue
+            # Сохраняем реально найденный category_id в общей структуре.
+            # После первого успешного разрешения остальные варианты используют
+            # тот же проверенный ID, а экспорт получает его без повторного поиска.
+            res["category_id"] = str(resolved["category_id"])
+            x["category_id"] = str(resolved["category_id"])
             x["oc_category_id"] = resolved["category_id"]
             x["oc_category_found"] = resolved["name"]
             x["oc_category_score"] = resolved["score"]
@@ -2298,7 +2399,7 @@ def export_excel(res, path, topdf=None):
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("FE-RUS SEO Manager v1.20")
+        self.title("FE-RUS SEO Manager v1.20.4")
         self.geometry("1280x860")
         self.q = queue.Queue()
         self.res = None
