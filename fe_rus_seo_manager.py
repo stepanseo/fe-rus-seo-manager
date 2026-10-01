@@ -559,7 +559,7 @@ def wordkeeper_query_variants(category, value):
 # SERP PAGE CLASSIFICATION
 # -----------------------------------------------------------------------------
 
-SERP_CLASSIFIER_VERSION = "1.20.1"
+SERP_CLASSIFIER_VERSION = "1.20.2"
 PRODUCT_PATH_MARKERS = (
     "/product/", "/products/", "/item/", "/goods/", "/tovar/", "/offer/",
     "/p/", "/detail/", "/produkt/", "/catalog/product/"
@@ -1738,12 +1738,45 @@ class Pipeline:
         page_map = {}
 
         # Собираем только URL, реально относящиеся к текущим canonical keywords.
+        # Помимо canonical keyword учитываем source_query и все актуальные варианты
+        # WordKeeper. Это важно для накопительного CSV, созданного старой версией
+        # программы, где keyword мог быть транслитерированным.
         canonical_keywords = [str(x.get("keyword", "")).strip() for x in res.get("rows", []) if str(x.get("keyword", "")).strip()]
-        keyword_set = {norm(k) for k in canonical_keywords}
-        relevant = topdf[topdf[kc].astype(str).str.strip().str.lower().isin(keyword_set)].copy()
+        accepted_queries = set()
+        for x in res.get("rows", []):
+            canonical = str(x.get("keyword", "")).strip()
+            if not canonical:
+                continue
+            accepted_queries.add(norm(canonical))
+            for qv in (wordkeeper_query_variants(
+                res.get("search_category") or res.get("category") or "",
+                x.get("value", ""),
+            ) or [canonical]):
+                accepted_queries.add(norm(qv))
+
+        keyword_norm_series = topdf[kc].astype(str).map(norm)
+        relevant = topdf[keyword_norm_series.isin(accepted_queries)].copy()
+        if "source_query" in topdf.columns:
+            source_norm_series = topdf["source_query"].astype(str).map(norm)
+            relevant = pd.concat([
+                relevant,
+                topdf[source_norm_series.isin(accepted_queries)].copy(),
+            ], ignore_index=False).drop_duplicates()
         if relevant.empty:
-            # Совместимость с CSV, где keyword мог отличаться пробелами/регистром.
-            relevant = topdf[topdf[kc].astype(str).str.lower().apply(lambda z: any(norm(k) in norm(z) for k in canonical_keywords))].copy()
+            # Совместимость с CSV, где keyword/source_query содержат дополнительные
+            # пробелы или регистр.
+            relevant = topdf[
+                keyword_norm_series.apply(lambda z: any(q in z or z in q for q in accepted_queries if q))
+            ].copy()
+            if "source_query" in topdf.columns:
+                source_norm_series = topdf["source_query"].astype(str).map(norm)
+                extra = topdf[
+                    source_norm_series.apply(lambda z: any(q in z or z in q for q in accepted_queries if q))
+                ].copy()
+                relevant = pd.concat([relevant, extra], ignore_index=False).drop_duplicates()
+
+        if progress:
+            progress(f"TOP-30: найдено строк текущей категории/вариантов запроса: {len(relevant)}")
 
         unique_urls = []
         seen_urls = set()
@@ -1801,10 +1834,33 @@ class Pipeline:
 
         # Повторяем строки анализа.
         for x in res["rows"]:
-            q = norm(x["keyword"])
-            rows = topdf[topdf[kc].astype(str).str.strip().str.lower() == q].copy()
+            canonical = str(x.get("keyword", "")).strip()
+            accepted_for_row = {norm(canonical)}
+            for qv in (wordkeeper_query_variants(
+                res.get("search_category") or res.get("category") or "",
+                x.get("value", ""),
+            ) or [canonical]):
+                accepted_for_row.add(norm(qv))
+
+            rows = topdf[topdf[kc].astype(str).map(norm).isin(accepted_for_row)].copy()
+            if "source_query" in topdf.columns:
+                rows = pd.concat([
+                    rows,
+                    topdf[topdf["source_query"].astype(str).map(norm).isin(accepted_for_row)].copy(),
+                ], ignore_index=False).drop_duplicates()
             if rows.empty:
-                rows = topdf[topdf[kc].astype(str).str.lower().str.contains(re.escape(q), regex=True, na=False)].copy()
+                rows = topdf[
+                    topdf[kc].astype(str).map(norm).apply(
+                        lambda z: any(q in z or z in q for q in accepted_for_row if q)
+                    )
+                ].copy()
+                if "source_query" in topdf.columns:
+                    rows = pd.concat([
+                        rows,
+                        topdf[topdf["source_query"].astype(str).map(norm).apply(
+                            lambda z: any(q in z or z in q for q in accepted_for_row if q)
+                        )].copy(),
+                    ], ignore_index=False).drop_duplicates()
 
             value = x.get("value", "")
             filter_urls = []
@@ -2671,66 +2727,104 @@ class App(tk.Tk):
                 for x in self.res["rows"]
                 if x.get("keyword") and str(x.get("keyword", "")).strip()
             ))
+            # Формируем карту АКТУАЛЬНЫХ запросов текущей категории до загрузки кэша.
+            # Старые seo_top30_result.csv / progress.json могут содержать результаты
+            # других категорий. Их нельзя считать выполненными только по факту наличия
+            # source_query: учитываем только запросы, которые реально относятся к
+            # текущей категории.
+            current_variants_by_keyword = {}
+            variant_to_canonical = {}
+            for row in self.res["rows"]:
+                canonical = str(row.get("keyword", "")).strip()
+                if not canonical:
+                    continue
+                variants = wordkeeper_query_variants(
+                    self.res.get("search_category") or self.res.get("category") or "",
+                    row.get("value", ""),
+                ) or [canonical]
+                current_variants_by_keyword[canonical] = variants
+                for q in variants:
+                    variant_to_canonical[norm(q)] = canonical
+
+            keywords = list(current_variants_by_keyword.keys())
+            current_keyword_set = set(keywords)
             results=[]
             done=set()
             done_queries=set()
+            cached_result_query_keys=set()
 
             if out_path.exists():
                 old=pd.read_csv(out_path,encoding="utf-8-sig")
-                if "keyword" in old.columns:
+                if not old.empty:
                     results=old.to_dict("records")
-                    done.update(str(v).strip() for v in old["keyword"].tolist() if str(v).strip())
+                    # ВАЖНО: если старый CSV был создан предыдущей версией, его
+                    # canonical keyword мог быть транслитерированным. Перепривязываем
+                    # строки по source_query к текущему русскому canonical keyword.
                     if "source_query" in old.columns:
-                        done_queries.update(str(v).strip() for v in old["source_query"].tolist() if str(v).strip())
+                        for rr in results:
+                            sq = str(rr.get("source_query", "")).strip()
+                            canonical = variant_to_canonical.get(norm(sq))
+                            if canonical:
+                                rr["keyword"] = canonical
+                                done_queries.add(sq)
+                                cached_result_query_keys.add(norm(sq))
+                    # Старые canonical keywords учитываем только если они относятся
+                    # к текущей категории.
+                    for rr in results:
+                        k = str(rr.get("keyword", "")).strip()
+                        if k in current_keyword_set:
+                            done.add(k)
 
             if progress_path.exists():
                 try:
                     progress=json.loads(progress_path.read_text(encoding="utf-8"))
-                    done.update(str(x).strip() for x in progress.get("done_keywords",[]) if str(x).strip())
-                    done_queries.update(str(x).strip() for x in progress.get("done_queries",[]) if str(x).strip())
+                    # done_keywords из старого checkpoint не переносим целиком:
+                    # оставляем только keywords текущей категории.
+                    done.update(
+                        str(x).strip() for x in progress.get("done_keywords",[])
+                        if str(x).strip() in current_keyword_set
+                    )
+                    # Аналогично done_queries: только актуальные варианты текущей
+                    # категории могут блокировать новый запрос.
+                    for x in progress.get("done_queries", []):
+                        q = str(x).strip()
+                        if q and norm(q) in variant_to_canonical:
+                            done_queries.add(q)
                 except Exception:
                     pass
 
-            # Старый checkpoint не знает о вариантах запросов. Его done_keywords
-            # остаётся совместимым: если canonical keyword уже полностью есть в
-            # старом кэше, повторно его не запрашиваем. Для новых русских keywords
-            # будут выполнены все новые варианты.
+            # Нормализованный набор уже выполненных запросов. Это устраняет ложные
+            # повторы из-за регистра/лишних пробелов.
+            done_query_keys = {norm(q) for q in done_queries if str(q).strip()}
+
+            # Если checkpoint говорит «запрос выполнен», но в накопительном CSV
+            # вообще нет ни одной строки с этим source_query, не доверяем старому
+            # checkpoint: такой запрос повторяем, иначе 0-результат/старый checkpoint
+            # может навсегда скрыть реальные TOP-30.
+            done_query_keys = {
+                qk for qk in done_query_keys
+                if qk in cached_result_query_keys
+            } | {
+                qk for qk in done_query_keys
+                if qk in cached_result_query_keys
+            }
+
             query_plan=[]
-            for row in self.res["rows"]:
-                canonical=str(row.get("keyword", "")).strip()
-                if not canonical:
-                    continue
-                variants=wordkeeper_query_variants(
-                    self.res.get("search_category") or self.res.get("category") or "",
-                    row.get("value", ""),
-                )
-                if not variants:
-                    variants=[canonical]
-                pending=[q for q in variants if q not in done_queries]
-                # Старый checkpoint v1.17 помечал только canonical keyword.
-                # Теперь считаем его полностью обработанным только тогда, когда
-                # все актуальные варианты запроса уже есть в done_queries.
-                if not pending and canonical in done:
-                    continue
-                query_plan.append((canonical, pending))
+            for canonical, variants in current_variants_by_keyword.items():
+                pending=[q for q in variants if norm(q) not in done_query_keys]
+                if pending:
+                    query_plan.append((canonical, pending))
 
             current_done={
-                k for k in keywords
-                if k in done and not any(
-                    q not in done_queries
-                    for r in self.res["rows"]
-                    if str(r.get("keyword", "")).strip() == k
-                    for q in (wordkeeper_query_variants(
-                        self.res.get("search_category") or self.res.get("category") or "",
-                        r.get("value", ""),
-                    ) or [k])
-                )
+                canonical for canonical, variants in current_variants_by_keyword.items()
+                if not any(norm(q) not in done_query_keys for q in variants)
             }
             pending_queries=sum(len(v) for _,v in query_plan)
             self.q.put(("wklog",f"TOP-30 CSV: {out_path}"))
             self.q.put(("wklog",f"Checkpoint: {progress_path}"))
             self.q.put(("wklog",f"Всего значений текущей категории: {len(keywords)} | уже полностью обработано: {len(current_done)} | осталось значений: {len(keywords)-len(current_done)}"))
-            self.q.put(("wklog",f"Запросов WordKeeper к выполнению: {pending_queries} | всего в накопительном кэше: {len(done_queries or done)}"))
+            self.q.put(("wklog",f"Запросов WordKeeper к выполнению: {pending_queries} | кэшем подтверждено запросов текущей категории: {len(done_query_keys)}"))
+            self.q.put(("wklog",f"Строк TOP-30 в накопительном CSV: {len(results)} | source_query с результатами текущей категории: {len(cached_result_query_keys)}"))
 
             query_index=0
             total_pending=pending_queries
@@ -2748,8 +2842,19 @@ class App(tk.Tk):
                         rows=parse_top30(rr.text,canonical)
                         for rrow in rows:
                             rrow["source_query"]=actual_query
-                        results.extend(rows)
                         done_queries.add(actual_query)
+                        done_query_keys.add(norm(actual_query))
+                        # Не дублируем одинаковый URL одного и того же source_query.
+                        existing_keys = {
+                            (str(rr.get("source_query", "")).strip(), str(rr.get("url", "")).strip())
+                            for rr in results
+                            if str(rr.get("source_query", "")).strip() and str(rr.get("url", "")).strip()
+                        }
+                        for rr in rows:
+                            key = (str(rr.get("source_query", "")).strip(), str(rr.get("url", "")).strip())
+                            if key not in existing_keys:
+                                results.append(rr)
+                                existing_keys.add(key)
                         pd.DataFrame(results).to_csv(out_path,index=False,encoding="utf-8-sig")
                         # keyword помечаем done только после всех его вариантов.
                         progress_path.write_text(json.dumps({
