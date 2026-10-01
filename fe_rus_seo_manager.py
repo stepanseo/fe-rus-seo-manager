@@ -460,6 +460,23 @@ def get_csrf(html):
     return token.get("value", "") if token else ""
 
 
+def safe_sorted_strings(values):
+    """Стабильная сортировка строковых значений из CSV/JSON-кэша.
+
+    Старые версии программы могли сохранить в checkpoint/CSV смешанные
+    типы (например, число и строку). Обычный sorted() в Python 3
+    сравнивает их через < и падает с TypeError.
+    """
+    cleaned = []
+    for value in values or []:
+        if value is None:
+            continue
+        text = str(value).strip()
+        if text:
+            cleaned.append(text)
+    return sorted(set(cleaned), key=lambda x: x.casefold())
+
+
 def wordkeeper_query_variants(category, value):
     """Формирует реальные поисковые запросы для одного значения OCFilter.
 
@@ -542,7 +559,7 @@ def wordkeeper_query_variants(category, value):
 # SERP PAGE CLASSIFICATION
 # -----------------------------------------------------------------------------
 
-SERP_CLASSIFIER_VERSION = "1.20"
+SERP_CLASSIFIER_VERSION = "1.20.1"
 PRODUCT_PATH_MARKERS = (
     "/product/", "/products/", "/item/", "/goods/", "/tovar/", "/offer/",
     "/p/", "/detail/", "/produkt/", "/catalog/product/"
@@ -1095,9 +1112,22 @@ def oc_resolve_category(session, token, category, category_slug="", log=lambda x
             log(f"OpenCart category resolver: EXACT SEO URL -> {chosen['category_id']} | {chosen['name']} | slug={category_slug}")
             return chosen
         log(f"OpenCart category resolver: exact SEO keyword не найден для slug={category_slug}; кандидаты={[(x['category_id'], x['name']) for x in candidates.values()]}")
-        # Если известен публичный slug, не возвращаем просто похожий ID.
-        # Иначе снова возможна ошибка вида 474 вместо 476. Безопаснее
-        # остановиться и показать, что точное сопоставление не найдено.
+
+        # Fallback: если парсер Design -> SEO URL не смог прочитать keyword,
+        # но autocomplete вернул категорию с точным названием или точным leaf,
+        # используем этот category_id. score >= 3000 означает именно такое
+        # совпадение, поэтому случайную похожую категорию не выбираем.
+        safe_candidates = [
+            c for c in candidates.values()
+            if c.get("score", 0) >= 3000
+            and oc_category_safe(cleaned or category, c.get("name", ""))
+        ]
+        if safe_candidates:
+            safe_candidates.sort(key=lambda x: x.get("score", 0), reverse=True)
+            chosen = safe_candidates[0]
+            log(f"OpenCart category resolver: FALLBACK EXACT NAME -> {chosen['category_id']} | {chosen['name']}")
+            return chosen
+
         return None
 
     if best and best["score"] >= 3000:
@@ -1617,7 +1647,7 @@ class Pipeline:
                 alias = value_alias(o, v)
                 rows.append({
                     "keyword": f"{search_category} {v['name']}",
-                    "category": cat,
+                    "category": search_category,
                     "category_id": cid,
                     "filter": o["name"],
                     "filter_keyword": o.get("keyword", ""),
@@ -1638,7 +1668,7 @@ class Pipeline:
         self.log(f"Category ID: {cid or 'не найден'}")
         self.log(f"Фильтров: {len(opts)}")
         self.log(f"Значений: {len(rows)}")
-        return {"url": r.url, "category": cat, "search_category": search_category, "category_id": cid, "options": opts, "rows": rows}
+        return {"url": r.url, "category": search_category, "category_slug": urlparse(r.url).path.rstrip("/").split("/")[-1], "search_category": search_category, "category_id": cid, "options": opts, "rows": rows}
 
     def merge_analysis(self, res, topdf, progress=None, stop_event=None, cache_path=None):
         """Сопоставляет TOP-30 с OCFilter и определяет тип продвижения.
@@ -1761,14 +1791,9 @@ class Pipeline:
             info = page_map.get(u) or cache.get(u)
             if not info:
                 continue
-            topdf.at[idx, "page_type"] = str(info.get("page_type", "") or "")
-            # TOP-30 DataFrame может иметь StringDtype (в т.ч. в новых версиях pandas).
-            # Классификационный кэш читается как dtype=str, поэтому confidence
-            # здесь сознательно записываем как строку, а не как float.
-            # Иначе pandas выдаёт:
-            # Invalid value '0.99' for dtype 'str'.
-            topdf.at[idx, "page_confidence"] = str(info.get("confidence", "") or "")
-            topdf.at[idx, "page_signals"] = str(info.get("signals", "") or "")
+            topdf.at[idx, "page_type"] = info.get("page_type", "")
+            topdf.at[idx, "page_confidence"] = info.get("confidence", "")
+            topdf.at[idx, "page_signals"] = info.get("signals", "")
             topdf.at[idx, "page_http_status"] = info.get("http_status", "")
             topdf.at[idx, "page_fetched"] = info.get("fetched", "")
             topdf.at[idx, "page_h1"] = info.get("h1", "")
@@ -2654,11 +2679,9 @@ class App(tk.Tk):
                 old=pd.read_csv(out_path,encoding="utf-8-sig")
                 if "keyword" in old.columns:
                     results=old.to_dict("records")
-                    done.update(old["keyword"].astype(str).str.strip())
+                    done.update(str(v).strip() for v in old["keyword"].tolist() if str(v).strip())
                     if "source_query" in old.columns:
-                        done_queries.update(
-                            old["source_query"].astype(str).str.strip()
-                        )
+                        done_queries.update(str(v).strip() for v in old["source_query"].tolist() if str(v).strip())
 
             if progress_path.exists():
                 try:
@@ -2675,7 +2698,7 @@ class App(tk.Tk):
             query_plan=[]
             for row in self.res["rows"]:
                 canonical=str(row.get("keyword", "")).strip()
-                if not canonical or canonical in done:
+                if not canonical:
                     continue
                 variants=wordkeeper_query_variants(
                     self.res.get("search_category") or self.res.get("category") or "",
@@ -2684,9 +2707,25 @@ class App(tk.Tk):
                 if not variants:
                     variants=[canonical]
                 pending=[q for q in variants if q not in done_queries]
+                # Старый checkpoint v1.17 помечал только canonical keyword.
+                # Теперь считаем его полностью обработанным только тогда, когда
+                # все актуальные варианты запроса уже есть в done_queries.
+                if not pending and canonical in done:
+                    continue
                 query_plan.append((canonical, pending))
 
-            current_done={k for k in keywords if k in done}
+            current_done={
+                k for k in keywords
+                if k in done and not any(
+                    q not in done_queries
+                    for r in self.res["rows"]
+                    if str(r.get("keyword", "")).strip() == k
+                    for q in (wordkeeper_query_variants(
+                        self.res.get("search_category") or self.res.get("category") or "",
+                        r.get("value", ""),
+                    ) or [k])
+                )
+            }
             pending_queries=sum(len(v) for _,v in query_plan)
             self.q.put(("wklog",f"TOP-30 CSV: {out_path}"))
             self.q.put(("wklog",f"Checkpoint: {progress_path}"))
@@ -2714,8 +2753,8 @@ class App(tk.Tk):
                         pd.DataFrame(results).to_csv(out_path,index=False,encoding="utf-8-sig")
                         # keyword помечаем done только после всех его вариантов.
                         progress_path.write_text(json.dumps({
-                            "done_keywords":sorted(done),
-                            "done_queries":sorted(done_queries),
+                            "done_keywords":safe_sorted_strings(done),
+                            "done_queries":safe_sorted_strings(done_queries),
                             "updated_at":time.strftime("%Y-%m-%d %H:%M:%S")
                         },ensure_ascii=False,indent=2),encoding="utf-8")
                         self.q.put(("wklog",f"[{query_index}/{total_pending}] {canonical} | запрос: {actual_query} | HTTP {rr.status_code} | результатов: {len(rows)} | СОХРАНЕНО"))
@@ -2727,8 +2766,8 @@ class App(tk.Tk):
                         all_variants_done=False
                         pd.DataFrame(results).to_csv(out_path,index=False,encoding="utf-8-sig")
                         progress_path.write_text(json.dumps({
-                            "done_keywords":sorted(done),
-                            "done_queries":sorted(done_queries),
+                            "done_keywords":safe_sorted_strings(done),
+                            "done_queries":safe_sorted_strings(done_queries),
                             "updated_at":time.strftime("%Y-%m-%d %H:%M:%S")
                         },ensure_ascii=False,indent=2),encoding="utf-8")
                         self.q.put(("wklog",f"ОШИБКА {actual_query}: {e} | текущая категория: обработано {len(set(keywords) & done)} из {len(keywords)}"))
@@ -2738,16 +2777,16 @@ class App(tk.Tk):
                     done.add(canonical)
                     pd.DataFrame(results).to_csv(out_path,index=False,encoding="utf-8-sig")
                     progress_path.write_text(json.dumps({
-                        "done_keywords":sorted(done),
-                        "done_queries":sorted(done_queries),
+                        "done_keywords":safe_sorted_strings(done),
+                        "done_queries":safe_sorted_strings(done_queries),
                         "updated_at":time.strftime("%Y-%m-%d %H:%M:%S")
                     },ensure_ascii=False,indent=2),encoding="utf-8")
                     self.q.put(("wklog",f"ЗАВЕРШЕНО ЗНАЧЕНИЕ: {canonical} | вариантов запроса: {len(variants)}"))
 
             pd.DataFrame(results).to_csv(out_path,index=False,encoding="utf-8-sig")
             progress_path.write_text(json.dumps({
-                "done_keywords":sorted(done),
-                "done_queries":sorted(done_queries),
+                "done_keywords":safe_sorted_strings(done),
+                "done_queries":safe_sorted_strings(done_queries),
                 "updated_at":time.strftime("%Y-%m-%d %H:%M:%S")
             },ensure_ascii=False,indent=2),encoding="utf-8")
             if self.wk_stop_event.is_set():
@@ -3247,75 +3286,29 @@ class App(tk.Tk):
             self.url_check_running=False
 
     def show_ready_filter_urls(self):
-        """Показывает исходные URL фильтрации только для полностью готовых строк.
-
-        Раньше при отсутствии готовых строк функция просто завершалась, поэтому
-        пользователю казалось, что кнопка не работает. Теперь в этом случае
-        показывается понятная причина и текущие счетчики этапов проверки.
+        """Показывает только исходные URL результатов фильтрации,
+        которые относятся к страницам, прошедшим проверку и готовым
+        для внешнего генератора. Один URL в одной строке, без нумерации.
         """
         self.export_log.delete("1.0", "end")
-
         if not self.res:
-            messagebox.showwarning(
-                "Нет данных",
-                "Сначала выполните анализ категории.\n\n"
-                "После анализа запустите Проверку URL и ПРОВЕРИТЬ OCFILTER (DRY-RUN)."
-            )
-            return False
-
-        all_rows = self.res.get("rows", []) or []
-        ready_rows = generator_rows(self.res)
+            return
 
         urls = []
         seen = set()
-        for row in ready_rows:
+        for row in generator_rows(self.res):
             url = str(row.get("filter_result_url") or "").strip()
             if not url or url in seen:
                 continue
             seen.add(url)
             urls.append(url)
 
-        if not urls:
-            create_count = sum(1 for r in all_rows if r.get("status") == "CREATE")
-            seo_create_count = sum(
-                1 for r in all_rows
-                if r.get("status") == "CREATE" and r.get("promotion_type") == "SEO-СТРАНИЦА"
-            )
-            url_ready_count = sum(
-                1 for r in all_rows
-                if r.get("status") == "CREATE"
-                and r.get("promotion_type") == "SEO-СТРАНИЦА"
-                and r.get("url_status") in ("READY_FOR_OCFILTER", "HTTP_404")
-            )
-            oc_ready_count = sum(
-                1 for r in all_rows
-                if r.get("status") == "CREATE"
-                and r.get("promotion_type") == "SEO-СТРАНИЦА"
-                and r.get("url_status") in ("READY_FOR_OCFILTER", "HTTP_404")
-                and r.get("oc_status") == "READY"
-            )
-
-            diagnostic = (
-                "Готовых URL фильтрации пока нет.\n\n"
-                f"CREATE: {create_count}\n"
-                f"SEO + CREATE: {seo_create_count}\n"
-                f"URL прошли проверку: {url_ready_count}\n"
-                f"OCFilter READY: {oc_ready_count}\n\n"
-                "Для вывода URL должны пройти оба этапа: "
-                "Проверка URL и Проверка OCFilter (DRY-RUN)."
-            )
-            self.export_log.insert("1.0", diagnostic)
-            messagebox.showwarning("Нет готовых URL", diagnostic)
-            return False
-
-        self.export_log.insert("1.0", "\n".join(urls))
-        self.export_log.see("1.0")
-        return True
+        if urls:
+            self.export_log.insert("1.0", "\n".join(urls))
 
     def copy_ready_filter_urls(self):
         """Копирует только готовые исходные URL фильтрации, по одному в строке."""
-        if not self.show_ready_filter_urls():
-            return
+        self.show_ready_filter_urls()
         value=self.export_log.get("1.0", "end-1c").strip()
         if not value:
             messagebox.showwarning("Нет URL", "Нет URL результатов фильтрации, прошедших проверку.")
@@ -3323,7 +3316,6 @@ class App(tk.Tk):
         self.clipboard_clear()
         self.clipboard_append(value)
         self.update()
-        messagebox.showinfo("Скопировано", f"Скопировано URL: {len(value.splitlines())}")
 
     def export_generator(self):
         if not self.res:
