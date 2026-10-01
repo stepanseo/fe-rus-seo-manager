@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-FE-RUS SEO Manager v1.20.5
+FE-RUS SEO Manager v1.20.6
 
 Единое Windows-приложение:
 1. Категория - получает category_id, OCFilter options и значения.
@@ -1164,6 +1164,24 @@ def oc_resolve_category(session, token, category, category_slug="", log=lambda x
         return best
     if best and oc_category_safe(cleaned or category, best["name"]):
         return best
+
+    # Резервный путь: autocomplete в некоторых сборках OpenCart/OCFilter
+    # может не вернуть категорию вообще. В этом случае ищем ее в штатном
+    # административном списке категорий, где есть реальный category_id.
+    # Важно: принимаем только безопасное совпадение имени, чтобы не получить
+    # соседнюю/похожую категорию.
+    try:
+        admin_best = oc_category_from_admin_list(session, token, cleaned or category, log=log)
+        if not admin_best and category_slug:
+            slug_words = re.sub(r"[-_]+", " ", str(category_slug)).strip()
+            if slug_words:
+                admin_best = oc_category_from_admin_list(session, token, slug_words, log=log)
+        if admin_best and oc_category_safe(cleaned or category, admin_best.get("name", "")):
+            log(f"OpenCart category resolver: ADMIN FALLBACK -> {admin_best['category_id']} | {admin_best['name']}")
+            return admin_best
+    except Exception as e:
+        log(f"OpenCart category resolver: ADMIN FALLBACK ошибка: {e}")
+
     return None
 
 def oc_category_from_admin_list(session, token, category, log=lambda x: None):
@@ -2233,19 +2251,22 @@ class Pipeline:
                         f"[{idx}/{total}] CATEGORY ID у анализа отсутствует | "
                         f"повторно ищем родительскую категорию: {category}"
                     )
+                log_fn = (lambda msg: progress(f"[{idx}/{total}] {msg}") if progress else None)
+                # Используем тот же полный resolver, что и при получении
+                # категории: autocomplete -> точный SEO keyword -> admin list.
+                # Раньше здесь вызывался только autocomplete, поэтому при
+                # отсутствии category_id в анализе все варианты получали
+                # CATEGORY_NOT_FOUND даже при корректной авторизации.
                 resolved = oc_resolve_category(
                     s, token, category,
                     category_slug=parent_slug,
-                    log=(lambda msg: progress(f"[{idx}/{total}] {msg}") if progress else None),
+                    log=log_fn,
                 )
-                # Второй fallback: если H1 отличается от имени категории в
-                # OpenCart, пробуем получить ID через тот же надежный resolver,
-                # но без жесткого требования совпадения SEO slug.
                 if not resolved:
                     resolved = oc_resolve_category(
                         s, token, category,
                         category_slug="",
-                        log=(lambda msg: progress(f"[{idx}/{total}] {msg}") if progress else None),
+                        log=log_fn,
                     )
 
             if not resolved:
@@ -2429,7 +2450,7 @@ def export_excel(res, path, topdf=None):
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("FE-RUS SEO Manager v1.20.5")
+        self.title("FE-RUS SEO Manager v1.20.6")
         self.geometry("1280x860")
         self.q = queue.Queue()
         self.res = None
@@ -3694,8 +3715,9 @@ class App(tk.Tk):
                 f"URL прошли проверку: {url_ready}\n"
                 f"OCFilter READY: {oc_ready}\n"
                 f"OCFilter статусы: {oc_status_text}\n\n"
-                "Чтобы URL появились здесь, они должны пройти проверку URL "
-                "и OCFilter (DRY-RUN)."
+                "Правило экспорта: status=CREATE + promotion_type=SEO-СТРАНИЦА "
+                "+ URL=404/READY + OCFilter=READY.\n"
+                "Если OCFilter READY=0, ссылки намеренно не выводятся."
             )
 
     def copy_ready_filter_urls(self):
