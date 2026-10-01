@@ -1761,9 +1761,14 @@ class Pipeline:
             info = page_map.get(u) or cache.get(u)
             if not info:
                 continue
-            topdf.at[idx, "page_type"] = info.get("page_type", "")
-            topdf.at[idx, "page_confidence"] = info.get("confidence", "")
-            topdf.at[idx, "page_signals"] = info.get("signals", "")
+            topdf.at[idx, "page_type"] = str(info.get("page_type", "") or "")
+            # TOP-30 DataFrame может иметь StringDtype (в т.ч. в новых версиях pandas).
+            # Классификационный кэш читается как dtype=str, поэтому confidence
+            # здесь сознательно записываем как строку, а не как float.
+            # Иначе pandas выдаёт:
+            # Invalid value '0.99' for dtype 'str'.
+            topdf.at[idx, "page_confidence"] = str(info.get("confidence", "") or "")
+            topdf.at[idx, "page_signals"] = str(info.get("signals", "") or "")
             topdf.at[idx, "page_http_status"] = info.get("http_status", "")
             topdf.at[idx, "page_fetched"] = info.get("fetched", "")
             topdf.at[idx, "page_h1"] = info.get("h1", "")
