@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-FE-RUS SEO Manager v1.20.6
+FE-RUS SEO Manager v1.20.7
 
 Единое Windows-приложение:
 1. Категория - получает category_id, OCFilter options и значения.
@@ -26,7 +26,7 @@ import queue
 import webbrowser
 import types
 from pathlib import Path
-from urllib.parse import urlparse, urljoin
+from urllib.parse import urlparse, urljoin, unquote_plus
 from collections import Counter
 
 import tkinter as tk
@@ -1016,6 +1016,102 @@ def _category_seo_keywords_from_html(html):
     return out
 
 
+def oc_category_id_by_seo_keyword(session, token, category_slug, log=lambda x: None):
+    """Надежно получает category_id по ТОЧНОМУ публичному SEO slug категории.
+
+    Это отдельный путь от autocomplete. Он нужен потому, что OpenCart
+    autocomplete может вернуть похожую категорию с другим category_id.
+    Для категории из URL вида /list-perforirovannyj-stal-konstruktsionnaja/
+    ищем именно этот keyword в административном разделе SEO URL и извлекаем
+    query=category_id=N.
+    """
+    slug = str(category_slug or "").strip().strip("/")
+    if not slug:
+        return None
+
+    base = f"{ADMIN}?route=design/seo_url&user_token={token}"
+    urls = [
+        base + "&filter_keyword=" + requests.utils.quote(slug, safe=""),
+        base + "&filter_keyword=" + requests.utils.quote(slug, safe="") + "&page=1",
+    ]
+    target_norm = norm(slug)
+    target_slug = slugify(slug.replace("_", "-"))
+
+    seen = set()
+    for url in urls:
+        try:
+            r = session.get(url, timeout=30)
+            if log:
+                log(f"OpenCart SEO URL: keyword={slug!r} -> HTTP {r.status_code}")
+            if r.status_code != 200:
+                continue
+            soup = BeautifulSoup(r.text, "html.parser")
+
+            for tr in soup.find_all("tr"):
+                row_html = str(tr)
+                row_text = tr.get_text(" ", strip=True)
+                if not row_text:
+                    continue
+
+                # Сначала определяем keyword строки.
+                row_keywords = []
+                for el in tr.find_all(["input", "textarea"]):
+                    name = str(el.get("name") or "").lower()
+                    if "keyword" in name:
+                        value = el.get("value") or el.get_text(" ", strip=True)
+                        if value:
+                            row_keywords.append(str(value).strip().strip("/"))
+
+                cells = [c.get_text(" ", strip=True) for c in tr.find_all(["td", "th"])]
+                row_keywords.extend(cells)
+                exact_keyword = False
+                for kw in row_keywords:
+                    kn = norm(kw.strip("/"))
+                    ks = slugify(kw.strip("/").replace("_", "-"))
+                    if kn == target_norm or (target_slug and ks == target_slug):
+                        exact_keyword = True
+                        break
+
+                # Даже если разметка таблицы нестандартная, query обычно
+                # присутствует в HTML как category_id=NNN.
+                decoded = unquote_plus(unquote_plus(row_html))
+                m = re.search(r"(?:category_id=|category_id%3D)(\d+)", decoded, re.I)
+                if not m:
+                    m = re.search(r"(?:^|[?&\s])category_id\s*[=:]\s*(\d+)", row_text, re.I)
+                if not m:
+                    continue
+                cid = m.group(1)
+
+                # Если keyword удалось извлечь, принимаем только точное
+                # совпадение. Если фильтр OpenCart уже вернул нужный keyword,
+                # допускаем строку с category_id даже при нестандартной верстке.
+                if exact_keyword:
+                    if cid not in seen:
+                        seen.add(cid)
+                        if log:
+                            log(f"OpenCart SEO URL: EXACT keyword -> category_id={cid} | slug={slug}")
+                        return cid
+
+            # Дополнительный fallback: ищем category_id=... рядом с точным
+            # keyword в исходном HTML, включая URL-encoded вариант.
+            html_dec = unquote_plus(unquote_plus(r.text))
+            pattern = re.compile(
+                r"(?:keyword[^>]{0,500}?" + re.escape(slug) + r"[^>]{0,1000}?category_id=(\d+)"
+                r"|category_id=(\d+)[^>]{0,1000}?keyword[^>]{0,500}?" + re.escape(slug) + r")",
+                re.I | re.S,
+            )
+            m = pattern.search(html_dec)
+            if m:
+                cid = m.group(1) or m.group(2)
+                if log:
+                    log(f"OpenCart SEO URL: HTML fallback -> category_id={cid} | slug={slug}")
+                return cid
+        except Exception as e:
+            if log:
+                log(f"OpenCart SEO URL: ошибка keyword={slug!r}: {e}")
+    return None
+
+
 def oc_category_seo_keywords(session, token, category_id):
     """Читает SEO keyword конкретной категории из OpenCart admin.
 
@@ -1279,6 +1375,16 @@ def resolve_public_category_id_via_admin(category_label, basic_user, basic_pass,
     s = http_session()
     try:
         token = oc_login(s, basic_user, basic_pass, oc_user, oc_pass)
+
+        # ПЕРВЫМ делом определяем category_id по точному SEO slug текущей
+        # публичной категории. Это исключает ложные IDs, которые autocomplete
+        # иногда возвращает для похожих категорий.
+        if category_slug:
+            direct_cid = oc_category_id_by_seo_keyword(s, token, category_slug, log=log)
+            if direct_cid:
+                log(f"OpenCart category resolver: DIRECT SEO SLUG -> {direct_cid} | slug={category_slug}")
+                return str(direct_cid)
+
         best = oc_resolve_category(s, token, category_label, category_slug=category_slug, log=log)
 
         # Если H1 содержит регион или отличается от имени в базе,
@@ -2252,16 +2358,30 @@ class Pipeline:
                         f"повторно ищем родительскую категорию: {category}"
                     )
                 log_fn = (lambda msg: progress(f"[{idx}/{total}] {msg}") if progress else None)
-                # Используем тот же полный resolver, что и при получении
-                # категории: autocomplete -> точный SEO keyword -> admin list.
-                # Раньше здесь вызывался только autocomplete, поэтому при
-                # отсутствии category_id в анализе все варианты получали
-                # CATEGORY_NOT_FOUND даже при корректной авторизации.
-                resolved = oc_resolve_category(
-                    s, token, category,
-                    category_slug=parent_slug,
-                    log=log_fn,
-                )
+
+                # Если анализ не сохранил ID, сначала ищем его напрямую по
+                # точному публичному SEO slug родительской категории.
+                # Это надежнее autocomplete и не допускает подмены 476 на 474.
+                resolved = None
+                if parent_slug:
+                    direct_cid = oc_category_id_by_seo_keyword(s, token, parent_slug, log=log_fn)
+                    if direct_cid:
+                        resolved = {
+                            "category_id": str(direct_cid),
+                            "name": category,
+                            "score": 10000,
+                            "term": "DIRECT_SEO_SLUG",
+                        }
+                        if progress:
+                            progress(f"[{idx}/{total}] CATEGORY ID={direct_cid} | найден по точному SEO slug")
+
+                # Если прямой поиск не дал ID, используем полный resolver.
+                if not resolved:
+                    resolved = oc_resolve_category(
+                        s, token, category,
+                        category_slug=parent_slug,
+                        log=log_fn,
+                    )
                 if not resolved:
                     resolved = oc_resolve_category(
                         s, token, category,
@@ -3375,7 +3495,7 @@ class App(tk.Tk):
                         "redirect_location":redirect_location,"final_http_status":final_status,"final_url":final_url,
                         "redirect":redirected,"existing_seo_url":x.get("existing_seo_url",""),
                         "existing_seo_alias":x.get("existing_seo_alias",""),"existing_seo_source":x.get("existing_seo_source",""),
-                        "checked_at":now,"verification_state":"VERIFIED","verification_version":"4","error":""
+                        "checked_at":now,"verification_state":"VERIFIED","verification_version":"5","error":""
                     }
                     self._save_url_audit(audit)
                     redir_txt=f" | Location: {redirect_location}" if redirect_location else ""
@@ -3636,7 +3756,7 @@ class App(tk.Tk):
                         "redirect_location":redirect_location,"final_http_status":final_status,"final_url":final_url,
                         "redirect":redirected,"existing_seo_url":x.get("existing_seo_url",""),
                         "existing_seo_alias":x.get("existing_seo_alias",""),"existing_seo_source":x.get("existing_seo_source",""),
-                        "checked_at":now,"verification_state":"VERIFIED","verification_version":"4","error":""
+                        "checked_at":now,"verification_state":"VERIFIED","verification_version":"5","error":""
                     }
                     self._save_url_audit(audit)
                     redir_txt=f" | Location: {redirect_location}" if redirect_location else ""
