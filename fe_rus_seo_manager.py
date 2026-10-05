@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-FE-RUS SEO Manager v1.21.1
+FE-RUS SEO Manager v1.21.2
 
 Единое Windows-приложение:
 1. Категория - получает category_id, OCFilter options и значения.
@@ -219,6 +219,48 @@ def http_session():
     s = requests.Session()
     s.headers.update({"User-Agent": UA, "Accept-Language": "ru-RU,ru;q=0.9"})
     return s
+
+
+def http_status_code(response):
+    """Безопасно получает HTTP-код из requests.Response или словаря-обертки."""
+    if hasattr(response, "status_code"):
+        try:
+            return int(response.status_code)
+        except (TypeError, ValueError):
+            return response.status_code
+
+    if isinstance(response, dict):
+        for key in ("status_code", "http_status", "status", "code"):
+            value = response.get(key)
+            if value not in (None, ""):
+                try:
+                    return int(value)
+                except (TypeError, ValueError):
+                    return str(value)
+        nested = response.get("response")
+        if nested is not None and nested is not response:
+            return http_status_code(nested)
+
+    return "UNKNOWN"
+
+
+def http_response_text(response):
+    """Безопасно получает текст HTTP-ответа из Response или словаря."""
+    if hasattr(response, "text"):
+        return str(response.text or "")
+
+    if isinstance(response, dict):
+        for key in ("text", "html", "body", "content", "response_text"):
+            value = response.get(key)
+            if isinstance(value, bytes):
+                return value.decode("utf-8", errors="replace")
+            if isinstance(value, str):
+                return value
+        nested = response.get("response")
+        if nested is not None and nested is not response:
+            return http_response_text(nested)
+
+    return ""
 
 
 def find_col(df, names):
