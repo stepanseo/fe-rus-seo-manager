@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-FE-RUS SEO Manager v1.20.9
+FE-RUS SEO Manager v1.21.0
 
 Единое Windows-приложение:
 1. Категория - получает category_id, OCFilter options и значения.
@@ -626,7 +626,7 @@ def wordkeeper_query_variants(category, value):
 # SERP PAGE CLASSIFICATION
 # -----------------------------------------------------------------------------
 
-SERP_CLASSIFIER_VERSION = "1.20.9"
+SERP_CLASSIFIER_VERSION = "1.21.0"
 PRODUCT_PATH_MARKERS = (
     "/product/", "/products/", "/item/", "/goods/", "/tovar/", "/offer/",
     "/p/", "/detail/", "/produkt/", "/catalog/product/"
@@ -2706,6 +2706,8 @@ class App(tk.Tk):
         ttk.Spinbox(row,from_=0,to=9999,textvariable=self.region,width=7).pack(side="left",padx=8)
         self.wk_start_btn=ttk.Button(row,text="ПОЛУЧИТЬ TOP-30 WORDKEEPER",command=self.start_wordkeeper)
         self.wk_start_btn.pack(side="left")
+        self.wk_rebuild_btn=ttk.Button(row,text="ПЕРЕСОБРАТЬ TOP-30 ТЕКУЩЕГО РАЗДЕЛА",command=self.rebuild_wordkeeper_current_section)
+        self.wk_rebuild_btn.pack(side="left",padx=8)
         self.wk_stop_btn=ttk.Button(row,text="ОСТАНОВИТЬ АНАЛИЗ",command=self.stop_wordkeeper,state="disabled")
         self.wk_stop_btn.pack(side="left",padx=8)
         ttk.Button(row,text="ЗАГРУЗИТЬ CSV",command=self.load_wk_csv).pack(side="left",padx=8)
@@ -3071,6 +3073,98 @@ class App(tk.Tk):
         self.wkstatus.config(text="Остановка WordKeeper... текущий запрос завершится, затем анализ остановится")
         self.wklog.insert("end","\n!!! Запрошена остановка. Последний завершённый запрос уже сохранён.\n")
         self.wklog.see("end")
+
+    def rebuild_wordkeeper_current_section(self):
+        """Удаляет накопленные TOP-30 только для текущего раздела и запускает его заново."""
+        if not self.res or not self.res.get("rows"):
+            messagebox.showwarning("TOP-30", "Сначала получите категорию и фильтры текущего раздела.")
+            return
+        if self.wk_running:
+            messagebox.showwarning("TOP-30", "Сначала дождитесь завершения или остановите текущий сбор TOP-30.")
+            return
+
+        category = str(self.res.get("category") or self.res.get("search_category") or "").strip()
+        current_keywords = {
+            str(x.get("keyword", "")).strip()
+            for x in self.res.get("rows", [])
+            if str(x.get("keyword", "")).strip()
+        }
+        current_variants = set()
+        for row in self.res.get("rows", []):
+            canonical = str(row.get("keyword", "")).strip()
+            if not canonical:
+                continue
+            variants = wordkeeper_query_variants(
+                self.res.get("search_category") or self.res.get("category") or "",
+                row.get("value", ""),
+            ) or [canonical]
+            current_variants.update(norm(q) for q in variants if str(q).strip())
+
+        if not current_keywords:
+            messagebox.showwarning("TOP-30", "У текущего раздела нет запросов для пересборки.")
+            return
+
+        ok = messagebox.askyesno(
+            "Пересобрать TOP-30",
+            f"Пересобрать TOP-30 заново только для текущего раздела?\n\n"
+            f"Раздел: {category or 'текущий'}\n"
+            f"Значений/запросов: {len(current_keywords)}\n\n"
+            "Старые результаты этого раздела будут удалены из накопительного CSV и checkpoint. "
+            "Результаты других разделов сохранятся.",
+        )
+        if not ok:
+            return
+
+        folder = Path(self.folder.get() or os.getcwd())
+        out_path = folder / "seo_top30_result.csv"
+        progress_path = folder / "seo_top30_progress.json"
+        removed_rows = 0
+        removed_queries = 0
+
+        # Удаляем только строки текущего раздела из накопительного CSV.
+        if out_path.exists() and out_path.stat().st_size:
+            try:
+                old = pd.read_csv(out_path, encoding="utf-8-sig")
+                if not old.empty:
+                    mask = pd.Series(False, index=old.index)
+                    if "source_query" in old.columns:
+                        mask = mask | old["source_query"].astype(str).map(norm).isin(current_variants)
+                    if "keyword" in old.columns:
+                        mask = mask | old["keyword"].astype(str).str.strip().isin(current_keywords)
+                    removed_rows = int(mask.sum())
+                    old = old.loc[~mask].copy()
+                    old.to_csv(out_path, index=False, encoding="utf-8-sig")
+            except Exception as e:
+                messagebox.showerror("TOP-30", f"Не удалось очистить текущий раздел из CSV:\n{e}")
+                return
+
+        # Из checkpoint удаляем только текущие canonical keywords и их варианты.
+        if progress_path.exists() and progress_path.stat().st_size:
+            try:
+                progress = json.loads(progress_path.read_text(encoding="utf-8"))
+                old_done_keywords = [str(x).strip() for x in progress.get("done_keywords", [])]
+                old_done_queries = [str(x).strip() for x in progress.get("done_queries", [])]
+                new_done_keywords = [x for x in old_done_keywords if x not in current_keywords]
+                new_done_queries = [x for x in old_done_queries if norm(x) not in current_variants]
+                removed_queries = len(old_done_queries) - len(new_done_queries)
+                progress["done_keywords"] = new_done_keywords
+                progress["done_queries"] = new_done_queries
+                progress["updated_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+                progress_path.write_text(json.dumps(progress, ensure_ascii=False, indent=2), encoding="utf-8")
+            except Exception as e:
+                messagebox.showerror("TOP-30", f"Не удалось обновить checkpoint:\n{e}")
+                return
+
+        self.topdf = pd.DataFrame()
+        self.wkstatus.config(text="Старый TOP-30 текущего раздела сброшен")
+        self.wklog.delete("1.0", "end")
+        self.wklog.insert("end", f"Пересборка текущего раздела: {category or 'текущий раздел'}\n")
+        self.wklog.insert("end", f"Удалено старых строк TOP-30: {removed_rows}\n")
+        self.wklog.insert("end", f"Сброшено checkpoint-запросов: {removed_queries}\n")
+        self.wklog.insert("end", "Запускаем новый сбор TOP-30...\n")
+        self.wklog.see("end")
+        self.save_settings()
+        self.start_wordkeeper()
 
     def worker_wordkeeper(self):
         out_path=Path(self.folder.get() or os.getcwd())/"seo_top30_result.csv"
