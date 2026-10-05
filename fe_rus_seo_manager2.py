@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-FE-RUS SEO Manager v1.21.0
+FE-RUS SEO Manager v1.21.1
 
 Единое Windows-приложение:
 1. Категория - получает category_id, OCFilter options и значения.
@@ -626,7 +626,7 @@ def wordkeeper_query_variants(category, value):
 # SERP PAGE CLASSIFICATION
 # -----------------------------------------------------------------------------
 
-SERP_CLASSIFIER_VERSION = "1.21.0"
+SERP_CLASSIFIER_VERSION = "1.21.1"
 PRODUCT_PATH_MARKERS = (
     "/product/", "/products/", "/item/", "/goods/", "/tovar/", "/offer/",
     "/p/", "/detail/", "/produkt/", "/catalog/product/"
@@ -2640,7 +2640,7 @@ def export_excel(res, path, topdf=None):
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("FE-RUS SEO Manager v1.20.6")
+        self.title("FE-RUS SEO Manager v1.21.1")
         self.geometry("1280x860")
         self.q = queue.Queue()
         self.res = None
@@ -2700,18 +2700,31 @@ class App(tk.Tk):
             ttk.Label(box,text=n+":").grid(row=r,column=c,padx=8,pady=6,sticky="w")
             e=ttk.Entry(box,show="*" if sec else ""); e.grid(row=r,column=c+1,sticky="ew",padx=8); self.wk[n]=e
         box.columnconfigure(1,weight=1); box.columnconfigure(3,weight=1)
-        row=ttk.Frame(f); row.pack(fill="x",padx=10,pady=6)
+        # Основное управление сбором TOP-30.
+        row=ttk.Frame(f); row.pack(fill="x",padx=10,pady=(6,2))
         ttk.Label(row,text="Регион:").pack(side="left")
         self.region=tk.IntVar(value=int(self.cfg.get("region",213) or 213))
         ttk.Spinbox(row,from_=0,to=9999,textvariable=self.region,width=7).pack(side="left",padx=8)
         self.wk_start_btn=ttk.Button(row,text="ПОЛУЧИТЬ TOP-30 WORDKEEPER",command=self.start_wordkeeper)
         self.wk_start_btn.pack(side="left")
-        self.wk_rebuild_btn=ttk.Button(row,text="ПЕРЕСОБРАТЬ TOP-30 ТЕКУЩЕГО РАЗДЕЛА",command=self.rebuild_wordkeeper_current_section)
-        self.wk_rebuild_btn.pack(side="left",padx=8)
         self.wk_stop_btn=ttk.Button(row,text="ОСТАНОВИТЬ АНАЛИЗ",command=self.stop_wordkeeper,state="disabled")
         self.wk_stop_btn.pack(side="left",padx=8)
         ttk.Button(row,text="ЗАГРУЗИТЬ CSV",command=self.load_wk_csv).pack(side="left",padx=8)
         self.wkstatus=ttk.Label(row,text="TOP-30 ещё не загружен"); self.wkstatus.pack(side="left",padx=8)
+
+        # Пересборка вынесена в отдельную строку, чтобы кнопка не исчезала
+        # за пределами окна при небольшой ширине интерфейса.
+        rebuild_row=ttk.Frame(f); rebuild_row.pack(fill="x",padx=10,pady=(2,6))
+        self.wk_rebuild_btn=ttk.Button(
+            rebuild_row,
+            text="ПЕРЕСОБРАТЬ TOP-30 ТЕКУЩЕГО РАЗДЕЛА",
+            command=self.rebuild_wordkeeper_current_section,
+        )
+        self.wk_rebuild_btn.pack(side="left")
+        ttk.Label(
+            rebuild_row,
+            text="Удаляет только TOP-30 текущего раздела и запускает его заново",
+        ).pack(side="left",padx=10)
         self.wklog=tk.Text(f,font=("Consolas",10)); self.wklog.pack(fill="both",expand=True,padx=10,pady=8)
 
     def build_analysis(self):
