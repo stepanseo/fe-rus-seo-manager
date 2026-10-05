@@ -26,7 +26,7 @@ import queue
 import webbrowser
 import types
 from pathlib import Path
-from urllib.parse import urlparse, urljoin, unquote_plus
+from urllib.parse import urlparse, urljoin
 from collections import Counter
 
 import tkinter as tk
@@ -55,36 +55,6 @@ def norm(x):
     x = str(x or "").lower().replace("ё", "е")
     x = re.sub(r"\s+", " ", x).strip()
     return x
-
-
-def canonical_value(x):
-    """Нормализует значение характеристики для сопоставления строк.
-
-    В CSV/Excel число может прийти как 1.0, а результат OCFilter как "1".
-    Для сопоставления это должно считаться одним и тем же значением.
-    Остальные значения сравниваются через norm().
-    """
-    s = norm(x)
-    if not s:
-        return ""
-    sn = s.replace(",", ".")
-    if re.fullmatch(r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)", sn):
-        try:
-            from decimal import Decimal
-            d = Decimal(sn)
-            return format(d, "f").rstrip("0").rstrip(".") or "0"
-        except Exception:
-            pass
-    return s
-
-
-def result_row_key(x):
-    """Стабильный ключ строки для объединения результатов OCFilter с анализом."""
-    return (
-        norm(x.get("keyword", "")),
-        norm(x.get("filter", "")),
-        canonical_value(x.get("value", "")),
-    )
 
 
 def slugify(text):
@@ -218,6 +188,54 @@ def http_session():
     s = requests.Session()
     s.headers.update({"User-Agent": UA, "Accept-Language": "ru-RU,ru;q=0.9"})
     return s
+
+
+def http_status_code(response):
+    """Безопасно получает HTTP-код как из requests.Response, так и из dict.
+
+    В некоторых сборках/обертках WordKeeper ответ POST может приходить
+    не как requests.Response, а как словарь. Старый код обращался напрямую
+    к response.status_code и из-за этого падал с:
+    "dict object has no attribute status_code".
+    """
+    if hasattr(response, "status_code"):
+        try:
+            return int(response.status_code)
+        except (TypeError, ValueError):
+            return response.status_code
+
+    if isinstance(response, dict):
+        for key in ("status_code", "http_status", "status", "code"):
+            value = response.get(key)
+            if value not in (None, ""):
+                try:
+                    return int(value)
+                except (TypeError, ValueError):
+                    return str(value)
+        nested = response.get("response")
+        if nested is not None and nested is not response:
+            return http_status_code(nested)
+
+    return "UNKNOWN"
+
+
+def http_response_text(response):
+    """Безопасно получает текст HTTP-ответа из Response или dict."""
+    if hasattr(response, "text"):
+        return str(response.text or "")
+
+    if isinstance(response, dict):
+        for key in ("text", "html", "body", "content", "response_text"):
+            value = response.get(key)
+            if isinstance(value, bytes):
+                return value.decode("utf-8", errors="replace")
+            if isinstance(value, str):
+                return value
+        nested = response.get("response")
+        if nested is not None and nested is not response:
+            return http_response_text(nested)
+
+    return ""
 
 
 def find_col(df, names):
@@ -490,23 +508,6 @@ def get_csrf(html):
     return token.get("value", "") if token else ""
 
 
-def safe_sorted_strings(values):
-    """Стабильная сортировка строковых значений из CSV/JSON-кэша.
-
-    Старые версии программы могли сохранить в checkpoint/CSV смешанные
-    типы (например, число и строку). Обычный sorted() в Python 3
-    сравнивает их через < и падает с TypeError.
-    """
-    cleaned = []
-    for value in values or []:
-        if value is None:
-            continue
-        text = str(value).strip()
-        if text:
-            cleaned.append(text)
-    return sorted(set(cleaned), key=lambda x: x.casefold())
-
-
 def wordkeeper_query_variants(category, value):
     """Формирует реальные поисковые запросы для одного значения OCFilter.
 
@@ -589,7 +590,7 @@ def wordkeeper_query_variants(category, value):
 # SERP PAGE CLASSIFICATION
 # -----------------------------------------------------------------------------
 
-SERP_CLASSIFIER_VERSION = "1.20.2"
+SERP_CLASSIFIER_VERSION = "1.20.7"
 PRODUCT_PATH_MARKERS = (
     "/product/", "/products/", "/item/", "/goods/", "/tovar/", "/offer/",
     "/p/", "/detail/", "/produkt/", "/catalog/product/"
@@ -1016,102 +1017,6 @@ def _category_seo_keywords_from_html(html):
     return out
 
 
-def oc_category_id_by_seo_keyword(session, token, category_slug, log=lambda x: None):
-    """Надежно получает category_id по ТОЧНОМУ публичному SEO slug категории.
-
-    Это отдельный путь от autocomplete. Он нужен потому, что OpenCart
-    autocomplete может вернуть похожую категорию с другим category_id.
-    Для категории из URL вида /list-perforirovannyj-stal-konstruktsionnaja/
-    ищем именно этот keyword в административном разделе SEO URL и извлекаем
-    query=category_id=N.
-    """
-    slug = str(category_slug or "").strip().strip("/")
-    if not slug:
-        return None
-
-    base = f"{ADMIN}?route=design/seo_url&user_token={token}"
-    urls = [
-        base + "&filter_keyword=" + requests.utils.quote(slug, safe=""),
-        base + "&filter_keyword=" + requests.utils.quote(slug, safe="") + "&page=1",
-    ]
-    target_norm = norm(slug)
-    target_slug = slugify(slug.replace("_", "-"))
-
-    seen = set()
-    for url in urls:
-        try:
-            r = session.get(url, timeout=30)
-            if log:
-                log(f"OpenCart SEO URL: keyword={slug!r} -> HTTP {r.status_code}")
-            if r.status_code != 200:
-                continue
-            soup = BeautifulSoup(r.text, "html.parser")
-
-            for tr in soup.find_all("tr"):
-                row_html = str(tr)
-                row_text = tr.get_text(" ", strip=True)
-                if not row_text:
-                    continue
-
-                # Сначала определяем keyword строки.
-                row_keywords = []
-                for el in tr.find_all(["input", "textarea"]):
-                    name = str(el.get("name") or "").lower()
-                    if "keyword" in name:
-                        value = el.get("value") or el.get_text(" ", strip=True)
-                        if value:
-                            row_keywords.append(str(value).strip().strip("/"))
-
-                cells = [c.get_text(" ", strip=True) for c in tr.find_all(["td", "th"])]
-                row_keywords.extend(cells)
-                exact_keyword = False
-                for kw in row_keywords:
-                    kn = norm(kw.strip("/"))
-                    ks = slugify(kw.strip("/").replace("_", "-"))
-                    if kn == target_norm or (target_slug and ks == target_slug):
-                        exact_keyword = True
-                        break
-
-                # Даже если разметка таблицы нестандартная, query обычно
-                # присутствует в HTML как category_id=NNN.
-                decoded = unquote_plus(unquote_plus(row_html))
-                m = re.search(r"(?:category_id=|category_id%3D)(\d+)", decoded, re.I)
-                if not m:
-                    m = re.search(r"(?:^|[?&\s])category_id\s*[=:]\s*(\d+)", row_text, re.I)
-                if not m:
-                    continue
-                cid = m.group(1)
-
-                # Если keyword удалось извлечь, принимаем только точное
-                # совпадение. Если фильтр OpenCart уже вернул нужный keyword,
-                # допускаем строку с category_id даже при нестандартной верстке.
-                if exact_keyword:
-                    if cid not in seen:
-                        seen.add(cid)
-                        if log:
-                            log(f"OpenCart SEO URL: EXACT keyword -> category_id={cid} | slug={slug}")
-                        return cid
-
-            # Дополнительный fallback: ищем category_id=... рядом с точным
-            # keyword в исходном HTML, включая URL-encoded вариант.
-            html_dec = unquote_plus(unquote_plus(r.text))
-            pattern = re.compile(
-                r"(?:keyword[^>]{0,500}?" + re.escape(slug) + r"[^>]{0,1000}?category_id=(\d+)"
-                r"|category_id=(\d+)[^>]{0,1000}?keyword[^>]{0,500}?" + re.escape(slug) + r")",
-                re.I | re.S,
-            )
-            m = pattern.search(html_dec)
-            if m:
-                cid = m.group(1) or m.group(2)
-                if log:
-                    log(f"OpenCart SEO URL: HTML fallback -> category_id={cid} | slug={slug}")
-                return cid
-        except Exception as e:
-            if log:
-                log(f"OpenCart SEO URL: ошибка keyword={slug!r}: {e}")
-    return None
-
-
 def oc_category_seo_keywords(session, token, category_id):
     """Читает SEO keyword конкретной категории из OpenCart admin.
 
@@ -1238,129 +1143,16 @@ def oc_resolve_category(session, token, category, category_slug="", log=lambda x
             log(f"OpenCart category resolver: EXACT SEO URL -> {chosen['category_id']} | {chosen['name']} | slug={category_slug}")
             return chosen
         log(f"OpenCart category resolver: exact SEO keyword не найден для slug={category_slug}; кандидаты={[(x['category_id'], x['name']) for x in candidates.values()]}")
-
-        # Fallback: если парсер Design -> SEO URL не смог прочитать keyword,
-        # но autocomplete вернул категорию с точным названием или точным leaf,
-        # используем этот category_id. score >= 3000 означает именно такое
-        # совпадение, поэтому случайную похожую категорию не выбираем.
-        safe_candidates = [
-            c for c in candidates.values()
-            if c.get("score", 0) >= 3000
-            and oc_category_safe(cleaned or category, c.get("name", ""))
-        ]
-        if safe_candidates:
-            safe_candidates.sort(key=lambda x: x.get("score", 0), reverse=True)
-            chosen = safe_candidates[0]
-            log(f"OpenCart category resolver: FALLBACK EXACT NAME -> {chosen['category_id']} | {chosen['name']}")
-            return chosen
-
+        # Если известен публичный slug, не возвращаем просто похожий ID.
+        # Иначе снова возможна ошибка вида 474 вместо 476. Безопаснее
+        # остановиться и показать, что точное сопоставление не найдено.
         return None
 
     if best and best["score"] >= 3000:
         return best
     if best and oc_category_safe(cleaned or category, best["name"]):
         return best
-
-    # Резервный путь: autocomplete в некоторых сборках OpenCart/OCFilter
-    # может не вернуть категорию вообще. В этом случае ищем ее в штатном
-    # административном списке категорий, где есть реальный category_id.
-    # Важно: принимаем только безопасное совпадение имени, чтобы не получить
-    # соседнюю/похожую категорию.
-    try:
-        admin_best = oc_category_from_admin_list(session, token, cleaned or category, log=log)
-        if not admin_best and category_slug:
-            slug_words = re.sub(r"[-_]+", " ", str(category_slug)).strip()
-            if slug_words:
-                admin_best = oc_category_from_admin_list(session, token, slug_words, log=log)
-        if admin_best and oc_category_safe(cleaned or category, admin_best.get("name", "")):
-            log(f"OpenCart category resolver: ADMIN FALLBACK -> {admin_best['category_id']} | {admin_best['name']}")
-            return admin_best
-    except Exception as e:
-        log(f"OpenCart category resolver: ADMIN FALLBACK ошибка: {e}")
-
     return None
-
-def oc_category_from_admin_list(session, token, category, log=lambda x: None):
-    """Резервный поиск реального category_id через список категорий OpenCart.
-
-    Используется, если штатный autocomplete не вернул кандидатов. Поиск идет
-    по фильтру админского списка категорий, после чего проверяется точное
-    соответствие имени. Случайный похожий category_id не принимается.
-    """
-    url = f"{ADMIN}?route=catalog/category&user_token={token}"
-    best = None
-    seen = set()
-
-    for term in oc_category_terms(category):
-        try:
-            r = session.get(url, params={"filter_name": term}, timeout=30)
-            if log:
-                log(f"OpenCart category list: {term!r} -> HTTP {r.status_code}")
-            if r.status_code != 200:
-                continue
-
-            soup = BeautifulSoup(r.text, "html.parser")
-            candidates = []
-
-            for tr in soup.find_all("tr"):
-                row_text = tr.get_text(" ", strip=True)
-                cid = ""
-                for a in tr.find_all("a", href=True):
-                    href = a.get("href", "")
-                    if "catalog/category/edit" in href and "category_id=" in href:
-                        m = re.search(r"[?&]category_id=(\d+)", href)
-                        if m:
-                            cid = m.group(1)
-                            break
-                if not cid:
-                    for inp in tr.find_all("input"):
-                        val = str(inp.get("value") or "").strip()
-                        name = str(inp.get("name") or "")
-                        if val.isdigit() and (name.startswith("selected") or name == "category_id"):
-                            cid = val
-                            break
-                if cid and cid not in seen:
-                    seen.add(cid)
-                    candidates.append((cid, row_text))
-
-            if not candidates:
-                for a in soup.find_all("a", href=True):
-                    href = a.get("href", "")
-                    if "catalog/category/edit" not in href or "category_id=" not in href:
-                        continue
-                    m = re.search(r"[?&]category_id=(\d+)", href)
-                    if not m:
-                        continue
-                    cid = m.group(1)
-                    if cid in seen:
-                        continue
-                    seen.add(cid)
-                    parent = a.parent
-                    txt = parent.get_text(" ", strip=True) if parent else a.get_text(" ", strip=True)
-                    candidates.append((cid, txt))
-
-            for cid, name in candidates:
-                score = oc_category_score(name, category)
-                if oc_category_safe(category, name):
-                    score += 2000
-                candidate = {
-                    "score": score,
-                    "category_id": cid,
-                    "name": name,
-                    "term": f"admin-category-list:{term}",
-                }
-                if best is None or score > best["score"]:
-                    best = candidate
-        except Exception as e:
-            if log:
-                log(f"OpenCart category list: ошибка {term!r}: {e}")
-
-    if best and oc_category_safe(category, best.get("name", "")):
-        if log:
-            log(f"OpenCart category resolver: ADMIN LIST -> {best['category_id']} | {best['name']}")
-        return best
-    return None
-
 
 def resolve_public_category_id_via_admin(category_label, basic_user, basic_pass, oc_user, oc_pass, log=lambda x: None, category_slug=''):
     """Надежно определяет category_id из самой базы OpenCart.
@@ -1375,16 +1167,6 @@ def resolve_public_category_id_via_admin(category_label, basic_user, basic_pass,
     s = http_session()
     try:
         token = oc_login(s, basic_user, basic_pass, oc_user, oc_pass)
-
-        # ПЕРВЫМ делом определяем category_id по точному SEO slug текущей
-        # публичной категории. Это исключает ложные IDs, которые autocomplete
-        # иногда возвращает для похожих категорий.
-        if category_slug:
-            direct_cid = oc_category_id_by_seo_keyword(s, token, category_slug, log=log)
-            if direct_cid:
-                log(f"OpenCart category resolver: DIRECT SEO SLUG -> {direct_cid} | slug={category_slug}")
-                return str(direct_cid)
-
         best = oc_resolve_category(s, token, category_label, category_slug=category_slug, log=log)
 
         # Если H1 содержит регион или отличается от имени в базе,
@@ -1403,20 +1185,6 @@ def resolve_public_category_id_via_admin(category_label, basic_user, basic_pass,
             return str(best["category_id"])
         if best:
             log(f"OpenCart resolver найден кандидат, но не прошел проверку: {best}")
-
-        # Если autocomplete не дал точного ID, читаем административный список
-        # категорий OpenCart. Это резервный путь для конкретных сборок, где
-        # autocomplete может не возвращать нужную категорию.
-        admin_best = oc_category_from_admin_list(s, token, category_label, log=log)
-        if not admin_best and category_slug:
-            slug_words = re.sub(r"[-_]+", " ", str(category_slug)).strip()
-            if slug_words:
-                admin_best = oc_category_from_admin_list(s, token, slug_words, log=log)
-        if admin_best:
-            expected_name = re.sub(r"\s+(?:в|во)\s+.*$", "", category_label, flags=re.I).strip() or category_label
-            if oc_category_safe(expected_name, admin_best.get("name", "")):
-                log(f"OpenCart category resolver: {category_label} -> {admin_best['category_id']} | {admin_best['name']}")
-                return str(admin_best["category_id"])
     except Exception as e:
         log(f"OpenCart category resolver: ошибка {e}")
     return None
@@ -1897,7 +1665,7 @@ class Pipeline:
                 alias = value_alias(o, v)
                 rows.append({
                     "keyword": f"{search_category} {v['name']}",
-                    "category": search_category,
+                    "category": cat,
                     "category_id": cid,
                     "filter": o["name"],
                     "filter_keyword": o.get("keyword", ""),
@@ -1918,7 +1686,7 @@ class Pipeline:
         self.log(f"Category ID: {cid or 'не найден'}")
         self.log(f"Фильтров: {len(opts)}")
         self.log(f"Значений: {len(rows)}")
-        return {"url": r.url, "category": search_category, "category_slug": urlparse(r.url).path.rstrip("/").split("/")[-1], "search_category": search_category, "category_id": cid, "options": opts, "rows": rows}
+        return {"url": r.url, "category": cat, "search_category": search_category, "category_id": cid, "options": opts, "rows": rows}
 
     def merge_analysis(self, res, topdf, progress=None, stop_event=None, cache_path=None):
         """Сопоставляет TOP-30 с OCFilter и определяет тип продвижения.
@@ -1988,45 +1756,12 @@ class Pipeline:
         page_map = {}
 
         # Собираем только URL, реально относящиеся к текущим canonical keywords.
-        # Помимо canonical keyword учитываем source_query и все актуальные варианты
-        # WordKeeper. Это важно для накопительного CSV, созданного старой версией
-        # программы, где keyword мог быть транслитерированным.
         canonical_keywords = [str(x.get("keyword", "")).strip() for x in res.get("rows", []) if str(x.get("keyword", "")).strip()]
-        accepted_queries = set()
-        for x in res.get("rows", []):
-            canonical = str(x.get("keyword", "")).strip()
-            if not canonical:
-                continue
-            accepted_queries.add(norm(canonical))
-            for qv in (wordkeeper_query_variants(
-                res.get("search_category") or res.get("category") or "",
-                x.get("value", ""),
-            ) or [canonical]):
-                accepted_queries.add(norm(qv))
-
-        keyword_norm_series = topdf[kc].astype(str).map(norm)
-        relevant = topdf[keyword_norm_series.isin(accepted_queries)].copy()
-        if "source_query" in topdf.columns:
-            source_norm_series = topdf["source_query"].astype(str).map(norm)
-            relevant = pd.concat([
-                relevant,
-                topdf[source_norm_series.isin(accepted_queries)].copy(),
-            ], ignore_index=False).drop_duplicates()
+        keyword_set = {norm(k) for k in canonical_keywords}
+        relevant = topdf[topdf[kc].astype(str).str.strip().str.lower().isin(keyword_set)].copy()
         if relevant.empty:
-            # Совместимость с CSV, где keyword/source_query содержат дополнительные
-            # пробелы или регистр.
-            relevant = topdf[
-                keyword_norm_series.apply(lambda z: any(q in z or z in q for q in accepted_queries if q))
-            ].copy()
-            if "source_query" in topdf.columns:
-                source_norm_series = topdf["source_query"].astype(str).map(norm)
-                extra = topdf[
-                    source_norm_series.apply(lambda z: any(q in z or z in q for q in accepted_queries if q))
-                ].copy()
-                relevant = pd.concat([relevant, extra], ignore_index=False).drop_duplicates()
-
-        if progress:
-            progress(f"TOP-30: найдено строк текущей категории/вариантов запроса: {len(relevant)}")
+            # Совместимость с CSV, где keyword мог отличаться пробелами/регистром.
+            relevant = topdf[topdf[kc].astype(str).str.lower().apply(lambda z: any(norm(k) in norm(z) for k in canonical_keywords))].copy()
 
         unique_urls = []
         seen_urls = set()
@@ -2084,33 +1819,10 @@ class Pipeline:
 
         # Повторяем строки анализа.
         for x in res["rows"]:
-            canonical = str(x.get("keyword", "")).strip()
-            accepted_for_row = {norm(canonical)}
-            for qv in (wordkeeper_query_variants(
-                res.get("search_category") or res.get("category") or "",
-                x.get("value", ""),
-            ) or [canonical]):
-                accepted_for_row.add(norm(qv))
-
-            rows = topdf[topdf[kc].astype(str).map(norm).isin(accepted_for_row)].copy()
-            if "source_query" in topdf.columns:
-                rows = pd.concat([
-                    rows,
-                    topdf[topdf["source_query"].astype(str).map(norm).isin(accepted_for_row)].copy(),
-                ], ignore_index=False).drop_duplicates()
+            q = norm(x["keyword"])
+            rows = topdf[topdf[kc].astype(str).str.strip().str.lower() == q].copy()
             if rows.empty:
-                rows = topdf[
-                    topdf[kc].astype(str).map(norm).apply(
-                        lambda z: any(q in z or z in q for q in accepted_for_row if q)
-                    )
-                ].copy()
-                if "source_query" in topdf.columns:
-                    rows = pd.concat([
-                        rows,
-                        topdf[topdf["source_query"].astype(str).map(norm).apply(
-                            lambda z: any(q in z or z in q for q in accepted_for_row if q)
-                        )].copy(),
-                    ], ignore_index=False).drop_duplicates()
+                rows = topdf[topdf[kc].astype(str).str.lower().str.contains(re.escape(q), regex=True, na=False)].copy()
 
             value = x.get("value", "")
             filter_urls = []
@@ -2335,13 +2047,10 @@ class Pipeline:
             if progress:
                 progress(f"[{idx}/{total}] {x.get('keyword','')} | {x.get('filter','')}={x.get('value','')} | проверка категории...")
             alias = choose_alias(existing, base_alias, category)
-            # Для вариантов одной родительской страницы сначала используем
-            # сохраненный category_id. Если анализ категории был выполнен до
-            # сохранения авторизаций или точный ID тогда не определился,
-            # ОБЯЗАТЕЛЬНО повторно разрешаем родительскую категорию здесь,
-            # уже имея рабочую авторизацию OpenCart.
+            # Для вариантов, полученных из одной родительской страницы,
+            # используем реальный category_id самой страницы. Это надежнее,
+            # чем повторно искать категорию по slug/транслитерации через autocomplete.
             parent_cid = str(res.get("category_id") or "").strip()
-            parent_slug = str(res.get("category_slug") or "").strip()
             if parent_cid and parent_cid.isdigit():
                 resolved = {
                     "category_id": parent_cid,
@@ -2352,63 +2061,14 @@ class Pipeline:
                 if progress:
                     progress(f"[{idx}/{total}] CATEGORY ID={parent_cid} | из родительской категории")
             else:
-                if progress:
-                    progress(
-                        f"[{idx}/{total}] CATEGORY ID у анализа отсутствует | "
-                        f"повторно ищем родительскую категорию: {category}"
-                    )
-                log_fn = (lambda msg: progress(f"[{idx}/{total}] {msg}") if progress else None)
-
-                # Если анализ не сохранил ID, сначала ищем его напрямую по
-                # точному публичному SEO slug родительской категории.
-                # Это надежнее autocomplete и не допускает подмены 476 на 474.
-                resolved = None
-                if parent_slug:
-                    direct_cid = oc_category_id_by_seo_keyword(s, token, parent_slug, log=log_fn)
-                    if direct_cid:
-                        resolved = {
-                            "category_id": str(direct_cid),
-                            "name": category,
-                            "score": 10000,
-                            "term": "DIRECT_SEO_SLUG",
-                        }
-                        if progress:
-                            progress(f"[{idx}/{total}] CATEGORY ID={direct_cid} | найден по точному SEO slug")
-
-                # Если прямой поиск не дал ID, используем полный resolver.
-                if not resolved:
-                    resolved = oc_resolve_category(
-                        s, token, category,
-                        category_slug=parent_slug,
-                        log=log_fn,
-                    )
-                if not resolved:
-                    resolved = oc_resolve_category(
-                        s, token, category,
-                        category_slug="",
-                        log=log_fn,
-                    )
+                resolved = oc_resolve_category(s, token, category)
 
             if not resolved:
                 x["oc_status"] = "CATEGORY_NOT_FOUND"
-                x["oc_message"] = (
-                    "Категория не найдена через OpenCart autocomplete; "
-                    f"category={category}; category_slug={parent_slug or '-'}; "
-                    f"category_id_from_analysis={parent_cid or '-'}"
-                )
+                x["oc_message"] = "Категория не найдена через OpenCart autocomplete и не задан category_id"
                 results.append(x)
-                if progress:
-                    progress(
-                        f"[{idx}/{total}] CATEGORY_NOT_FOUND | "
-                        f"category={category} | slug={parent_slug or '-'} | "
-                        f"analysis_category_id={parent_cid or '-'}"
-                    )
+                if progress: progress(f"[{idx}/{total}] CATEGORY_NOT_FOUND")
                 continue
-            # Сохраняем реально найденный category_id в общей структуре.
-            # После первого успешного разрешения остальные варианты используют
-            # тот же проверенный ID, а экспорт получает его без повторного поиска.
-            res["category_id"] = str(resolved["category_id"])
-            x["category_id"] = str(resolved["category_id"])
             x["oc_category_id"] = resolved["category_id"]
             x["oc_category_found"] = resolved["name"]
             x["oc_category_score"] = resolved["score"]
@@ -2570,7 +2230,7 @@ def export_excel(res, path, topdf=None):
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("FE-RUS SEO Manager v1.20.6")
+        self.title("FE-RUS SEO Manager v1.20")
         self.geometry("1280x860")
         self.q = queue.Queue()
         self.res = None
@@ -3029,104 +2689,52 @@ class App(tk.Tk):
                 for x in self.res["rows"]
                 if x.get("keyword") and str(x.get("keyword", "")).strip()
             ))
-            # Формируем карту АКТУАЛЬНЫХ запросов текущей категории до загрузки кэша.
-            # Старые seo_top30_result.csv / progress.json могут содержать результаты
-            # других категорий. Их нельзя считать выполненными только по факту наличия
-            # source_query: учитываем только запросы, которые реально относятся к
-            # текущей категории.
-            current_variants_by_keyword = {}
-            variant_to_canonical = {}
-            for row in self.res["rows"]:
-                canonical = str(row.get("keyword", "")).strip()
-                if not canonical:
-                    continue
-                variants = wordkeeper_query_variants(
-                    self.res.get("search_category") or self.res.get("category") or "",
-                    row.get("value", ""),
-                ) or [canonical]
-                current_variants_by_keyword[canonical] = variants
-                for q in variants:
-                    variant_to_canonical[norm(q)] = canonical
-
-            keywords = list(current_variants_by_keyword.keys())
-            current_keyword_set = set(keywords)
             results=[]
             done=set()
             done_queries=set()
-            cached_result_query_keys=set()
 
             if out_path.exists():
                 old=pd.read_csv(out_path,encoding="utf-8-sig")
-                if not old.empty:
+                if "keyword" in old.columns:
                     results=old.to_dict("records")
-                    # ВАЖНО: если старый CSV был создан предыдущей версией, его
-                    # canonical keyword мог быть транслитерированным. Перепривязываем
-                    # строки по source_query к текущему русскому canonical keyword.
+                    done.update(old["keyword"].astype(str).str.strip())
                     if "source_query" in old.columns:
-                        for rr in results:
-                            sq = str(rr.get("source_query", "")).strip()
-                            canonical = variant_to_canonical.get(norm(sq))
-                            if canonical:
-                                rr["keyword"] = canonical
-                                done_queries.add(sq)
-                                cached_result_query_keys.add(norm(sq))
-                    # Старые canonical keywords учитываем только если они относятся
-                    # к текущей категории.
-                    for rr in results:
-                        k = str(rr.get("keyword", "")).strip()
-                        if k in current_keyword_set:
-                            done.add(k)
+                        done_queries.update(
+                            old["source_query"].astype(str).str.strip()
+                        )
 
             if progress_path.exists():
                 try:
                     progress=json.loads(progress_path.read_text(encoding="utf-8"))
-                    # done_keywords из старого checkpoint не переносим целиком:
-                    # оставляем только keywords текущей категории.
-                    done.update(
-                        str(x).strip() for x in progress.get("done_keywords",[])
-                        if str(x).strip() in current_keyword_set
-                    )
-                    # Аналогично done_queries: только актуальные варианты текущей
-                    # категории могут блокировать новый запрос.
-                    for x in progress.get("done_queries", []):
-                        q = str(x).strip()
-                        if q and norm(q) in variant_to_canonical:
-                            done_queries.add(q)
+                    done.update(str(x).strip() for x in progress.get("done_keywords",[]) if str(x).strip())
+                    done_queries.update(str(x).strip() for x in progress.get("done_queries",[]) if str(x).strip())
                 except Exception:
                     pass
 
-            # Нормализованный набор уже выполненных запросов. Это устраняет ложные
-            # повторы из-за регистра/лишних пробелов.
-            done_query_keys = {norm(q) for q in done_queries if str(q).strip()}
-
-            # Если checkpoint говорит «запрос выполнен», но в накопительном CSV
-            # вообще нет ни одной строки с этим source_query, не доверяем старому
-            # checkpoint: такой запрос повторяем, иначе 0-результат/старый checkpoint
-            # может навсегда скрыть реальные TOP-30.
-            done_query_keys = {
-                qk for qk in done_query_keys
-                if qk in cached_result_query_keys
-            } | {
-                qk for qk in done_query_keys
-                if qk in cached_result_query_keys
-            }
-
+            # Старый checkpoint не знает о вариантах запросов. Его done_keywords
+            # остаётся совместимым: если canonical keyword уже полностью есть в
+            # старом кэше, повторно его не запрашиваем. Для новых русских keywords
+            # будут выполнены все новые варианты.
             query_plan=[]
-            for canonical, variants in current_variants_by_keyword.items():
-                pending=[q for q in variants if norm(q) not in done_query_keys]
-                if pending:
-                    query_plan.append((canonical, pending))
+            for row in self.res["rows"]:
+                canonical=str(row.get("keyword", "")).strip()
+                if not canonical or canonical in done:
+                    continue
+                variants=wordkeeper_query_variants(
+                    self.res.get("search_category") or self.res.get("category") or "",
+                    row.get("value", ""),
+                )
+                if not variants:
+                    variants=[canonical]
+                pending=[q for q in variants if q not in done_queries]
+                query_plan.append((canonical, pending))
 
-            current_done={
-                canonical for canonical, variants in current_variants_by_keyword.items()
-                if not any(norm(q) not in done_query_keys for q in variants)
-            }
+            current_done={k for k in keywords if k in done}
             pending_queries=sum(len(v) for _,v in query_plan)
             self.q.put(("wklog",f"TOP-30 CSV: {out_path}"))
             self.q.put(("wklog",f"Checkpoint: {progress_path}"))
             self.q.put(("wklog",f"Всего значений текущей категории: {len(keywords)} | уже полностью обработано: {len(current_done)} | осталось значений: {len(keywords)-len(current_done)}"))
-            self.q.put(("wklog",f"Запросов WordKeeper к выполнению: {pending_queries} | кэшем подтверждено запросов текущей категории: {len(done_query_keys)}"))
-            self.q.put(("wklog",f"Строк TOP-30 в накопительном CSV: {len(results)} | source_query с результатами текущей категории: {len(cached_result_query_keys)}"))
+            self.q.put(("wklog",f"Запросов WordKeeper к выполнению: {pending_queries} | всего в накопительном кэше: {len(done_queries or done)}"))
 
             query_index=0
             total_pending=pending_queries
@@ -3141,30 +2749,26 @@ class App(tk.Tk):
                     query_index += 1
                     try:
                         rr=s.post(TOP30_WK,data={"word":actual_query,"region":region},headers={"Accept":"text/html, */*; q=0.01","X-Requested-With":"XMLHttpRequest","Referer":"https://word-keeper.ru/core"},timeout=120)
-                        rows=parse_top30(rr.text,canonical)
+                        rr_status=http_status_code(rr)
+                        rr_text=http_response_text(rr)
+                        if not rr_text:
+                            raise RuntimeError(
+                                f"WordKeeper вернул пустой/неподдерживаемый ответ "
+                                f"(тип={type(rr).__name__}, HTTP={rr_status})"
+                            )
+                        rows=parse_top30(rr_text,canonical)
                         for rrow in rows:
                             rrow["source_query"]=actual_query
+                        results.extend(rows)
                         done_queries.add(actual_query)
-                        done_query_keys.add(norm(actual_query))
-                        # Не дублируем одинаковый URL одного и того же source_query.
-                        existing_keys = {
-                            (str(rr.get("source_query", "")).strip(), str(rr.get("url", "")).strip())
-                            for rr in results
-                            if str(rr.get("source_query", "")).strip() and str(rr.get("url", "")).strip()
-                        }
-                        for rr in rows:
-                            key = (str(rr.get("source_query", "")).strip(), str(rr.get("url", "")).strip())
-                            if key not in existing_keys:
-                                results.append(rr)
-                                existing_keys.add(key)
                         pd.DataFrame(results).to_csv(out_path,index=False,encoding="utf-8-sig")
                         # keyword помечаем done только после всех его вариантов.
                         progress_path.write_text(json.dumps({
-                            "done_keywords":safe_sorted_strings(done),
-                            "done_queries":safe_sorted_strings(done_queries),
+                            "done_keywords":sorted(done),
+                            "done_queries":sorted(done_queries),
                             "updated_at":time.strftime("%Y-%m-%d %H:%M:%S")
                         },ensure_ascii=False,indent=2),encoding="utf-8")
-                        self.q.put(("wklog",f"[{query_index}/{total_pending}] {canonical} | запрос: {actual_query} | HTTP {rr.status_code} | результатов: {len(rows)} | СОХРАНЕНО"))
+                        self.q.put(("wklog",f"[{query_index}/{total_pending}] {canonical} | запрос: {actual_query} | HTTP {rr_status} | результатов: {len(rows)} | СОХРАНЕНО"))
                         if self.wk_stop_event.is_set():
                             all_variants_done=False
                             break
@@ -3173,8 +2777,8 @@ class App(tk.Tk):
                         all_variants_done=False
                         pd.DataFrame(results).to_csv(out_path,index=False,encoding="utf-8-sig")
                         progress_path.write_text(json.dumps({
-                            "done_keywords":safe_sorted_strings(done),
-                            "done_queries":safe_sorted_strings(done_queries),
+                            "done_keywords":sorted(done),
+                            "done_queries":sorted(done_queries),
                             "updated_at":time.strftime("%Y-%m-%d %H:%M:%S")
                         },ensure_ascii=False,indent=2),encoding="utf-8")
                         self.q.put(("wklog",f"ОШИБКА {actual_query}: {e} | текущая категория: обработано {len(set(keywords) & done)} из {len(keywords)}"))
@@ -3184,16 +2788,16 @@ class App(tk.Tk):
                     done.add(canonical)
                     pd.DataFrame(results).to_csv(out_path,index=False,encoding="utf-8-sig")
                     progress_path.write_text(json.dumps({
-                        "done_keywords":safe_sorted_strings(done),
-                        "done_queries":safe_sorted_strings(done_queries),
+                        "done_keywords":sorted(done),
+                        "done_queries":sorted(done_queries),
                         "updated_at":time.strftime("%Y-%m-%d %H:%M:%S")
                     },ensure_ascii=False,indent=2),encoding="utf-8")
                     self.q.put(("wklog",f"ЗАВЕРШЕНО ЗНАЧЕНИЕ: {canonical} | вариантов запроса: {len(variants)}"))
 
             pd.DataFrame(results).to_csv(out_path,index=False,encoding="utf-8-sig")
             progress_path.write_text(json.dumps({
-                "done_keywords":safe_sorted_strings(done),
-                "done_queries":safe_sorted_strings(done_queries),
+                "done_keywords":sorted(done),
+                "done_queries":sorted(done_queries),
                 "updated_at":time.strftime("%Y-%m-%d %H:%M:%S")
             },ensure_ascii=False,indent=2),encoding="utf-8")
             if self.wk_stop_event.is_set():
@@ -3495,7 +3099,7 @@ class App(tk.Tk):
                         "redirect_location":redirect_location,"final_http_status":final_status,"final_url":final_url,
                         "redirect":redirected,"existing_seo_url":x.get("existing_seo_url",""),
                         "existing_seo_alias":x.get("existing_seo_alias",""),"existing_seo_source":x.get("existing_seo_source",""),
-                        "checked_at":now,"verification_state":"VERIFIED","verification_version":"5","error":""
+                        "checked_at":now,"verification_state":"VERIFIED","verification_version":"4","error":""
                     }
                     self._save_url_audit(audit)
                     redir_txt=f" | Location: {redirect_location}" if redirect_location else ""
@@ -3517,92 +3121,6 @@ class App(tk.Tk):
         finally:
             self.url_check_running=False
 
-
-    def ocfilter_audit_path(self):
-        return Path(self.folder.get() or os.getcwd()) / "seo_ocfilter_check_audit.json"
-
-    def _save_ocfilter_audit(self, results):
-        """Сохраняет результат DRY-RUN OCFilter, чтобы он не терялся между запусками."""
-        try:
-            path = self.ocfilter_audit_path()
-            old = {}
-            if path.exists():
-                try:
-                    old = json.loads(path.read_text(encoding="utf-8"))
-                except Exception:
-                    old = {}
-            if not isinstance(old, dict):
-                old = {}
-            category_url = str(self.res.get("url", "")).strip() if self.res else ""
-            now = time.strftime("%Y-%m-%d %H:%M:%S")
-            for r in results:
-                key = "|".join([
-                    category_url,
-                    norm(r.get("keyword", "")),
-                    norm(r.get("filter", "")),
-                    canonical_value(r.get("value", "")),
-                ])
-                old[key] = {
-                    "category_url": category_url,
-                    "keyword": r.get("keyword", ""),
-                    "filter": r.get("filter", ""),
-                    "value": r.get("value", ""),
-                    "target_url": r.get("target_url", ""),
-                    "url_status": r.get("url_status", ""),
-                    "oc_status": r.get("oc_status", ""),
-                    "oc_message": r.get("oc_message", ""),
-                    "oc_category_id": r.get("oc_category_id", ""),
-                    "oc_category_found": r.get("oc_category_found", ""),
-                    "oc_category_score": r.get("oc_category_score", ""),
-                    "alias": r.get("alias", ""),
-                    "verified_at": now,
-                    "verification_state": "VERIFIED",
-                    "verification_version": "2",
-                }
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(json.dumps(old, ensure_ascii=False, indent=2), encoding="utf-8")
-            return path
-        except Exception:
-            return None
-
-    def _apply_ocfilter_audit(self):
-        """Подтягивает сохраненные результаты OCFilter в текущий анализ."""
-        if not self.res:
-            return 0
-        try:
-            path = self.ocfilter_audit_path()
-            if not path.exists():
-                return 0
-            data = json.loads(path.read_text(encoding="utf-8"))
-            if not isinstance(data, dict):
-                return 0
-            category_url = str(self.res.get("url", "")).strip()
-            applied = 0
-            for row in self.res.get("rows", []):
-                key = "|".join([
-                    category_url,
-                    norm(row.get("keyword", "")),
-                    norm(row.get("filter", "")),
-                    canonical_value(row.get("value", "")),
-                ])
-                saved = data.get(key)
-                if not isinstance(saved, dict):
-                    continue
-                # Не переносим старый результат на другой target URL.
-                saved_target = str(saved.get("target_url", "")).strip()
-                current_target = str(row.get("target_url", "")).strip()
-                if saved_target and current_target and saved_target != current_target:
-                    continue
-                for field in (
-                    "url_status", "oc_status", "oc_message", "oc_category_id",
-                    "oc_category_found", "oc_category_score", "alias", "target_url"
-                ):
-                    if field in saved and saved.get(field) not in (None, ""):
-                        row[field] = saved.get(field)
-                applied += 1
-            return applied
-        except Exception:
-            return 0
 
     def run_oc(self):
         if not self.res:
@@ -3756,7 +3274,7 @@ class App(tk.Tk):
                         "redirect_location":redirect_location,"final_http_status":final_status,"final_url":final_url,
                         "redirect":redirected,"existing_seo_url":x.get("existing_seo_url",""),
                         "existing_seo_alias":x.get("existing_seo_alias",""),"existing_seo_source":x.get("existing_seo_source",""),
-                        "checked_at":now,"verification_state":"VERIFIED","verification_version":"5","error":""
+                        "checked_at":now,"verification_state":"VERIFIED","verification_version":"4","error":""
                     }
                     self._save_url_audit(audit)
                     redir_txt=f" | Location: {redirect_location}" if redirect_location else ""
@@ -3787,7 +3305,6 @@ class App(tk.Tk):
         if not self.res:
             return
 
-        self._apply_ocfilter_audit()
         urls = []
         seen = set()
         for row in generator_rows(self.res):
@@ -3799,46 +3316,6 @@ class App(tk.Tk):
 
         if urls:
             self.export_log.insert("1.0", "\n".join(urls))
-        else:
-            rows = self.res.get("rows", [])
-            create = sum(1 for x in rows if x.get("status") == "CREATE")
-            seo_create = sum(
-                1 for x in rows
-                if x.get("status") == "CREATE"
-                and x.get("promotion_type") == "SEO-СТРАНИЦА"
-            )
-            url_ready = sum(
-                1 for x in rows
-                if x.get("status") == "CREATE"
-                and x.get("promotion_type") == "SEO-СТРАНИЦА"
-                and x.get("url_status") in ("READY_FOR_OCFILTER", "HTTP_404")
-            )
-            oc_ready = sum(
-                1 for x in rows
-                if x.get("status") == "CREATE"
-                and x.get("promotion_type") == "SEO-СТРАНИЦА"
-                and x.get("url_status") in ("READY_FOR_OCFILTER", "HTTP_404")
-                and x.get("oc_status") == "READY"
-            )
-            oc_statuses = {}
-            for x in rows:
-                if x.get("status") != "CREATE" or x.get("promotion_type") != "SEO-СТРАНИЦА":
-                    continue
-                st = str(x.get("oc_status", "")) or "EMPTY"
-                oc_statuses[st] = oc_statuses.get(st, 0) + 1
-            oc_status_text = ", ".join(f"{k}={v}" for k,v in sorted(oc_statuses.items())) or "нет данных"
-            self.export_log.insert(
-                "1.0",
-                "Готовых URL фильтрации пока нет.\n\n"
-                f"CREATE: {create}\n"
-                f"SEO + CREATE: {seo_create}\n"
-                f"URL прошли проверку: {url_ready}\n"
-                f"OCFilter READY: {oc_ready}\n"
-                f"OCFilter статусы: {oc_status_text}\n\n"
-                "Правило экспорта: status=CREATE + promotion_type=SEO-СТРАНИЦА "
-                "+ URL=404/READY + OCFilter=READY.\n"
-                "Если OCFilter READY=0, ссылки намеренно не выводятся."
-            )
 
     def copy_ready_filter_urls(self):
         """Копирует только готовые исходные URL фильтрации, по одному в строке."""
@@ -3855,7 +3332,6 @@ class App(tk.Tk):
         if not self.res:
             messagebox.showwarning("Нет данных","Сначала выполните анализ категории.")
             return
-        self._apply_ocfilter_audit()
         ready = generator_rows(self.res)
         if not ready:
             messagebox.showwarning("Нет готовых страниц","Сначала выполните Проверку URL и Проверку OCFilter (DRY-RUN).")
@@ -3871,7 +3347,6 @@ class App(tk.Tk):
 
     def export(self):
         if not self.res:messagebox.showwarning("Нет данных","Сначала выполните анализ.");return
-        self._apply_ocfilter_audit()
         p=filedialog.asksaveasfilename(defaultextension=".xlsx",initialfile="fe_rus_seo_pages.xlsx",filetypes=[("Excel","*.xlsx")])
         if p:
             export_excel(self.res,p,self.topdf); messagebox.showinfo("Готово","Файл сохранен:\n"+p)
@@ -3933,35 +3408,13 @@ class App(tk.Tk):
                 elif t=="ocdone":
                     self.oc_running=False
                     self.oc_check_btn.config(state="normal")
-                    rows_by_key = {}
-                    for rr in self.res.get("rows", []):
-                        rows_by_key.setdefault(result_row_key(rr), []).append(rr)
-                    matched = 0
                     for r in x:
-                        candidates = rows_by_key.get(result_row_key(r), [])
-                        if len(candidates) == 1:
-                            candidates[0].update(r)
-                            matched += 1
-                        elif candidates:
-                            # Резерв: если ключ совпал несколько раз, target_url
-                            # позволяет выбрать конкретную строку.
-                            target = str(r.get("target_url", "")).strip()
-                            found = next((rr for rr in candidates if str(rr.get("target_url", "")).strip() == target), None)
-                            if found is not None:
-                                found.update(r)
-                                matched += 1
-                    audit_path = self._save_ocfilter_audit(x)
-                    self._apply_ocfilter_audit()
+                        for rr in self.res.get("rows", []):
+                            if rr.get("keyword") == r.get("keyword") and rr.get("filter") == r.get("filter") and str(rr.get("value")) == str(r.get("value")):
+                                rr.update(r)
+                                break
                     ready = len(generator_rows(self.res))
-                    statuses = {}
-                    for rr in self.res.get("rows", []):
-                        st = str(rr.get("oc_status", "")) or "EMPTY"
-                        statuses[st] = statuses.get(st, 0) + 1
-                    status_text = ", ".join(f"{k}={v}" for k,v in sorted(statuses.items()))
-                    self.oclog.insert("end",f"\nГотово. Проверено CREATE: {len(x)} | сопоставлено с анализом: {matched}\nГОТОВО ДЛЯ ГЕНЕРАТОРА: {ready}\nOCFilter статусы: {status_text}\n")
-                    if audit_path:
-                        self.oclog.insert("end",f"Проверка OCFilter сохранена: {audit_path}\n")
-                    self.oclog.insert("end","\n")
+                    self.oclog.insert("end",f"\nГотово. Проверено CREATE: {len(x)}\nГОТОВО ДЛЯ ГЕНЕРАТОРА: {ready}\n\n")
                     for r in x:self.oclog.insert("end",f"{r.get('keyword')} -> {r.get('oc_status')} | {r.get('target_url','')}\n")
                     self.oclog.insert("end",f"\nСледующий шаг: вкладка 6. Экспорт -> СОХРАНИТЬ CSV ДЛЯ ГЕНЕРАТОРА.\n")
                     self.oclog.see("end")
