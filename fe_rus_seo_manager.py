@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-FE-RUS SEO Manager v1.20.10
+FE-RUS SEO Manager v1.21.1
 
 Единое Windows-приложение:
 1. Категория - получает category_id, OCFilter options и значения.
@@ -544,44 +544,6 @@ def wordkeeper_ajax_post(session, query, region):
     )
 
 
-def http_status_code(response):
-    """Безопасно получает HTTP-код из requests.Response или dict."""
-    if hasattr(response, "status_code"):
-        try:
-            return int(response.status_code)
-        except (TypeError, ValueError):
-            return response.status_code
-    if isinstance(response, dict):
-        for key in ("status_code", "http_status", "status", "code"):
-            value = response.get(key)
-            if value not in (None, ""):
-                try:
-                    return int(value)
-                except (TypeError, ValueError):
-                    return str(value)
-        nested = response.get("response")
-        if nested is not None and nested is not response:
-            return http_status_code(nested)
-    return "UNKNOWN"
-
-
-def http_response_text(response):
-    """Безопасно получает тело HTTP-ответа из requests.Response или dict."""
-    if hasattr(response, "text"):
-        return str(response.text or "")
-    if isinstance(response, dict):
-        for key in ("text", "html", "body", "content", "response_text"):
-            value = response.get(key)
-            if isinstance(value, bytes):
-                return value.decode("utf-8", errors="replace")
-            if isinstance(value, str):
-                return value
-        nested = response.get("response")
-        if nested is not None and nested is not response:
-            return http_response_text(nested)
-    return ""
-
-
 def wordkeeper_query_variants(category, value):
     """Формирует реальные поисковые запросы для одного значения OCFilter.
 
@@ -664,7 +626,7 @@ def wordkeeper_query_variants(category, value):
 # SERP PAGE CLASSIFICATION
 # -----------------------------------------------------------------------------
 
-SERP_CLASSIFIER_VERSION = "1.20.2"
+SERP_CLASSIFIER_VERSION = "1.21.1"
 PRODUCT_PATH_MARKERS = (
     "/product/", "/products/", "/item/", "/goods/", "/tovar/", "/offer/",
     "/p/", "/detail/", "/produkt/", "/catalog/product/"
@@ -759,18 +721,33 @@ def _classify_serp_page(session, url, title="", snippet="", keyword="", value=""
                 if crumb:
                     breadcrumbs = " | ".join(c.get_text(" ", strip=True) for c in crumb[:2])[:1000]
 
-                if any("product" in t.lower() for t in types):
-                    product_score += 10; signals.append("JSONLD_PRODUCT")
-                if any(t.lower() in {"productgroup", "product"} for t in types):
-                    product_score += 3
+                # Product-разметка может находиться не только на карточке товара,
+                # но и на категории/фильтре: например, карточки товаров внутри
+                # ItemList могут содержать @type=Product, а товарные карточки
+                # категории могут использовать Microdata Product. Поэтому наличие
+                # Product-разметки само по себе НЕ является достаточным признаком
+                # того, что вся страница является карточкой товара.
+                has_jsonld_product = any(
+                    t.lower() in {"product", "productgroup"}
+                    for t in types
+                )
+                if has_jsonld_product:
+                    signals.append("JSONLD_PRODUCT")
+
                 if any(t.lower() == "article" or t.lower().endswith("article") for t in types):
                     article_score += 9; signals.append("JSONLD_ARTICLE")
                 if any(t.lower() in {"itemlist", "collectionpage", "searchresults"} for t in types):
                     seo_score += 3; signals.append("JSONLD_LIST")
 
-                # Product microdata.
-                if soup.find(attrs={"itemtype": re.compile(r"schema\.org/(Product|ProductGroup)", re.I)}):
-                    product_score += 7; signals.append("MICRODATA_PRODUCT")
+                # Product microdata. Как и JSON-LD Product, это только сигнал
+                # наличия товарной разметки на странице, а не автоматический
+                # признак типа страницы PRODUCT. На категориях такая разметка
+                # также допустима для отдельных товаров из списка.
+                has_microdata_product = bool(
+                    soup.find(attrs={"itemtype": re.compile(r"schema\.org/(Product|ProductGroup)", re.I)})
+                )
+                if has_microdata_product:
+                    signals.append("MICRODATA_PRODUCT")
 
                 # Цена / SKU / артикул / корзина - сильные товарные признаки.
                 visible = soup.get_text(" ", strip=True).lower()
@@ -814,6 +791,24 @@ def _classify_serp_page(session, url, title="", snippet="", keyword="", value=""
 
                 if h1 and any(x in h1.lower() for x in ("каталог", "лист", "труба", "сетка", "металлопрокат")) and product_links >= 2:
                     seo_score += 2; signals.append("CATALOG_H1")
+
+                # Только после оценки структуры страницы учитываем Product-разметку
+                # как слабый дополнительный товарный сигнал. Если страница уже
+                # выглядит как категория/фильтр (список товаров, фильтры,
+                # пагинация или ItemList), Product-разметка не должна перевешивать
+                # эти признаки. Это защищает категории, где Product/Microdata
+                # используется на карточках товаров.
+                catalog_context = (
+                    product_links >= 2
+                    or filter_controls > 0
+                    or pagination
+                    or any(t.lower() in {"itemlist", "collectionpage", "searchresults"} for t in types)
+                )
+                if not catalog_context:
+                    if has_jsonld_product:
+                        product_score += 2
+                    if has_microdata_product:
+                        product_score += 1
 
         except Exception as e:
             signals.append("FETCH_ERROR:" + str(e)[:120])
@@ -2645,7 +2640,7 @@ def export_excel(res, path, topdf=None):
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("FE-RUS SEO Manager v1.20.10")
+        self.title("FE-RUS SEO Manager v1.21.1")
         self.geometry("1280x860")
         self.q = queue.Queue()
         self.res = None
@@ -2705,7 +2700,8 @@ class App(tk.Tk):
             ttk.Label(box,text=n+":").grid(row=r,column=c,padx=8,pady=6,sticky="w")
             e=ttk.Entry(box,show="*" if sec else ""); e.grid(row=r,column=c+1,sticky="ew",padx=8); self.wk[n]=e
         box.columnconfigure(1,weight=1); box.columnconfigure(3,weight=1)
-        row=ttk.Frame(f); row.pack(fill="x",padx=10,pady=6)
+        # Основное управление сбором TOP-30.
+        row=ttk.Frame(f); row.pack(fill="x",padx=10,pady=(6,2))
         ttk.Label(row,text="Регион:").pack(side="left")
         self.region=tk.IntVar(value=int(self.cfg.get("region",213) or 213))
         ttk.Spinbox(row,from_=0,to=9999,textvariable=self.region,width=7).pack(side="left",padx=8)
@@ -2715,6 +2711,20 @@ class App(tk.Tk):
         self.wk_stop_btn.pack(side="left",padx=8)
         ttk.Button(row,text="ЗАГРУЗИТЬ CSV",command=self.load_wk_csv).pack(side="left",padx=8)
         self.wkstatus=ttk.Label(row,text="TOP-30 ещё не загружен"); self.wkstatus.pack(side="left",padx=8)
+
+        # Пересборка вынесена в отдельную строку, чтобы кнопка не исчезала
+        # за пределами окна при небольшой ширине интерфейса.
+        rebuild_row=ttk.Frame(f); rebuild_row.pack(fill="x",padx=10,pady=(2,6))
+        self.wk_rebuild_btn=ttk.Button(
+            rebuild_row,
+            text="ПЕРЕСОБРАТЬ TOP-30 ТЕКУЩЕГО РАЗДЕЛА",
+            command=self.rebuild_wordkeeper_current_section,
+        )
+        self.wk_rebuild_btn.pack(side="left")
+        ttk.Label(
+            rebuild_row,
+            text="Удаляет только TOP-30 текущего раздела и запускает его заново",
+        ).pack(side="left",padx=10)
         self.wklog=tk.Text(f,font=("Consolas",10)); self.wklog.pack(fill="both",expand=True,padx=10,pady=8)
 
     def build_analysis(self):
@@ -3076,6 +3086,98 @@ class App(tk.Tk):
         self.wkstatus.config(text="Остановка WordKeeper... текущий запрос завершится, затем анализ остановится")
         self.wklog.insert("end","\n!!! Запрошена остановка. Последний завершённый запрос уже сохранён.\n")
         self.wklog.see("end")
+
+    def rebuild_wordkeeper_current_section(self):
+        """Удаляет накопленные TOP-30 только для текущего раздела и запускает его заново."""
+        if not self.res or not self.res.get("rows"):
+            messagebox.showwarning("TOP-30", "Сначала получите категорию и фильтры текущего раздела.")
+            return
+        if self.wk_running:
+            messagebox.showwarning("TOP-30", "Сначала дождитесь завершения или остановите текущий сбор TOP-30.")
+            return
+
+        category = str(self.res.get("category") or self.res.get("search_category") or "").strip()
+        current_keywords = {
+            str(x.get("keyword", "")).strip()
+            for x in self.res.get("rows", [])
+            if str(x.get("keyword", "")).strip()
+        }
+        current_variants = set()
+        for row in self.res.get("rows", []):
+            canonical = str(row.get("keyword", "")).strip()
+            if not canonical:
+                continue
+            variants = wordkeeper_query_variants(
+                self.res.get("search_category") or self.res.get("category") or "",
+                row.get("value", ""),
+            ) or [canonical]
+            current_variants.update(norm(q) for q in variants if str(q).strip())
+
+        if not current_keywords:
+            messagebox.showwarning("TOP-30", "У текущего раздела нет запросов для пересборки.")
+            return
+
+        ok = messagebox.askyesno(
+            "Пересобрать TOP-30",
+            f"Пересобрать TOP-30 заново только для текущего раздела?\n\n"
+            f"Раздел: {category or 'текущий'}\n"
+            f"Значений/запросов: {len(current_keywords)}\n\n"
+            "Старые результаты этого раздела будут удалены из накопительного CSV и checkpoint. "
+            "Результаты других разделов сохранятся.",
+        )
+        if not ok:
+            return
+
+        folder = Path(self.folder.get() or os.getcwd())
+        out_path = folder / "seo_top30_result.csv"
+        progress_path = folder / "seo_top30_progress.json"
+        removed_rows = 0
+        removed_queries = 0
+
+        # Удаляем только строки текущего раздела из накопительного CSV.
+        if out_path.exists() and out_path.stat().st_size:
+            try:
+                old = pd.read_csv(out_path, encoding="utf-8-sig")
+                if not old.empty:
+                    mask = pd.Series(False, index=old.index)
+                    if "source_query" in old.columns:
+                        mask = mask | old["source_query"].astype(str).map(norm).isin(current_variants)
+                    if "keyword" in old.columns:
+                        mask = mask | old["keyword"].astype(str).str.strip().isin(current_keywords)
+                    removed_rows = int(mask.sum())
+                    old = old.loc[~mask].copy()
+                    old.to_csv(out_path, index=False, encoding="utf-8-sig")
+            except Exception as e:
+                messagebox.showerror("TOP-30", f"Не удалось очистить текущий раздел из CSV:\n{e}")
+                return
+
+        # Из checkpoint удаляем только текущие canonical keywords и их варианты.
+        if progress_path.exists() and progress_path.stat().st_size:
+            try:
+                progress = json.loads(progress_path.read_text(encoding="utf-8"))
+                old_done_keywords = [str(x).strip() for x in progress.get("done_keywords", [])]
+                old_done_queries = [str(x).strip() for x in progress.get("done_queries", [])]
+                new_done_keywords = [x for x in old_done_keywords if x not in current_keywords]
+                new_done_queries = [x for x in old_done_queries if norm(x) not in current_variants]
+                removed_queries = len(old_done_queries) - len(new_done_queries)
+                progress["done_keywords"] = new_done_keywords
+                progress["done_queries"] = new_done_queries
+                progress["updated_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+                progress_path.write_text(json.dumps(progress, ensure_ascii=False, indent=2), encoding="utf-8")
+            except Exception as e:
+                messagebox.showerror("TOP-30", f"Не удалось обновить checkpoint:\n{e}")
+                return
+
+        self.topdf = pd.DataFrame()
+        self.wkstatus.config(text="Старый TOP-30 текущего раздела сброшен")
+        self.wklog.delete("1.0", "end")
+        self.wklog.insert("end", f"Пересборка текущего раздела: {category or 'текущий раздел'}\n")
+        self.wklog.insert("end", f"Удалено старых строк TOP-30: {removed_rows}\n")
+        self.wklog.insert("end", f"Сброшено checkpoint-запросов: {removed_queries}\n")
+        self.wklog.insert("end", "Запускаем новый сбор TOP-30...\n")
+        self.wklog.see("end")
+        self.save_settings()
+        self.start_wordkeeper()
 
     def worker_wordkeeper(self):
         out_path=Path(self.folder.get() or os.getcwd())/"seo_top30_result.csv"
