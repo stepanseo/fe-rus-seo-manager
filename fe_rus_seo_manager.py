@@ -1,11 +1,11 @@
 # -*- coding: utf-8 -*-
 """
-FE-RUS SEO Manager v1.21.4
+FE-RUS SEO Manager v1.21.7
 
 Единое Windows-приложение:
 1. Категория - получает category_id, OCFilter options и значения.
 2. WordKeeper - авторизация, получение TOP-30 с продолжением после перезапуска.
-3. Анализ - классификация CREATE / SKIP / REVIEW / EXISTS и конкуренты.
+3. Анализ - классификация CREATE / SKIP / EXISTS и конкуренты; подтвержденный СМЕШАННЫЙ сразу попадает в CREATE.
 4. Проверка URL - проверка ожидаемых OCFilter URL до создания.
 5. OCFilter - реальный direct POST в штатный addPage, без Playwright.
 6. Экспорт - XLSX/CSV для внешней программы генерации контента (CSV: ; + UTF-8 BOM).
@@ -2045,14 +2045,16 @@ class Pipeline:
         Затем по независимым доменам определяется promotion_type:
         ТОВАР / SEO-СТРАНИЦА / СМЕШАННЫЙ / ИНФОРМАЦИОННАЯ / НЕДОСТАТОЧНО ДАННЫХ.
 
-        CREATE разрешается только для SEO-СТРАНИЦЫ и только при наличии
-        минимум двух независимых подтвержденных SEO-конкурентов, которые
-        действительно соответствуют текущему value.
+        CREATE разрешается для SEO-СТРАНИЦЫ и СМЕШАННОГО интента,
+        если есть минимум два независимых подтвержденных filter-конкурента,
+        действительно соответствующих текущему value. Явно ТОВАРНЫЙ интент
+        по-прежнему не переводится в CREATE только из-за filter URL.
+        REVIEW не используется: все неподтвержденные случаи получают SKIP.
         """
         if topdf is None or topdf.empty:
             for x in res["rows"]:
                 x["promotion_type"] = "НЕДОСТАТОЧНО ДАННЫХ"
-                x["status"] = "REVIEW"
+                x["status"] = "SKIP"
                 x["reason"] = "TOP-30 не загружен"
             return res
 
@@ -2415,29 +2417,34 @@ class Pipeline:
                 x["status"] = "EXISTS"
                 x["reason"] = "FE-RUS уже имеет filter URL для этого значения в TOP-30"
             elif promotion == "ТОВАР":
+                # Явно товарный TOP-30 не переводим в CREATE только из-за
+                # наличия отдельных filter URL у конкурентов.
                 x["status"] = "SKIP"
                 x["reason"] = f"Товарный интент: PRODUCT-доменов={len(product_domains)}, SEO-доменов={len(seo_domains)}"
-            elif promotion == "СМЕШАННЫЙ":
-                x["status"] = "REVIEW"
-                x["reason"] = f"Смешанный интент: PRODUCT-доменов={len(product_domains)}, SEO-доменов={len(seo_domains)}"
             elif promotion == "ИНФОРМАЦИОННАЯ":
                 x["status"] = "SKIP"
                 x["reason"] = f"Информационный интент: ARTICLE-доменов={len(article_domains)}"
-            elif promotion == "НЕДОСТАТОЧНО ДАННЫХ":
-                x["status"] = "REVIEW"
-                x["reason"] = "Не удалось надежно определить товарный/каталожный интент TOP-30"
-            elif len(filter_domains) >= 2:
+            elif len(filter_domains) >= 2 and promotion in ("СМЕШАННЫЙ", "SEO-СТРАНИЦА"):
+                # СМЕШАННЫЙ не отправляем в REVIEW: при двух и более
+                # независимых точных filter URL сразу создаем CREATE.
+                # Это прямое подтверждение коммерческого filter-интента.
                 x["status"] = "CREATE"
-                x["reason"] = f"SEO-интент + {len(filter_domains)} независимых конкурентов с подтвержденным filter URL для значения «{value}»"
+                x["reason"] = f"Подтвержден filter-интент: {len(filter_domains)} независимых конкурента с точным filter URL; TOP-30={promotion.lower()}"
+            elif promotion == "СМЕШАННЫЙ":
+                x["status"] = "SKIP"
+                x["reason"] = f"Смешанный интент, но точных filter-конкурентов недостаточно для CREATE: {len(filter_domains)}"
+            elif promotion == "НЕДОСТАТОЧНО ДАННЫХ":
+                x["status"] = "SKIP"
+                x["reason"] = "Недостаточно данных для надежного определения интента"
             elif len(filter_domains) == 1:
-                x["status"] = "REVIEW"
-                x["reason"] = f"SEO-интент, но только 1 независимый конкурент с подтвержденным filter URL для значения «{value}»"
+                x["status"] = "SKIP"
+                x["reason"] = f"Только 1 независимый конкурент с подтвержденным filter URL: {value}"
             elif len(seo_domains) >= 2:
-                x["status"] = "REVIEW"
+                x["status"] = "SKIP"
                 x["reason"] = f"SEO-интент подтвержден {len(seo_domains)} доменами, но точных filter URL недостаточно для CREATE"
             elif len(landing_domains) >= 1:
-                x["status"] = "REVIEW"
-                x["reason"] = f"SEO-интент, найдено посадочных доменов={len(landing_domains)}, но недостаточно точных filter-конкурентов"
+                x["status"] = "SKIP"
+                x["reason"] = f"Найдены посадочные домены={len(landing_domains)}, но недостаточно точных filter-конкурентов для CREATE"
             else:
                 x["status"] = "SKIP"
                 x["reason"] = "SEO-интент не подтвержден независимыми каталожными/filter-конкурентами"
@@ -2448,7 +2455,7 @@ class Pipeline:
 
     def check_urls(self, res):
         s = http_session()
-        rows = [x for x in res.get("rows", []) if x.get("status") in ("CREATE", "REVIEW")]
+        rows = [x for x in res.get("rows", []) if x.get("status") == "CREATE"]
         total = len(rows)
         checked = 0
         for idx, x in enumerate(rows, 1):
@@ -2624,6 +2631,11 @@ class Pipeline:
 # EXPORT
 # -----------------------------------------------------------------------------
 
+def is_filter_creation_intent(x):
+    """Разрешённый тип интента для SEO/filter-страницы."""
+    return x.get("promotion_type") in ("SEO-СТРАНИЦА", "СМЕШАННЫЙ")
+
+
 def generator_rows(res):
     """Финальный набор строк для внешнего генератора контента."""
     out = []
@@ -2632,8 +2644,9 @@ def generator_rows(res):
         # URL = 404 (страницы нет) и OCFilter = READY (категория/alias проверены).
         if x.get("status") != "CREATE":
             continue
-        # Внешний генератор получает только SEO-посадочные, не товарный интент.
-        if x.get("promotion_type") != "SEO-СТРАНИЦА":
+        # СМЕШАННЫЙ также допускается, если filter-интент подтверждён
+        # минимум двумя независимыми точными filter URL.
+        if not is_filter_creation_intent(x):
             continue
         if x.get("url_status") not in ("READY_FOR_OCFILTER", "HTTP_404"):
             continue
@@ -2701,7 +2714,7 @@ def export_excel(res, path, topdf=None):
         ("ТИП: ТОВАР", promo.get("ТОВАР", 0)),
         ("ТИП: СМЕШАННЫЙ", promo.get("СМЕШАННЫЙ", 0)),
         ("ТИП: ИНФОРМАЦИОННАЯ", promo.get("ИНФОРМАЦИОННАЯ", 0)),
-    ] + [(k, c[k]) for k in ("CREATE", "SKIP", "REVIEW", "EXISTS")]
+    ] + [(k, c[k]) for k in ("CREATE", "SKIP", "EXISTS")]
     for row in summary: ws.append(row)
     ws["A1"].font = Font(bold=True)
     headers = [
@@ -2725,9 +2738,6 @@ def export_excel(res, path, topdf=None):
     ws = wb.create_sheet("SKIP"); ws.append(headers)
     for x in res.get("rows", []):
         if x.get("status") == "SKIP": ws.append([x.get(h, "") for h in headers])
-    ws = wb.create_sheet("REVIEW"); ws.append(headers)
-    for x in res.get("rows", []):
-        if x.get("status") == "REVIEW": ws.append([x.get(h, "") for h in headers])
     ws = wb.create_sheet("FILTERS"); ws.append(["filter","filter_keyword","option_id","value","value_id","value_keyword","params","alias"])
     for o in res.get("options", []):
         for v in o.get("values", []):
@@ -2747,7 +2757,7 @@ def export_excel(res, path, topdf=None):
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("FE-RUS SEO Manager v1.21.5")
+        self.title("FE-RUS SEO Manager v1.21.7")
         self.geometry("1280x860")
         self.q = queue.Queue()
         self.res = None
@@ -2841,7 +2851,6 @@ class App(tk.Tk):
         self.analysis_stop_btn=ttk.Button(row,text="ОСТАНОВИТЬ АНАЛИЗ",command=self.stop_analysis,state="disabled"); self.analysis_stop_btn.pack(side="left",padx=8)
         ttk.Button(row,text="ПОКАЗАТЬ CREATE",command=lambda:self.show_status("CREATE")).pack(side="left",padx=8)
         ttk.Button(row,text="ПОКАЗАТЬ SKIP",command=lambda:self.show_status("SKIP")).pack(side="left")
-        ttk.Button(row,text="ПОКАЗАТЬ REVIEW",command=lambda:self.show_status("REVIEW")).pack(side="left",padx=8)
         ttk.Button(row,text="ПОКАЗАТЬ ТОВАРНЫЕ",command=lambda:self.show_promotion_type("ТОВАР")).pack(side="left",padx=8)
         ttk.Button(row,text="ПОКАЗАТЬ SEO",command=lambda:self.show_promotion_type("SEO-СТРАНИЦА")).pack(side="left")
         ttk.Button(row,text="ПОКАЗАТЬ СМЕШАННЫЕ",command=lambda:self.show_promotion_type("СМЕШАННЫЙ")).pack(side="left",padx=8)
@@ -2880,7 +2889,7 @@ class App(tk.Tk):
         ttk.Label(f,text="Финальный экспорт для внешней программы генерации контента").pack(anchor="w",padx=10,pady=12)
         ttk.Button(f,text="СОХРАНИТЬ CSV ДЛЯ ГЕНЕРАТОРА",command=self.export_generator).pack(anchor="w",padx=10,pady=4)
         ttk.Button(f,text="ЭКСПОРТИРОВАТЬ ПОЛНЫЙ XLSX",command=self.export).pack(anchor="w",padx=10,pady=4)
-        ttk.Label(f,text="CSV содержит только готовые SEO-страницы: promotion_type=SEO-СТРАНИЦА + status=CREATE + URL/OCFilter=READY. target_url - будущий SEO URL, filter_result_url - старый URL фильтрации.").pack(anchor="w",padx=10,pady=8)
+        ttk.Label(f,text="CSV содержит только готовые SEO/filter-страницы: promotion_type=SEO-СТРАНИЦА или СМЕШАННЫЙ + status=CREATE + URL/OCFilter=READY. target_url - будущий SEO URL, filter_result_url - старый URL фильтрации.").pack(anchor="w",padx=10,pady=8)
         self.export_log=tk.Text(f,font=("Consolas",10),height=24)
         self.export_log.pack(fill="both",expand=True,padx=10,pady=8)
         ttk.Button(f,text="ПОКАЗАТЬ ГОТОВЫЕ URL ФИЛЬТРАЦИИ",command=self.show_ready_filter_urls).pack(anchor="w",padx=10,pady=4)
@@ -3593,9 +3602,9 @@ class App(tk.Tk):
         for k in ("SEO-СТРАНИЦА","ТОВАР","СМЕШАННЫЙ","ИНФОРМАЦИОННАЯ","НЕДОСТАТОЧНО ДАННЫХ"):
             self.stats.insert("end",f"{k}: {p[k]}\n")
         self.stats.insert("end", "\nСТАТУС SEO-СТРАНИЦ:\n")
-        for k in ("CREATE","SKIP","REVIEW","EXISTS"):
+        for k in ("CREATE","SKIP","EXISTS"):
             self.stats.insert("end",f"{k}: {c[k]}\n")
-        self.stats.insert("end", "\nCREATE = только SEO-интент + минимум 2 независимых точных filter-конкурента.\n")
+        self.stats.insert("end", "\nCREATE = SEO- или СМЕШАННЫЙ-интент + минимум 2 независимых точных filter-конкурента. REVIEW не используется: неподтвержденные варианты идут в SKIP.\n")
         self.stats.insert("end", "ТОВАР = запрос преимущественно ведет на карточки товаров; отдельную SEO-посадочную не создаем.\n\n")
         self.stats.insert("end", "СПИСОК:\n")
         for x in self.res["rows"]:
@@ -4135,24 +4144,24 @@ class App(tk.Tk):
             seo_create = sum(
                 1 for x in rows
                 if x.get("status") == "CREATE"
-                and x.get("promotion_type") == "SEO-СТРАНИЦА"
+                and is_filter_creation_intent(x)
             )
             url_ready = sum(
                 1 for x in rows
                 if x.get("status") == "CREATE"
-                and x.get("promotion_type") == "SEO-СТРАНИЦА"
+                and is_filter_creation_intent(x)
                 and x.get("url_status") in ("READY_FOR_OCFILTER", "HTTP_404")
             )
             oc_ready = sum(
                 1 for x in rows
                 if x.get("status") == "CREATE"
-                and x.get("promotion_type") == "SEO-СТРАНИЦА"
+                and is_filter_creation_intent(x)
                 and x.get("url_status") in ("READY_FOR_OCFILTER", "HTTP_404")
                 and x.get("oc_status") == "READY"
             )
             oc_statuses = {}
             for x in rows:
-                if x.get("status") != "CREATE" or x.get("promotion_type") != "SEO-СТРАНИЦА":
+                if x.get("status") != "CREATE" or not is_filter_creation_intent(x):
                     continue
                 st = str(x.get("oc_status", "")) or "EMPTY"
                 oc_statuses[st] = oc_statuses.get(st, 0) + 1
@@ -4161,11 +4170,11 @@ class App(tk.Tk):
                 "1.0",
                 "Готовых URL фильтрации пока нет.\n\n"
                 f"CREATE: {create}\n"
-                f"SEO + CREATE: {seo_create}\n"
+                f"SEO/СМЕШАННЫЙ + CREATE: {seo_create}\n"
                 f"URL прошли проверку: {url_ready}\n"
                 f"OCFilter READY: {oc_ready}\n"
                 f"OCFilter статусы: {oc_status_text}\n\n"
-                "Правило экспорта: status=CREATE + promotion_type=SEO-СТРАНИЦА "
+                "Правило экспорта: status=CREATE + promotion_type=SEO-СТРАНИЦА/СМЕШАННЫЙ "
                 "+ URL=404/READY + OCFilter=READY.\n"
                 "Если OCFilter READY=0, ссылки намеренно не выводятся."
             )
