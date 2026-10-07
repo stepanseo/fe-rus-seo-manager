@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-FE-RUS SEO Manager v1.21.2
+FE-RUS SEO Manager v1.21.3
 
 Единое Windows-приложение:
 1. Категория - получает category_id, OCFilter options и значения.
@@ -2178,21 +2178,40 @@ class Pipeline:
 
         # Добавляем классификацию к исходному TOP-30 DataFrame для полного XLSX.
         classification_cols = ["page_type","page_confidence","page_signals","page_http_status","page_fetched","page_h1","page_breadcrumbs"]
+
+        # Pandas 2.x может прочитать уже существующие колонки как StringDtype.
+        # В таком DataFrame запись числового confidence (например 0.35) через
+        # .at[] вызывает:
+        # "Invalid value '0.35' for dtype 'str'".
+        # Для результатов классификации храним все поля как обычный object/text.
         for col in classification_cols:
             if col not in topdf.columns:
-                topdf[col] = ""
+                topdf[col] = pd.Series([""] * len(topdf), index=topdf.index, dtype=object)
+            else:
+                topdf[col] = topdf[col].astype(object)
+
+        def classification_cell(value):
+            if value is None:
+                return ""
+            try:
+                if pd.isna(value):
+                    return ""
+            except Exception:
+                pass
+            return str(value)
+
         for idx, rr in topdf.iterrows():
             u = str(rr.get(uc, "")).strip().rstrip("/")
             info = page_map.get(u) or cache.get(u)
             if not info:
                 continue
-            topdf.at[idx, "page_type"] = info.get("page_type", "")
-            topdf.at[idx, "page_confidence"] = info.get("confidence", "")
-            topdf.at[idx, "page_signals"] = info.get("signals", "")
-            topdf.at[idx, "page_http_status"] = info.get("http_status", "")
-            topdf.at[idx, "page_fetched"] = info.get("fetched", "")
-            topdf.at[idx, "page_h1"] = info.get("h1", "")
-            topdf.at[idx, "page_breadcrumbs"] = info.get("breadcrumbs", "")
+            topdf.at[idx, "page_type"] = classification_cell(info.get("page_type", ""))
+            topdf.at[idx, "page_confidence"] = classification_cell(info.get("confidence", ""))
+            topdf.at[idx, "page_signals"] = classification_cell(info.get("signals", ""))
+            topdf.at[idx, "page_http_status"] = classification_cell(info.get("http_status", ""))
+            topdf.at[idx, "page_fetched"] = classification_cell(info.get("fetched", ""))
+            topdf.at[idx, "page_h1"] = classification_cell(info.get("h1", ""))
+            topdf.at[idx, "page_breadcrumbs"] = classification_cell(info.get("breadcrumbs", ""))
 
         # Повторяем строки анализа.
         for x in res["rows"]:
@@ -2682,7 +2701,7 @@ def export_excel(res, path, topdf=None):
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("FE-RUS SEO Manager v1.21.1")
+        self.title("FE-RUS SEO Manager v1.21.3")
         self.geometry("1280x860")
         self.q = queue.Queue()
         self.res = None
