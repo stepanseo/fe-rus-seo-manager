@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-FE-RUS SEO Manager v1.21.3
+FE-RUS SEO Manager v1.21.4
 
 Единое Windows-приложение:
 1. Категория - получает category_id, OCFilter options и значения.
@@ -50,6 +50,13 @@ CFG = Path(os.environ.get("APPDATA", Path.home())) / APP / "config.json"
 CREATE_ROUTE = "extension/module/ocfilter/addPage"
 PAGE_ROUTE = "extension/module/ocfilter/page"
 MENU_STATUS = "0"  # ВСЕГДА отключено
+
+# Ускорение TOP-30 WordKeeper.
+# 0.5 сек между запросами вместо прежних 2 сек.
+WK_DELAY = 0.5
+# CSV/checkpoint сохраняются пакетно, чтобы не переписывать весь накопительный
+# файл после каждого запроса. При остановке/ошибке пакет принудительно сохраняется.
+WK_SAVE_EVERY = 10
 
 
 def norm(x):
@@ -550,23 +557,16 @@ def safe_sorted_strings(values):
     return sorted(set(cleaned), key=lambda x: x.casefold())
 
 
-def wordkeeper_ajax_post(session, query, region):
-    """Выполняет AJAX TOP-30 WordKeeper без передачи Session cookie-jar в POST.
+def wordkeeper_ajax_post(ajax_session, query, region, cookie_header=""):
+    """Выполняет AJAX TOP-30 через постоянную HTTP-сессию.
 
-    На некоторых ответах WordKeeper/промежуточном cookie-jar requests возникает
-    TypeError вида:
-        '<' not supported between instances of 'float' and 'str'
-    Поэтому после авторизации забираем только готовую строку Cookie и выполняем
-    AJAX через отдельный requests.post. Это не меняет авторизацию, но исключает
-    повторную обработку/сортировку потенциально кривых cookies из ответа AJAX.
+    Авторизационные cookies передаются как готовая строка Cookie, поэтому мы
+    не используем проблемный cookie-jar авторизационной сессии WordKeeper.
+    При этом отдельная ajax-сессия переиспользует TCP/TLS-соединение между
+    запросами, что заметно ускоряет большой пакет TOP-30.
     """
     query = str(query or "").strip()
     region = str(region or "").strip()
-    cookie_header = "; ".join(
-        f"{str(c.name)}={str(c.value)}"
-        for c in session.cookies
-        if getattr(c, "name", None) is not None
-    )
     headers = {
         "User-Agent": UA,
         "Accept-Language": "ru-RU,ru;q=0.9",
@@ -577,7 +577,7 @@ def wordkeeper_ajax_post(session, query, region):
     if cookie_header:
         headers["Cookie"] = cookie_header
 
-    return requests.post(
+    return ajax_session.post(
         TOP30_WK,
         data={"word": query, "region": region},
         headers=headers,
@@ -2701,7 +2701,7 @@ def export_excel(res, path, topdf=None):
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("FE-RUS SEO Manager v1.21.3")
+        self.title("FE-RUS SEO Manager v1.21.4")
         self.geometry("1280x860")
         self.q = queue.Queue()
         self.res = None
@@ -3258,6 +3258,17 @@ class App(tk.Tk):
             if "/dashboard" not in r.url:
                 raise RuntimeError("Авторизация WordKeeper не удалась.")
 
+            # Отдельная постоянная сессия для AJAX: не трогаем cookie-jar
+            # авторизационной сессии, но переиспользуем HTTP-соединение между
+            # десятками/сотнями TOP-30 запросов.
+            ajax_session = requests.Session()
+            ajax_session.headers.update({"User-Agent": UA, "Accept-Language": "ru-RU,ru;q=0.9"})
+            cookie_header = "; ".join(
+                f"{str(c.name)}={str(c.value)}"
+                for c in s.cookies
+                if getattr(c, "name", None) is not None
+            )
+
             # Запросы именно ТЕКУЩЕЙ категории.
             # CSV/checkpoint являются накопительным кэшем, но для текущей категории
             # считаем только её канонические keywords. Один keyword может иметь
@@ -3366,6 +3377,15 @@ class App(tk.Tk):
             self.q.put(("wklog",f"Запросов WordKeeper к выполнению: {pending_queries} | кэшем подтверждено запросов текущей категории: {len(done_query_keys)}"))
             self.q.put(("wklog",f"Строк TOP-30 в накопительном CSV: {len(results)} | source_query с результатами текущей категории: {len(cached_result_query_keys)}"))
 
+            # Один раз строим индекс уже сохранённых пар (source_query, URL).
+            # Раньше этот set пересобирался из всего CSV на каждом запросе,
+            # что давало лишнюю O(N^2) работу на больших накопительных файлах.
+            existing_keys = {
+                (str(rr.get("source_query", "")).strip(), str(rr.get("url", "")).strip())
+                for rr in results
+                if str(rr.get("source_query", "")).strip() and str(rr.get("url", "")).strip()
+            }
+
             query_index=0
             total_pending=pending_queries
             for canonical, variants in query_plan:
@@ -3378,7 +3398,7 @@ class App(tk.Tk):
                         break
                     query_index += 1
                     try:
-                        rr=wordkeeper_ajax_post(s, actual_query, region)
+                        rr=wordkeeper_ajax_post(ajax_session, actual_query, region, cookie_header)
                         rr_status=http_status_code(rr)
                         rr_text=http_response_text(rr)
                         if rr_status in (301,302,303,307,308):
@@ -3399,28 +3419,34 @@ class App(tk.Tk):
                         done_queries.add(actual_query)
                         done_query_keys.add(norm(actual_query))
                         # Не дублируем одинаковый URL одного и того же source_query.
-                        existing_keys = {
-                            (str(rr.get("source_query", "")).strip(), str(rr.get("url", "")).strip())
-                            for rr in results
-                            if str(rr.get("source_query", "")).strip() and str(rr.get("url", "")).strip()
-                        }
                         for rr in rows:
                             key = (str(rr.get("source_query", "")).strip(), str(rr.get("url", "")).strip())
                             if key not in existing_keys:
                                 results.append(rr)
                                 existing_keys.add(key)
-                        pd.DataFrame(results).to_csv(out_path,index=False,encoding="utf-8-sig")
-                        # keyword помечаем done только после всех его вариантов.
-                        progress_path.write_text(json.dumps({
-                            "done_keywords":safe_sorted_strings(done),
-                            "done_queries":safe_sorted_strings(done_queries),
-                            "updated_at":time.strftime("%Y-%m-%d %H:%M:%S")
-                        },ensure_ascii=False,indent=2),encoding="utf-8")
-                        self.q.put(("wklog",f"[{query_index}/{total_pending}] {canonical} | запрос: {actual_query} | HTTP {rr_status} | результатов: {len(rows)} | СОХРАНЕНО"))
+                        # Не переписываем весь накопительный CSV после каждого
+                        # запроса. Сохраняем каждые WK_SAVE_EVERY запросов, а также
+                        # немедленно при остановке/последнем запросе.
+                        force_save = (
+                            query_index % WK_SAVE_EVERY == 0
+                            or self.wk_stop_event.is_set()
+                            or query_index == total_pending
+                        )
+                        if force_save:
+                            pd.DataFrame(results).to_csv(out_path,index=False,encoding="utf-8-sig")
+                            progress_path.write_text(json.dumps({
+                                "done_keywords":safe_sorted_strings(done),
+                                "done_queries":safe_sorted_strings(done_queries),
+                                "updated_at":time.strftime("%Y-%m-%d %H:%M:%S")
+                            },ensure_ascii=False,indent=2),encoding="utf-8")
+                            save_note = " | СОХРАНЕНО"
+                        else:
+                            save_note = ""
+                        self.q.put(("wklog",f"[{query_index}/{total_pending}] {canonical} | запрос: {actual_query} | HTTP {rr_status} | результатов: {len(rows)}{save_note}"))
                         if self.wk_stop_event.is_set():
                             all_variants_done=False
                             break
-                        time.sleep(2)
+                        time.sleep(WK_DELAY)
                     except Exception as e:
                         all_variants_done=False
                         pd.DataFrame(results).to_csv(out_path,index=False,encoding="utf-8-sig")
@@ -3442,12 +3468,10 @@ class App(tk.Tk):
 
                 if all_variants_done:
                     done.add(canonical)
-                    pd.DataFrame(results).to_csv(out_path,index=False,encoding="utf-8-sig")
-                    progress_path.write_text(json.dumps({
-                        "done_keywords":safe_sorted_strings(done),
-                        "done_queries":safe_sorted_strings(done_queries),
-                        "updated_at":time.strftime("%Y-%m-%d %H:%M:%S")
-                    },ensure_ascii=False,indent=2),encoding="utf-8")
+                    # CSV/checkpoint сохраняются пакетно выше. Здесь только фиксируем
+                    # завершение canonical keyword в памяти, чтобы не переписывать
+                    # весь файл после каждого значения. Финальное сохранение выполняется
+                    # после цикла, а при ошибке/остановке — принудительно.
                     self.q.put(("wklog",f"ЗАВЕРШЕНО ЗНАЧЕНИЕ: {canonical} | вариантов запроса: {len(variants)}"))
 
             pd.DataFrame(results).to_csv(out_path,index=False,encoding="utf-8-sig")
