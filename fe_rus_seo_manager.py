@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-FE-RUS SEO Manager v1.21.7
+FE-RUS SEO Manager v1.21.8
 
 Единое Windows-приложение:
 1. Категория - получает category_id, OCFilter options и значения.
@@ -2686,6 +2686,75 @@ def generator_rows(res):
     return out
 
 
+
+def append_ready_links_file(res, path):
+    """Добавляет готовые к созданию SEO-URL в единый двухколоночный файл."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    parent_url = str(res.get("url", "") or "").strip().rstrip("/") + "/"
+    ready = generator_rows(res)
+    if not parent_url or parent_url == "/":
+        raise RuntimeError("Не определена ссылка родительского раздела.")
+    if not ready:
+        raise RuntimeError("Нет готовых ссылок для записи. Нужны status=CREATE + URL=READY + OCFilter=READY.")
+
+    pairs = []
+    seen = set()
+    for row in ready:
+        target = str(row.get("target_url", "") or "").strip()
+        if target:
+            key = (target.rstrip("/") + "/", parent_url)
+            if key not in seen:
+                seen.add(key)
+                pairs.append(key)
+
+    existing = []
+    seen_existing = set()
+    if path.exists() and path.stat().st_size > 0:
+        try:
+            old = pd.read_csv(path, sep=";", encoding="utf-8-sig", dtype=str, keep_default_na=False)
+        except Exception:
+            old = pd.read_csv(path, sep=",", encoding="utf-8-sig", dtype=str, keep_default_na=False)
+
+        cols = list(old.columns)
+        link_col = next((c for c in cols if str(c).strip().lower() in {"ссылка","link","url","target_url"}), None)
+        parent_col = next((c for c in cols if str(c).strip().lower() in {"ссылка на раздел","parent_url","category_url","parent"}), None)
+        if not (link_col and parent_col) and len(cols) >= 2:
+            link_col, parent_col = cols[0], cols[1]
+        if not (link_col and parent_col):
+            raise RuntimeError("Существующий файл не содержит двух необходимых колонок.")
+
+        for _, rr in old.iterrows():
+            target = str(rr.get(link_col, "") or "").strip()
+            parent = str(rr.get(parent_col, "") or "").strip()
+            if target and parent:
+                key = (target.rstrip("/") + "/", parent.rstrip("/") + "/")
+                if key not in seen_existing:
+                    seen_existing.add(key)
+                    existing.append(key)
+
+    added = 0
+    for key in pairs:
+        if key not in seen_existing:
+            existing.append(key)
+            seen_existing.add(key)
+            added += 1
+
+    df = pd.DataFrame(existing, columns=["Ссылка", "Ссылка на раздел"])
+    tmp = path.with_name(path.name + ".tmp")
+    df.to_csv(tmp, sep=";", index=False, encoding="utf-8-sig", lineterminator="\n")
+    try:
+        tmp.replace(path)
+    except Exception:
+        try:
+            if tmp.exists():
+                tmp.unlink()
+        except Exception:
+            pass
+        raise
+    return added, len(existing), str(path)
+
+
 def export_generator_csv(res, path):
     rows = generator_rows(res)
     if not rows:
@@ -2888,6 +2957,7 @@ class App(tk.Tk):
         f=self.tabs["6. Экспорт"]
         ttk.Label(f,text="Финальный экспорт для внешней программы генерации контента").pack(anchor="w",padx=10,pady=12)
         ttk.Button(f,text="СОХРАНИТЬ CSV ДЛЯ ГЕНЕРАТОРА",command=self.export_generator).pack(anchor="w",padx=10,pady=4)
+        ttk.Button(f,text="ЗАПИСАТЬ ДАННЫЕ В ФАЙЛ",command=self.append_ready_links).pack(anchor="w",padx=10,pady=4)
         ttk.Button(f,text="ЭКСПОРТИРОВАТЬ ПОЛНЫЙ XLSX",command=self.export).pack(anchor="w",padx=10,pady=4)
         ttk.Label(f,text="CSV содержит только готовые SEO/filter-страницы: promotion_type=SEO-СТРАНИЦА или СМЕШАННЫЙ + status=CREATE + URL/OCFilter=READY. target_url - будущий SEO URL, filter_result_url - старый URL фильтрации.").pack(anchor="w",padx=10,pady=8)
         self.export_log=tk.Text(f,font=("Consolas",10),height=24)
@@ -4189,6 +4259,46 @@ class App(tk.Tk):
         self.clipboard_clear()
         self.clipboard_append(value)
         self.update()
+
+    def append_ready_links(self):
+        """Записывает готовые к созданию ссылки в единый накопительный файл."""
+        if not self.res:
+            messagebox.showwarning("Нет данных", "Сначала выполните анализ.")
+            return
+        self._apply_ocfilter_audit()
+
+        cfg = load_cfg()
+        saved_path = str(cfg.get("ready_links_file", "") or "").strip()
+        path = Path(saved_path) if saved_path else None
+
+        if path is None:
+            chosen = filedialog.asksaveasfilename(
+                title="Выберите единый файл готовых ссылок",
+                defaultextension=".csv",
+                initialfile="seo_create_links.csv",
+                filetypes=[("CSV", "*.csv"), ("Все файлы", "*.*")]
+            )
+            if not chosen:
+                return
+            path = Path(chosen)
+            cfg["ready_links_file"] = str(path)
+            save_cfg(cfg)
+
+        try:
+            added, total, saved = append_ready_links_file(self.res, path)
+            self.export_log.insert(
+                "end",
+                f"\nЗапись готовых ссылок: добавлено {added} | всего в файле {total}\n"
+                f"Файл: {saved}\n"
+            )
+            self.export_log.see("end")
+            messagebox.showinfo(
+                "Готово",
+                f"Новых ссылок записано: {added}\n"
+                f"Всего строк в файле: {total}\n\n{saved}"
+            )
+        except Exception as e:
+            messagebox.showerror("Запись данных", str(e))
 
     def export_generator(self):
         if not self.res:
