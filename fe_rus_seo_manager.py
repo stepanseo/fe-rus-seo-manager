@@ -22,6 +22,7 @@ import re
 import json
 import time
 import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import queue
 import webbrowser
 import types
@@ -669,6 +670,10 @@ def wordkeeper_query_variants(category, value):
 # -----------------------------------------------------------------------------
 
 SERP_CLASSIFIER_VERSION = "1.21.1"
+# Параллельная классификация URL на этапе «Анализ».
+# 8 потоков заметно ускоряют сетевые проверки, не создавая слишком
+# агрессивную нагрузку на сайты из TOP-30.
+SERP_CLASSIFY_WORKERS = 8
 PRODUCT_PATH_MARKERS = (
     "/product/", "/products/", "/item/", "/goods/", "/tovar/", "/offer/",
     "/p/", "/detail/", "/produkt/", "/catalog/product/"
@@ -2154,25 +2159,66 @@ class Pipeline:
 
         total_urls = len(unique_urls)
         new_classified = 0
-        if progress:
-            progress(f"Классификация TOP-30: уникальных URL {total_urls} | кэш: {len(cache)}")
 
-        for idx, (u, title, snippet) in enumerate(unique_urls, 1):
-            if stop_event is not None and stop_event.is_set():
-                break
+        # Сначала мгновенно забираем всё из кэша, а в сеть отправляем только
+        # действительно новые URL. Раньше новые URL проверялись строго
+        # последовательно, поэтому десятки медленных сайтов могли растянуть
+        # этап анализа на многие минуты.
+        pending_urls = []
+        for u, title, snippet in unique_urls:
             key = u.rstrip("/")
             if key in cache:
                 page_map[key] = cache[key]
-                continue
-            item = _classify_serp_page(session, u, title, snippet)
-            cache[key] = item
-            page_map[key] = item
-            new_classified += 1
-            if progress and (new_classified == 1 or new_classified % 10 == 0):
-                progress(f"Классификация URL: {idx}/{total_urls} | новых {new_classified} | {item.get('page_type')} | {u}")
-            # Сохраняем регулярно, чтобы остановка/сбой не потеряли работу.
-            if new_classified % 10 == 0:
-                save_serp_classification_cache(cache, cache_path)
+            else:
+                pending_urls.append((u, title, snippet))
+
+        if progress:
+            progress(
+                f"Классификация TOP-30: уникальных URL {total_urls} | "
+                f"кэшировано {total_urls - len(pending_urls)} | "
+                f"новых {len(pending_urls)} | потоков {SERP_CLASSIFY_WORKERS}"
+            )
+
+        # requests.Session не является гарантированно thread-safe, поэтому
+        # каждый поток получает собственную Session и переиспользует её для
+        # всех своих URL. Это одновременно даёт параллельность и keep-alive.
+        thread_local = threading.local()
+
+        def classify_one(task):
+            u, title, snippet = task
+            sess = getattr(thread_local, "session", None)
+            if sess is None:
+                sess = http_session()
+                thread_local.session = sess
+            item = _classify_serp_page(sess, u, title, snippet)
+            return u.rstrip("/"), item
+
+        if pending_urls:
+            max_workers = min(SERP_CLASSIFY_WORKERS, len(pending_urls))
+            executor = ThreadPoolExecutor(max_workers=max_workers)
+            futures = {executor.submit(classify_one, task): task for task in pending_urls}
+            try:
+                for future in as_completed(futures):
+                    if stop_event is not None and stop_event.is_set():
+                        for f in futures:
+                            if not f.done():
+                                f.cancel()
+                        break
+                    u, item = future.result()
+                    cache[u] = item
+                    page_map[u] = item
+                    new_classified += 1
+                    if progress:
+                        progress(
+                            f"Классификация URL: {new_classified}/{len(pending_urls)} "
+                            f"(всего {total_urls}) | {item.get('page_type')} | {u}"
+                        )
+                    # Сохраняем регулярно, чтобы остановка/сбой не потеряли
+                    # уже завершённые параллельные проверки.
+                    if new_classified % 20 == 0:
+                        save_serp_classification_cache(cache, cache_path)
+            finally:
+                executor.shutdown(wait=True, cancel_futures=True)
 
         save_serp_classification_cache(cache, cache_path)
 
@@ -2701,7 +2747,7 @@ def export_excel(res, path, topdf=None):
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("FE-RUS SEO Manager v1.21.4")
+        self.title("FE-RUS SEO Manager v1.21.5")
         self.geometry("1280x860")
         self.q = queue.Queue()
         self.res = None
