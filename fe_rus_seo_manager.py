@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-FE-RUS SEO Manager v1.24.1
+FE-RUS SEO Manager v1.24.2
 
 Единое Windows-приложение:
 1. Категория - получает category_id, OCFilter options и значения.
@@ -3215,7 +3215,7 @@ def migrate_legacy_file_for_section(src, dst, filename, res):
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("FE-RUS SEO Manager v1.24.1")
+        self.title("FE-RUS SEO Manager v1.24.2")
         self.geometry("1280x860")
         self.q = queue.Queue()
         self.res = None
@@ -4642,7 +4642,21 @@ class App(tk.Tk):
                 key = (str(r.get("category_url", "")).strip(), str(r.get("keyword", "")).strip(), str(r.get("target_url", "")).strip())
                 if not key[1] or not key[2]:
                     continue
-                result[key] = r.to_dict()
+                row = r.to_dict()
+
+                # v1.24.1 записывала verification_version в память,
+                # но не включала это поле в CSV. Поэтому после перезапуска
+                # все строки выглядели как "непроверенные" и запускались заново.
+                # Для таких старых записей безопасно восстановить версию 5,
+                # если проверка была завершена успешно.
+                if (
+                    not str(row.get("verification_version", "")).strip()
+                    and str(row.get("verification_state", "")).strip() == "VERIFIED"
+                    and str(row.get("url_status", "")).strip()
+                ):
+                    row["verification_version"] = "5"
+
+                result[key] = row
             return result
         except Exception:
             return {}
@@ -4656,8 +4670,10 @@ class App(tk.Tk):
         df = pd.DataFrame(rows)
         cols = [
             "category_url", "keyword", "category", "category_id", "filter", "value",
-            "target_url", "url_status", "http_status", "final_url", "redirect",
-            "checked_at", "verification_state", "error"
+            "target_url", "url_status", "http_status", "redirect_location",
+            "final_http_status", "final_url", "redirect",
+            "existing_seo_url", "existing_seo_alias", "existing_seo_source",
+            "checked_at", "verification_state", "verification_version", "error"
         ]
         for c in cols:
             if c not in df.columns:
