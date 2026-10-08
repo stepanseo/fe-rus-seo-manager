@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-FE-RUS SEO Manager v1.23.1
+FE-RUS SEO Manager v1.23.3
 
 Единое Windows-приложение:
 1. Категория - получает category_id, OCFilter options и значения.
@@ -3944,7 +3944,7 @@ class App(tk.Tk):
             if not endpoint or not token:
                 raise RuntimeError("Не настроен Google Drive Web App.")
 
-            sections=cloud_list_sections(endpoint,token,timeout=120)
+            sections=cloud_list_sections(endpoint,token,timeout=180)
             # Не считаем 00_ОБЩИЕ разделом.
             sections=[
                 x for x in sections
@@ -4037,7 +4037,7 @@ class App(tk.Tk):
                 local_dir=cloud_cache_dir(sid)
                 local_dir.mkdir(parents=True,exist_ok=True)
                 local_path=local_dir/"seo_top30_result.csv"
-                cloud_download_section_file(endpoint,token,section_name,"seo_top30_result.csv",local_path,timeout=180)
+                cloud_download_section_file(endpoint,token,section_name,"seo_top30_result.csv",local_path,timeout=300)
 
                 new_df=df.loc[idxs].copy()
                 if local_path.exists() and local_path.stat().st_size:
@@ -4050,7 +4050,7 @@ class App(tk.Tk):
                         self.q.put(("wkmigratelog",f"  Предупреждение: старый облачный файл не прочитан, будет заменён: {e}"))
 
                 new_df.to_csv(local_path,index=False,encoding="utf-8-sig")
-                cloud_upload_section_file(endpoint,token,section_name,"seo_top30_result.csv",local_path,timeout=240)
+                cloud_upload_section_file(endpoint,token,section_name,"seo_top30_result.csv",local_path,timeout=600)
 
                 uploaded+=1
                 uploaded_rows+=len(idxs)
@@ -5022,7 +5022,7 @@ class App(tk.Tk):
 
         # Проверяем Web App до сохранения настроек.
         try:
-            test = requests.get(endpoint_new, timeout=20)
+            test = requests.get(endpoint_new, timeout=60, allow_redirects=True)
             if test.status_code != 200:
                 body = (test.text or "").strip()
                 if test.status_code in (401, 403) or "accounts.google.com" in body or "<html" in body.lower():
@@ -5055,8 +5055,13 @@ class App(tk.Tk):
                     "Проверьте, что опубликован именно Apps Script из файла google_drive_csv_webapp_final.gs."
                 )
                 return False
-        except Exception as e:
-            messagebox.showerror("Облачный CSV", f"Не удалось проверить Web App:\n{e}")
+        except requests.exceptions.ReadTimeout:
+            messagebox.showerror(
+                "Облачный CSV",
+                "Google Web App не ответил вовремя.\n\n"
+                "В новой версии GET /exec сделан лёгким и не обращается к Google Drive. "
+                "Обновите развёртывание Apps Script до v1.23.3 и повторите проверку."
+            )
             return False
 
         cfg["cloud_csv_webapp_url"] = endpoint_new
