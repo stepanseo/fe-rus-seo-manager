@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-FE-RUS SEO Manager v1.22.4
+FE-RUS SEO Manager v1.22.5
 
 Единое Windows-приложение:
 1. Категория - получает category_id, OCFilter options и значения.
@@ -3323,7 +3323,14 @@ class App(tk.Tk):
             **{k:e.get() for k,e in self.oc.items()}
         }
         d["ocfilter"]={k:e.get() for k,e in self.oc.items()}
-        save_cfg(d); self.cfg=d
+
+        # Не перезаписываем весь config.json только настройками категории.
+        # Раньше здесь cloud_csv_webapp_url/cloud_csv_token и ready_links_file
+        # удалялись, поэтому программа снова спрашивала URL и токен.
+        cfg = load_cfg()
+        cfg.update(d)
+        save_cfg(cfg)
+        self.cfg = cfg
 
     def pickfolder(self):
         p=filedialog.askdirectory(initialdir=self.folder.get() or os.getcwd())
@@ -4538,7 +4545,7 @@ class App(tk.Tk):
             return
         self._apply_ocfilter_audit()
 
-        cfg = load_cfg()
+        cfg = dict(getattr(self, "cfg", None) or load_cfg())
         endpoint = str(cfg.get("cloud_csv_webapp_url", "") or "").strip()
         token = str(cfg.get("cloud_csv_token", "") or "").strip()
 
