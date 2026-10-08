@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-FE-RUS SEO Manager v1.22.3
+FE-RUS SEO Manager v1.22.4
 
 Единое Windows-приложение:
 1. Категория - получает category_id, OCFilter options и значения.
@@ -2794,7 +2794,7 @@ def sync_ready_links_cloud(csv_path, endpoint, token, timeout=60):
 
 
 def append_ready_links_file(res, path):
-    """Добавляет готовые к созданию SEO-URL в единый двухколоночный файл."""
+    """Добавляет готовые SEO-URL в единый накопительный CSV из 4 колонок."""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     parent_url = str(res.get("url", "") or "").strip().rstrip("/") + "/"
@@ -2804,18 +2804,24 @@ def append_ready_links_file(res, path):
     if not ready:
         raise RuntimeError("Нет готовых ссылок для записи. Нужны status=CREATE + URL=READY + OCFilter=READY.")
 
-    pairs = []
+    # Новая запись: ссылка + название характеристики + значение + родительский раздел.
+    new_rows = []
     seen = set()
     for row in ready:
         target = str(row.get("target_url", "") or "").strip()
-        if target:
-            key = (target.rstrip("/") + "/", parent_url)
-            if key not in seen:
-                seen.add(key)
-                pairs.append(key)
+        characteristic = str(row.get("filter", "") or "").strip()
+        value = str(row.get("value", "") or "").strip()
+        if not target:
+            continue
+        target = target.rstrip("/") + "/"
+        key = (target, characteristic, value, parent_url)
+        if key not in seen:
+            seen.add(key)
+            new_rows.append(key)
 
     existing = []
     seen_existing = set()
+
     if path.exists() and path.stat().st_size > 0:
         try:
             old = pd.read_csv(path, sep=";", encoding="utf-8-sig", dtype=str, keep_default_na=False)
@@ -2823,30 +2829,42 @@ def append_ready_links_file(res, path):
             old = pd.read_csv(path, sep=",", encoding="utf-8-sig", dtype=str, keep_default_na=False)
 
         cols = list(old.columns)
-        link_col = next((c for c in cols if str(c).strip().lower() in {"ссылка","link","url","target_url"}), None)
-        parent_col = next((c for c in cols if str(c).strip().lower() in {"ссылка на раздел","parent_url","category_url","parent"}), None)
+        def find_col(names):
+            return next((c for c in cols if str(c).strip().lower() in names), None)
+
+        link_col = find_col({"ссылка", "link", "url", "target_url"})
+        char_col = find_col({"название хар-ки", "название характеристики", "характеристика", "filter", "filter_name"})
+        value_col = find_col({"значение", "value", "value_name"})
+        parent_col = find_col({"ссылка на раздел", "parent_url", "category_url", "parent"})
+
+        # Старый двухколоночный файл поддерживаем: характеристика/значение будут пустыми.
         if not (link_col and parent_col) and len(cols) >= 2:
             link_col, parent_col = cols[0], cols[1]
         if not (link_col and parent_col):
-            raise RuntimeError("Существующий файл не содержит двух необходимых колонок.")
+            raise RuntimeError("Существующий файл не содержит колонок «Ссылка» и «Ссылка на раздел».")
 
         for _, rr in old.iterrows():
             target = str(rr.get(link_col, "") or "").strip()
             parent = str(rr.get(parent_col, "") or "").strip()
+            characteristic = str(rr.get(char_col, "") or "").strip() if char_col else ""
+            value = str(rr.get(value_col, "") or "").strip() if value_col else ""
             if target and parent:
-                key = (target.rstrip("/") + "/", parent.rstrip("/") + "/")
+                key = (target.rstrip("/") + "/", characteristic, value, parent.rstrip("/") + "/")
                 if key not in seen_existing:
                     seen_existing.add(key)
                     existing.append(key)
 
     added = 0
-    for key in pairs:
+    for key in new_rows:
         if key not in seen_existing:
             existing.append(key)
             seen_existing.add(key)
             added += 1
 
-    df = pd.DataFrame(existing, columns=["Ссылка", "Ссылка на раздел"])
+    df = pd.DataFrame(
+        existing,
+        columns=["Ссылка", "Название хар-ки", "Значение", "Ссылка на раздел"]
+    )
     tmp = path.with_name(path.name + ".tmp")
     df.to_csv(tmp, sep=";", index=False, encoding="utf-8-sig", lineterminator="\n")
     try:
@@ -3068,7 +3086,7 @@ class App(tk.Tk):
         ttk.Button(f,text="ОТКРЫТЬ ОБЛАЧНЫЙ ФАЙЛ",command=self.open_cloud_file).pack(anchor="w",padx=10,pady=4)
         ttk.Label(f,text="Кнопка сохраняет накопительный CSV на компьютере и автоматически синхронизирует его с единым CSV в Google Drive.").pack(anchor="w",padx=10,pady=2)
         ttk.Button(f,text="ЭКСПОРТИРОВАТЬ ПОЛНЫЙ XLSX",command=self.export).pack(anchor="w",padx=10,pady=4)
-        ttk.Label(f,text="CSV содержит только готовые SEO/filter-страницы: promotion_type=SEO-СТРАНИЦА или СМЕШАННЫЙ + status=CREATE + URL/OCFilter=READY. target_url - будущий SEO URL, filter_result_url - старый URL фильтрации.").pack(anchor="w",padx=10,pady=8)
+        ttk.Label(f,text="Накопительный CSV: 4 колонки — Ссылка, Название хар-ки, Значение, Ссылка на раздел. Записываются только готовые страницы: promotion_type=SEO-СТРАНИЦА или СМЕШАННЫЙ + status=CREATE + URL/OCFilter=READY.").pack(anchor="w",padx=10,pady=8)
         self.export_log=tk.Text(f,font=("Consolas",10),height=24)
         self.export_log.pack(fill="both",expand=True,padx=10,pady=8)
         ttk.Button(f,text="ПОКАЗАТЬ ГОТОВЫЕ URL ФИЛЬТРАЦИИ",command=self.show_ready_filter_urls).pack(anchor="w",padx=10,pady=4)
