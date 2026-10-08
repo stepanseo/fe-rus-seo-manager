@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-FE-RUS SEO Manager v1.22.1
+FE-RUS SEO Manager v1.22.2
 
 Единое Windows-приложение:
 1. Категория - получает category_id, OCFilter options и значения.
@@ -2773,7 +2773,17 @@ def sync_ready_links_cloud(csv_path, endpoint, token, timeout=60):
     except Exception as e:
         raise RuntimeError(f"Не удалось отправить файл в Google Drive: {e}")
     if r.status_code != 200:
-        raise RuntimeError(f"Google Drive Web App вернул HTTP {r.status_code}: {r.text[:500]}")
+        body = (r.text or "").strip()
+        if r.status_code in (401, 403) or "accounts.google.com" in body or "<!DOCTYPE html>" in body or "<html" in body.lower():
+            raise RuntimeError(
+                f"Google Apps Script не разрешил анонимный доступ (HTTP {r.status_code}). "
+                "В настройках Web App выберите «Выполнять от имени: меня» и "
+                "«У кого есть доступ: любой пользователь/Anyone», затем заново разверните "
+                "новую версию и используйте URL, заканчивающийся на /exec. "
+                "Проверка: откройте /exec в режиме инкогнито — должна появиться JSON-строка "
+                "{ok:true,...}, а не страница входа Google."
+            )
+        raise RuntimeError(f"Google Drive Web App вернул HTTP {r.status_code}: {body[:500]}")
     try:
         data = r.json()
     except Exception:
@@ -4393,6 +4403,45 @@ class App(tk.Tk):
         token_new = token_new.strip()
         if not token_new:
             messagebox.showerror("Облачный CSV", "Токен не может быть пустым.")
+            return False
+
+        # Проверяем Web App до сохранения настроек.
+        try:
+            test = requests.get(endpoint_new, timeout=20)
+            if test.status_code != 200:
+                body = (test.text or "").strip()
+                if test.status_code in (401, 403) or "accounts.google.com" in body or "<html" in body.lower():
+                    messagebox.showerror(
+                        "Облачный CSV",
+                        "Google Apps Script сейчас требует авторизацию.\n\n"
+                        "В развертывании Web App установите:\n"
+                        "• Выполнять от имени: меня\n"
+                        "• У кого есть доступ: любой пользователь / Anyone\n\n"
+                        "После этого создайте/обновите развертывание и используйте новый URL /exec."
+                    )
+                else:
+                    messagebox.showerror(
+                        "Облачный CSV",
+                        f"Web App вернул HTTP {test.status_code}.\n\n{body[:500]}"
+                    )
+                return False
+            try:
+                test_json = test.json()
+                if not test_json.get("ok"):
+                    messagebox.showerror(
+                        "Облачный CSV",
+                        f"Web App ответил, но сервис не готов:\n{test.text[:500]}"
+                    )
+                    return False
+            except Exception:
+                messagebox.showerror(
+                    "Облачный CSV",
+                    "URL /exec открылся, но Web App вернул не JSON. "
+                    "Проверьте, что опубликован именно Apps Script из файла google_drive_csv_webapp_final.gs."
+                )
+                return False
+        except Exception as e:
+            messagebox.showerror("Облачный CSV", f"Не удалось проверить Web App:\n{e}")
             return False
 
         cfg["cloud_csv_webapp_url"] = endpoint_new
