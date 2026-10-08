@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-FE-RUS SEO Manager v1.22.2
+FE-RUS SEO Manager v1.22.3
 
 Единое Windows-приложение:
 1. Категория - получает category_id, OCFilter options и значения.
@@ -3120,6 +3120,67 @@ class App(tk.Tk):
         self.bind_class("Text", "<Control-A>", self.text_select_all)
         self.bind_class("Text", "<Control-c>", self.text_copy)
         self.bind_class("Text", "<Control-C>", self.text_copy)
+
+        # ВАЖНО: simpledialog.askstring() создаёт собственный Tk Entry
+        # внутри отдельного диалогового окна. Прямые bind_class() иногда
+        # не перехватываются такими диалогами в собранном EXE, поэтому
+        # добавляем резервный bind_all(). Он работает и в обычных полях,
+        # и в окнах «URL Web App», «Токен», «Логин», «Пароль» и т.п.
+        self.bind_all("<Control-v>", self.global_clipboard_key, add="+")
+        self.bind_all("<Control-V>", self.global_clipboard_key, add="+")
+        self.bind_all("<Control-c>", self.global_clipboard_key, add="+")
+        self.bind_all("<Control-C>", self.global_clipboard_key, add="+")
+        self.bind_all("<Control-x>", self.global_clipboard_key, add="+")
+        self.bind_all("<Control-X>", self.global_clipboard_key, add="+")
+        self.bind_all("<Control-a>", self.global_clipboard_key, add="+")
+        self.bind_all("<Control-A>", self.global_clipboard_key, add="+")
+        self.bind_all("<Shift-Insert>", self.global_clipboard_key, add="+")
+        self.bind_all("<KeyPress>", self.global_clipboard_keycode, add="+")
+
+    def _is_entry_widget(self, widget):
+        """Определяет обычный/ttk Entry, включая Entry из simpledialog."""
+        try:
+            cls = str(widget.winfo_class())
+        except Exception:
+            return False
+        if cls in ("Entry", "TEntry"):
+            return True
+        try:
+            return isinstance(widget, (tk.Entry, ttk.Entry))
+        except Exception:
+            return False
+
+    def global_clipboard_key(self, e):
+        """Горячие клавиши Ctrl+A/C/V/X для любого Entry в приложении и диалогах."""
+        if not self._is_entry_widget(e.widget):
+            return None
+        key = str(getattr(e, "keysym", "")).lower()
+        if key == "v":
+            return self.entry_paste(e)
+        if key == "c":
+            return self.entry_copy(e)
+        if key == "x":
+            return self.entry_cut(e)
+        if key == "a":
+            return self.entry_select_all(e)
+        if key == "insert":
+            return self.entry_paste(e)
+        return None
+
+    def global_clipboard_keycode(self, e):
+        """Резерв по физическому коду клавиши — работает с русской раскладкой."""
+        if not self._is_entry_widget(e.widget):
+            return None
+        if e.state & 0x4:
+            if e.keycode == 65:
+                return self.entry_select_all(e)
+            if e.keycode == 67:
+                return self.entry_copy(e)
+            if e.keycode == 86:
+                return self.entry_paste(e)
+            if e.keycode == 88:
+                return self.entry_cut(e)
+        return None
 
     def text_select_all(self, e):
         e.widget.tag_add("sel", "1.0", "end-1c")
