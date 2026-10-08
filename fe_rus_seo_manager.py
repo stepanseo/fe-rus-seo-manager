@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-FE-RUS SEO Manager v1.25.0
+FE-RUS SEO Manager v1.25.1
 
 Единое Windows-приложение:
 1. Категория - получает category_id, OCFilter options и значения.
@@ -3472,7 +3472,7 @@ def migrate_legacy_file_for_section(src, dst, filename, res):
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("FE-RUS SEO Manager v1.25.0")
+        self.title("FE-RUS SEO Manager v1.25.1")
         self.geometry("1280x860")
         self.q = queue.Queue()
         self.res = None
@@ -4130,15 +4130,15 @@ class App(tk.Tk):
 
     def cloud_push_current_files(self,filenames=None):
         if not self.res:
-            return
+            return False
         cfg=load_cfg()
         endpoint=str(cfg.get("cloud_csv_webapp_url","") or "").strip()
         token=str(cfg.get("cloud_csv_token","") or "").strip()
         if not endpoint or not token:
-            return
+            return False
         section_name=self.cloud_section_name or cloud_section_name_from_result(self.res)
         if not section_name:
-            return
+            return False
         local_dir=cloud_cache_dir(self.cloud_section_id) if self.cloud_section_id else Path(self.folder.get() or os.getcwd())
         selected=list(filenames or CLOUD_SECTION_FILES)
         upload_files={}
@@ -4151,7 +4151,7 @@ class App(tk.Tk):
                     "content_b64":base64.b64encode(zipped).decode("ascii"),
                 }
         if not upload_files:
-            return
+            return False
 
         data=cloud_sync_section_data(
             endpoint, token, section_name,
@@ -4168,6 +4168,14 @@ class App(tk.Tk):
                 }
         if self.cloud_section_id:
             save_cloud_manifest(self.cloud_section_id, manifest)
+
+        uploaded_names={str(item.get("file_name") or "") for item in (data.get("uploaded") or [])}
+        missing=set(upload_files) - uploaded_names
+        if missing:
+            raise RuntimeError(
+                "Google Drive не подтвердил загрузку файлов: " + ", ".join(sorted(missing))
+            )
+        return True
 
     def analyze_category(self):
         # Важно: пользователь мог снять характеристики и сразу нажать кнопку.
@@ -4314,12 +4322,38 @@ class App(tk.Tk):
                 messagebox.showerror("TOP-30", f"Не удалось обновить checkpoint:\n{e}")
                 return
 
+        # КРИТИЧНО: сначала фиксируем очищенный раздел в Google Drive.
+        # worker_wordkeeper() в начале делает cloud_pull_current_section();
+        # если оставить старую облачную копию, она может вернуть удалённые
+        # строки обратно сразу после нажатия «Пересобрать».
+        # Поэтому новый сбор разрешаем только после успешной отправки
+        # очищенного TOP-30 и checkpoint в облако.
+        if self.cloud_sync_running:
+            messagebox.showinfo(
+                "Google Drive",
+                "Синхронизация текущего раздела ещё выполняется. Дождитесь её завершения и повторите пересборку.",
+            )
+            return
+        try:
+            pushed = self.cloud_push_current_files(["seo_top30_result.csv", "seo_top30_progress.json"])
+            if not pushed:
+                raise RuntimeError("облачное хранилище не подтвердило отправку очищенных файлов")
+        except Exception as e:
+            messagebox.showerror(
+                "Google Drive",
+                "Не удалось записать очищенный TOP-30 в облако.\n"
+                "Новый сбор НЕ запущен, чтобы старые облачные данные не вернулись.\n\n"
+                f"Ошибка: {e}",
+            )
+            return
+
         self.topdf = pd.DataFrame()
-        self.wkstatus.config(text="Старый TOP-30 текущего раздела сброшен")
+        self.wkstatus.config(text="Старый TOP-30 текущего раздела сброшен и очищен в Google Drive")
         self.wklog.delete("1.0", "end")
         self.wklog.insert("end", f"Пересборка текущего раздела: {category or 'текущий раздел'}\n")
         self.wklog.insert("end", f"Удалено старых строк TOP-30: {removed_rows}\n")
         self.wklog.insert("end", f"Сброшено checkpoint-запросов: {removed_queries}\n")
+        self.wklog.insert("end", "Очищенный TOP-30 записан в Google Drive.\n")
         self.wklog.insert("end", "Запускаем новый сбор TOP-30...\n")
         self.wklog.see("end")
         self.save_settings()
