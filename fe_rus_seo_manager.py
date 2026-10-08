@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-FE-RUS SEO Manager v1.22.5
+FE-RUS SEO Manager v1.22.6
 
 Единое Windows-приложение:
 1. Категория - получает category_id, OCFilter options и значения.
@@ -44,7 +44,7 @@ APP = "FE-RUS SEO Manager"
 BASE = "https://fe-rus.ru"
 GOOGLE_SHEET_ID = "1NbEr9ZDR5dmFa_8zayfSQtQ5VL1dLn2jSN0nNT1fkD8"
 # Единый облачный CSV в Google Drive. ID не меняется при обновлении содержимого файла.
-CLOUD_READY_FILE_ID = "1TDpnpSV1zWnEEuiOBdoN4GmxKqbk_NTd"
+CLOUD_READY_FILE_ID = "1YcEPhor7Up_5Wt2wCni86irElRqqkc0Y"
 CLOUD_READY_FILE_URL = "https://drive.google.com/file/d/1TDpnpSV1zWnEEuiOBdoN4GmxKqbk_NTd/view"
 # URL веб-приложения Google Apps Script задаётся пользователем при первом нажатии.
 ADMIN = BASE + "/admin/"
