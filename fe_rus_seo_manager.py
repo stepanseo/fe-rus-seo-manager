@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-FE-RUS SEO Manager v1.24.2
+FE-RUS SEO Manager v1.25.0
 
 Единое Windows-приложение:
 1. Категория - получает category_id, OCFilter options и значения.
@@ -1980,6 +1980,253 @@ def promotion_type_for_counts(product_domains, seo_domains, article_domains, unk
 
 
 # -----------------------------------------------------------------------------
+# SEO CANDIDATE SELECTION v1.25
+# -----------------------------------------------------------------------------
+
+SEO_SELECTION_VERSION = "1.25.0"
+SEO_CREATE_MIN_SCORE = 6
+SEO_MIN_FILTER_DOMAINS_TEXT = 5
+SEO_MIN_FILTER_DOMAINS_NUMERIC = 7
+SEO_MIN_FILTER_DOMAINS_SMALL = 3
+SEO_CREATE_CAP_NUMERIC = 25
+SEO_CREATE_CAP_TEXT = 20
+
+SEO_NUMERIC_FILTER_WORDS = (
+    "диаметр", "толщ", "длина", "ширина", "высота", "размер", "вес",
+    "нагруз", "давлен", "объем", "объём", "ячейк", "шаг", "толщина",
+    "метр", "м2", "м²", "кг", "мм", "см", "мкм", "проход",
+)
+
+
+def _looks_numeric_value(value):
+    s = norm(value).replace("×", "x").replace("х", "x")
+    if not s:
+        return False
+    # Число, диапазон, размер 10x20, AISI 304 и подобные буквенно-цифровые
+    # значения считаем числовыми только если в них есть цифра и это не длинная
+    # свободная фраза.
+    if re.fullmatch(r"[+-]?\d+(?:[.,]\d+)?", s):
+        return True
+    if re.search(r"\d", s) and re.search(r"(?:\d\s*[xх×]\s*\d|\d+[.,]?\d*\s*(?:мм|см|м|кг|г|м2|м²|м3|м³|кн|мкм))", s):
+        return True
+    return False
+
+
+def _is_numeric_filter(filter_name, values):
+    name = norm(filter_name)
+    if any(w in name for w in SEO_NUMERIC_FILTER_WORDS):
+        return True
+    vals = [str(v or "").strip() for v in values if str(v or "").strip()]
+    if not vals:
+        return False
+    numeric = sum(1 for v in vals if _looks_numeric_value(v))
+    return numeric / len(vals) >= 0.60
+
+
+def _seo_candidate_score(row):
+    """Оценивает силу SEO-кандидата без новых сетевых запросов.
+
+    Скоринг использует только уже собранные данные TOP-30 и классификации:
+    точные filter-конкуренты, разнообразие доменов, SEO/product-интент,
+    положение конкурентов в TOP-30, качество URL и размер сетки характеристики.
+    """
+    fd = int(row.get("filter_domains_count") or 0)
+    sd = int(row.get("seo_domains_count") or 0)
+    pdm = int(row.get("product_domains_count") or 0)
+    value_count = int(row.get("filter_value_count") or 0)
+    quality = float(row.get("filter_quality_score") or 0)
+    top10 = int(row.get("filter_top10_count") or 0)
+
+    score = 0
+    if fd >= 10:
+        score += 5
+    elif fd >= 8:
+        score += 4
+    elif fd >= 6:
+        score += 3
+    elif fd >= 4:
+        score += 2
+    elif fd >= 2:
+        score += 1
+
+    if sd >= 8:
+        score += 2
+    elif sd >= 5:
+        score += 1
+
+    if sd >= max(2, pdm * 2):
+        score += 2
+    elif sd > pdm:
+        score += 1
+    elif pdm > sd:
+        score -= 2
+
+    if top10 >= 3:
+        score += 2
+    elif top10 >= 2:
+        score += 1
+
+    if quality >= 140:
+        score += 2
+    elif quality >= 100:
+        score += 1
+
+    # Большая сетка сама по себе не запрещает CREATE, но требует более сильного
+    # доказательства. Иначе одна характеристика с сотнями значений раздувает сайт.
+    if value_count > 100:
+        score -= 2
+    elif value_count > 50:
+        score -= 1
+
+    if row.get("promotion_type") == "СМЕШАННЫЙ":
+        score -= 1
+
+    return score
+
+
+def _apply_seo_candidate_selection(res, progress=None):
+    """Финальный отбор CREATE-кандидатов v1.25.
+
+    Важный принцип: базовая классификация собирает доказательства, а эта функция
+    уже решает, сколько реальных SEO-посадочных страниц стоит создавать.
+    Все строки сохраняются в результате для аудита, но слабые/дублирующиеся
+    кандидаты переводятся в SKIP с понятной причиной.
+    """
+    rows = list(res.get("rows") or [])
+    if not rows:
+        return res
+
+    # Размер каждой характеристики в текущем разделе.
+    groups = {}
+    for r in rows:
+        key = norm(r.get("filter") or "")
+        groups.setdefault(key, set()).add(norm(r.get("value") or ""))
+    filter_value_counts = {k: len({v for v in vals if v}) for k, vals in groups.items()}
+    filter_numeric = {}
+    for r in rows:
+        key = norm(r.get("filter") or "")
+        if key in filter_numeric:
+            continue
+        vals = [x.get("value", "") for x in rows if norm(x.get("filter") or "") == key]
+        filter_numeric[key] = _is_numeric_filter(r.get("filter", ""), vals)
+
+    # Заполняем служебные поля и применяем базовый порог.
+    for r in rows:
+        fkey = norm(r.get("filter") or "")
+        value_count = filter_value_counts.get(fkey, 0)
+        numeric = bool(filter_numeric.get(fkey, False))
+        cap = SEO_CREATE_CAP_NUMERIC if numeric else SEO_CREATE_CAP_TEXT
+        if value_count <= 5:
+            min_domains = SEO_MIN_FILTER_DOMAINS_SMALL
+        elif numeric:
+            min_domains = SEO_MIN_FILTER_DOMAINS_NUMERIC
+        else:
+            min_domains = SEO_MIN_FILTER_DOMAINS_TEXT
+
+        r["seo_selection_version"] = SEO_SELECTION_VERSION
+        r["filter_value_count"] = value_count
+        r["seo_numeric_filter"] = "1" if numeric else "0"
+        r["seo_create_min_domains"] = min_domains
+        r["seo_create_cap"] = cap
+        r["seo_selection_score"] = _seo_candidate_score(r)
+
+        if r.get("status") != "CREATE":
+            continue
+        score = int(r.get("seo_selection_score") or 0)
+        fd = int(r.get("filter_domains_count") or 0)
+        if fd < min_domains:
+            r["status"] = "SKIP"
+            r["reason"] = (
+                f"SEO-отбор v1.25: недостаточно независимых filter-конкурентов "
+                f"({fd}/{min_domains}); значений характеристики={value_count}"
+            )
+        elif score < SEO_CREATE_MIN_SCORE:
+            r["status"] = "SKIP"
+            r["reason"] = (
+                f"SEO-отбор v1.25: низкий SEO Score={score}/{SEO_CREATE_MIN_SCORE}; "
+                f"filter-конкурентов={fd}, SEO-доменов={r.get('seo_domains_count',0)}, "
+                f"PRODUCT-доменов={r.get('product_domains_count',0)}"
+            )
+
+    # Одна будущая URL = одна страница. Если одна и та же URL появилась у
+    # нескольких характеристик, оставляем самый сильный CREATE-кандидат.
+    by_url = {}
+    for r in rows:
+        if r.get("status") != "CREATE":
+            continue
+        key = norm(str(r.get("target_url") or "").rstrip("/"))
+        if not key:
+            continue
+        by_url.setdefault(key, []).append(r)
+
+    duplicate_removed = 0
+    for key, candidates in by_url.items():
+        if len(candidates) <= 1:
+            continue
+        winner = max(
+            candidates,
+            key=lambda r: (
+                int(r.get("seo_selection_score") or 0),
+                int(r.get("filter_domains_count") or 0),
+                int(r.get("filter_top10_count") or 0),
+                float(r.get("filter_quality_score") or 0),
+                -len(str(r.get("value") or "")),
+            ),
+        )
+        for r in candidates:
+            if r is winner:
+                continue
+            r["status"] = "SKIP"
+            r["reason"] = (
+                f"SEO-отбор v1.25: дубликат target URL; приоритет у "
+                f"«{winner.get('filter')} = {winner.get('value')}» "
+                f"(Score={winner.get('seo_selection_score')})"
+            )
+            duplicate_removed += 1
+
+    # Жёсткий лимит на самые широкие характеристики. Берём не первые N значений,
+    # а лучшие по доказательствам: Score -> конкуренты -> TOP-10 -> качество URL.
+    capped = 0
+    for fkey, value_count in filter_value_counts.items():
+        candidates = [
+            r for r in rows
+            if r.get("status") == "CREATE" and norm(r.get("filter") or "") == fkey
+        ]
+        if not candidates:
+            continue
+        numeric = bool(filter_numeric.get(fkey, False))
+        cap = SEO_CREATE_CAP_NUMERIC if numeric else SEO_CREATE_CAP_TEXT
+        if len(candidates) <= cap:
+            continue
+        candidates.sort(
+            key=lambda r: (
+                -int(r.get("seo_selection_score") or 0),
+                -int(r.get("filter_domains_count") or 0),
+                -int(r.get("filter_top10_count") or 0),
+                -float(r.get("filter_quality_score") or 0),
+                norm(r.get("value") or ""),
+            )
+        )
+        for r in candidates[cap:]:
+            r["status"] = "SKIP"
+            r["reason"] = (
+                f"SEO-отбор v1.25: превышен лимит характеристики "
+                f"{cap} страниц; кандидат исключён как менее сильный "
+                f"(Score={r.get('seo_selection_score')})"
+            )
+            capped += 1
+
+    final_create = sum(1 for r in rows if r.get("status") == "CREATE")
+    if progress:
+        progress(
+            f"SEO-отбор v1.25: CREATE={final_create} | "
+            f"дубликатов URL убрано={duplicate_removed} | "
+            f"лишних по лимитам характеристик={capped}"
+        )
+    return res
+
+
+# -----------------------------------------------------------------------------
 # PIPELINE
 # -----------------------------------------------------------------------------
 
@@ -2064,11 +2311,11 @@ class Pipeline:
         Затем по независимым доменам определяется promotion_type:
         ТОВАР / SEO-СТРАНИЦА / СМЕШАННЫЙ / ИНФОРМАЦИОННАЯ / НЕДОСТАТОЧНО ДАННЫХ.
 
-        CREATE разрешается для SEO-СТРАНИЦЫ и СМЕШАННОГО интента,
-        если есть минимум два независимых подтвержденных filter-конкурента,
-        действительно соответствующих текущему value. Явно ТОВАРНЫЙ интент
-        по-прежнему не переводится в CREATE только из-за filter URL.
-        REVIEW не используется: все неподтвержденные случаи получают SKIP.
+        Базовый слой собирает доказательства filter-интента. Финальный CREATE
+        определяется отдельным SEO-отбором v1.25: требуется больше независимых
+        конкурентов (5 для обычных и 7 для числовых характеристик), считается
+        SEO Score, удаляются дубли target URL и ограничивается число страниц
+        для широких характеристик. Явно ТОВАРНЫЙ интент не переводится в CREATE.
         """
         if topdf is None or topdf.empty:
             for x in res["rows"]:
@@ -2382,7 +2629,7 @@ class Pipeline:
                             if is_our:
                                 fe_filter = True
                             else:
-                                filter_urls.append((score_url(u, title, x.get("keyword", "")), d, u))
+                                filter_urls.append((score_url(u, title, x.get("keyword", "")), d, u, int(rr.get("position") or 999)))
                     continue
 
                 if ptype in {"UNKNOWN", "OTHER"}:
@@ -2391,18 +2638,22 @@ class Pipeline:
                     # Старый URL-only сигнал оставляем как fallback, но не считаем его
                     # сильным конкурентом без подтверждения типа страницы.
                     if is_filter_url and value_match and not is_our:
-                        filter_urls.append((score_url(u, title, x.get("keyword", "")), d, u))
+                        filter_urls.append((score_url(u, title, x.get("keyword", "")), d, u, int(rr.get("position") or 999)))
                     elif value_match and not is_our:
                         landing_urls.append(u)
                         landing_domains.add(d)
 
             # Один домен = один сигнал.
-            filter_urls.sort(key=lambda z: (-z[0], z[1], z[2]))
+            filter_urls.sort(key=lambda z: (-z[0], z[3], z[1], z[2]))
             unique_filter_urls = []
-            for score, d, u in filter_urls:
+            unique_filter_scores = []
+            unique_filter_positions = []
+            for score, d, u, position in filter_urls:
                 if d not in filter_domains:
                     filter_domains.add(d)
                     unique_filter_urls.append(u)
+                    unique_filter_scores.append(score)
+                    unique_filter_positions.append(position)
 
             # SEO URL без обязательного exact value участвуют в определении интента,
             # но CREATE даём только по exact-value конкурентам.
@@ -2433,6 +2684,8 @@ class Pipeline:
             x["unknown_domains_count"] = len(unknown_domains)
             x["filter_count"] = len(unique_filter_urls)
             x["filter_domains_count"] = len(filter_domains)
+            x["filter_quality_score"] = round(sum(unique_filter_scores) / len(unique_filter_scores), 1) if unique_filter_scores else 0
+            x["filter_top10_count"] = sum(1 for p in unique_filter_positions if p <= 10)
             x["fe_rus_filter"] = fe_filter
             x["competitor_filter_urls"] = " | ".join(unique_filter_urls)
             x["competitor_landing_urls"] = " | ".join(dict.fromkeys(landing_urls))
@@ -2452,14 +2705,13 @@ class Pipeline:
                 x["status"] = "SKIP"
                 x["reason"] = f"Информационный интент: ARTICLE-доменов={len(article_domains)}"
             elif len(filter_domains) >= 2 and promotion in ("СМЕШАННЫЙ", "SEO-СТРАНИЦА"):
-                # СМЕШАННЫЙ не отправляем в REVIEW: при двух и более
-                # независимых точных filter URL сразу создаем CREATE.
-                # Это прямое подтверждение коммерческого filter-интента.
+                # Базовый слой только собирает кандидата. Финальное решение
+                # принимает _apply_seo_candidate_selection ниже.
                 x["status"] = "CREATE"
-                x["reason"] = f"Подтвержден filter-интент: {len(filter_domains)} независимых конкурента с точным filter URL; TOP-30={promotion.lower()}"
+                x["reason"] = f"Базовый кандидат: {len(filter_domains)} независимых конкурента с точным filter URL; TOP-30={promotion.lower()}"
             elif promotion == "СМЕШАННЫЙ":
                 x["status"] = "SKIP"
-                x["reason"] = f"Смешанный интент, но точных filter-конкурентов недостаточно для CREATE: {len(filter_domains)}"
+                x["reason"] = f"Смешанный интент, но точных filter-конкурентов недостаточно: {len(filter_domains)}"
             elif promotion == "НЕДОСТАТОЧНО ДАННЫХ":
                 x["status"] = "SKIP"
                 x["reason"] = "Недостаточно данных для надежного определения интента"
@@ -2471,11 +2723,12 @@ class Pipeline:
                 x["reason"] = f"SEO-интент подтвержден {len(seo_domains)} доменами, но точных filter URL недостаточно для CREATE"
             elif len(landing_domains) >= 1:
                 x["status"] = "SKIP"
-                x["reason"] = f"Найдены посадочные домены={len(landing_domains)}, но недостаточно точных filter-конкурентов для CREATE"
+                x["reason"] = f"Найдены посадочные домены={len(landing_domains)}, но недостаточно точных filter-конкурентов"
             else:
                 x["status"] = "SKIP"
                 x["reason"] = "SEO-интент не подтвержден независимыми каталожными/filter-конкурентами"
 
+        _apply_seo_candidate_selection(res, progress=progress)
         if progress:
             progress("Классификация TOP-30 завершена.")
         return res
@@ -2671,8 +2924,8 @@ def generator_rows(res):
         # URL = 404 (страницы нет) и OCFilter = READY (категория/alias проверены).
         if x.get("status") != "CREATE":
             continue
-        # СМЕШАННЫЙ также допускается, если filter-интент подтверждён
-        # минимум двумя независимыми точными filter URL.
+        # СМЕШАННЫЙ также допускается, если кандидат прошёл новый
+        # SEO-отбор v1.25 и все последующие проверки.
         if not is_filter_creation_intent(x):
             continue
         if x.get("url_status") not in ("READY_FOR_OCFILTER", "HTTP_404"):
@@ -2703,6 +2956,10 @@ def generator_rows(res):
             "competitor_filter_urls": x.get("competitor_filter_urls", ""),
             "competitor_landing_urls": x.get("competitor_landing_urls", ""),
             "competitor_count": x.get("filter_domains_count", 0),
+            "seo_selection_score": x.get("seo_selection_score", ""),
+            "filter_value_count": x.get("filter_value_count", ""),
+            "seo_create_cap": x.get("seo_create_cap", ""),
+            "seo_selection_version": x.get("seo_selection_version", ""),
             "url_status": x.get("url_status", ""),
             "existing_seo_url": x.get("existing_seo_url", ""),
             "existing_seo_alias": x.get("existing_seo_alias", ""),
@@ -2936,7 +3193,7 @@ def export_excel(res, path, topdf=None):
         "keyword","promotion_type","product_count","product_domains_count","seo_page_count","seo_domains_count","article_count","article_domains_count","other_count","unknown_domains_count",
         "category","category_id","filter","filter_keyword","option_id","value","value_id","params","value_keyword","alias","target_url",
         "status","reason","filter_count","filter_domains_count","competitor_1","competitor_2","competitor_3","competitor_4","competitor_5",
-        "competitor_filter_urls","competitor_landing_urls","rejected_filter_urls","url_status","existing_seo_url","existing_seo_alias","http_status","final_url","redirect","oc_status","oc_category_id","oc_category_found","oc_category_score","oc_message"
+        "competitor_filter_urls","competitor_landing_urls","rejected_filter_urls","filter_quality_score","filter_top10_count","filter_value_count","seo_numeric_filter","seo_create_min_domains","seo_create_cap","seo_selection_score","seo_selection_version","url_status","existing_seo_url","existing_seo_alias","http_status","final_url","redirect","oc_status","oc_category_id","oc_category_found","oc_category_score","oc_message"
     ]
     ws = wb.create_sheet("CREATE"); ws.append(headers)
     for x in res.get("rows", []):
@@ -2946,7 +3203,7 @@ def export_excel(res, path, topdf=None):
     gen = generator_rows(res)
     gen_headers = list(gen[0].keys()) if gen else [
         "keyword","promotion_type","category","category_id","filter","filter_keyword","value","value_id","params","value_keyword","alias","filter_result_url","target_url",
-        "competitor_1","competitor_2","competitor_3","competitor_4","competitor_5","competitor_filter_urls","competitor_landing_urls","competitor_count","url_status","oc_status","generator_status"
+        "competitor_1","competitor_2","competitor_3","competitor_4","competitor_5","competitor_filter_urls","competitor_landing_urls","competitor_count","seo_selection_score","filter_value_count","seo_create_cap","seo_selection_version","url_status","oc_status","generator_status"
     ]
     ws.append(gen_headers)
     for x in gen: ws.append([x.get(h, "") for h in gen_headers])
@@ -3215,7 +3472,7 @@ def migrate_legacy_file_for_section(src, dst, filename, res):
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("FE-RUS SEO Manager v1.24.2")
+        self.title("FE-RUS SEO Manager v1.25.0")
         self.geometry("1280x860")
         self.q = queue.Queue()
         self.res = None
@@ -4601,13 +4858,13 @@ class App(tk.Tk):
         self.stats.insert("end", "\nСТАТУС SEO-СТРАНИЦ:\n")
         for k in ("CREATE","SKIP","EXISTS"):
             self.stats.insert("end",f"{k}: {c[k]}\n")
-        self.stats.insert("end", "\nCREATE = SEO- или СМЕШАННЫЙ-интент + минимум 2 независимых точных filter-конкурента. REVIEW не используется: неподтвержденные варианты идут в SKIP.\n")
+        self.stats.insert("end", "\nCREATE = SEO-отбор v1.25: минимум 5 независимых filter-конкурентов (7 для числовых характеристик; 3 для характеристик до 5 значений) + SEO Score. Дубли URL и слабые кандидаты идут в SKIP.\n")
         self.stats.insert("end", "ТОВАР = запрос преимущественно ведет на карточки товаров; отдельную SEO-посадочную не создаем.\n\n")
         self.stats.insert("end", "СПИСОК:\n")
         for x in self.res["rows"]:
             self.stats.insert(
                 "end",
-                f"- {x['keyword']} | {x['filter']} | {x['value']} | ТИП={x.get('promotion_type','')} | STATUS={x.get('status','')} | PRODUCT={x.get('product_domains_count',0)} | SEO={x.get('seo_domains_count',0)} | конкуренты={x.get('filter_domains_count',0)} | {x.get('reason','')}\n"
+                f"- {x['keyword']} | {x['filter']} | {x['value']} | ТИП={x.get('promotion_type','')} | STATUS={x.get('status','')} | SCORE={x.get('seo_selection_score','')} | PRODUCT={x.get('product_domains_count',0)} | SEO={x.get('seo_domains_count',0)} | конкуренты={x.get('filter_domains_count',0)} | {x.get('reason','')}\n"
             )
         self.stats.see("1.0")
 
@@ -4616,14 +4873,14 @@ class App(tk.Tk):
         self.stats.delete("1.0","end")
         for x in self.res["rows"]:
             if x.get("status")==status:
-                self.stats.insert("end",f"{x['keyword']} | {x['filter']} | {x['value']} | ТИП={x.get('promotion_type','')} | {x.get('reason','')}\n")
+                self.stats.insert("end",f"{x['keyword']} | {x['filter']} | {x['value']} | SCORE={x.get('seo_selection_score','')} | ТИП={x.get('promotion_type','')} | {x.get('reason','')}\n")
 
     def show_promotion_type(self,promotion_type):
         if not self.res:return
         self.stats.delete("1.0","end")
         for x in self.res["rows"]:
             if x.get("promotion_type")==promotion_type:
-                self.stats.insert("end",f"{x['keyword']} | {x['filter']} | {x['value']} | ТИП={x.get('promotion_type','')} | STATUS={x.get('status','')} | PRODUCT={x.get('product_domains_count',0)} | SEO={x.get('seo_domains_count',0)} | {x.get('reason','')}\n")
+                self.stats.insert("end",f"{x['keyword']} | {x['filter']} | {x['value']} | SCORE={x.get('seo_selection_score','')} | ТИП={x.get('promotion_type','')} | STATUS={x.get('status','')} | PRODUCT={x.get('product_domains_count',0)} | SEO={x.get('seo_domains_count',0)} | {x.get('reason','')}\n")
 
     def url_audit_path(self):
         return (cloud_cache_dir(self.cloud_section_id) if self.cloud_section_id else Path(self.folder.get() or os.getcwd())) / "seo_url_check_audit.csv"
