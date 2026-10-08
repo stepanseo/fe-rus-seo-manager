@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-FE-RUS SEO Manager v1.22.0
+FE-RUS SEO Manager v1.22.1
 
 Единое Windows-приложение:
 1. Категория - получает category_id, OCFilter options и значения.
@@ -2922,7 +2922,7 @@ def export_excel(res, path, topdf=None):
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("FE-RUS SEO Manager v1.22.0")
+        self.title("FE-RUS SEO Manager v1.22.1")
         self.geometry("1280x860")
         self.q = queue.Queue()
         self.res = None
@@ -3053,7 +3053,8 @@ class App(tk.Tk):
         f=self.tabs["6. Экспорт"]
         ttk.Label(f,text="Финальный экспорт для внешней программы генерации контента").pack(anchor="w",padx=10,pady=12)
         ttk.Button(f,text="СОХРАНИТЬ CSV ДЛЯ ГЕНЕРАТОРА",command=self.export_generator).pack(anchor="w",padx=10,pady=4)
-        ttk.Button(f,text="ЗАПИСАТЬ ДАННЫЕ В ФАЙЛ",command=self.append_ready_links).pack(anchor="w",padx=10,pady=4)
+        ttk.Button(f,text="ЗАПИСАТЬ ДАННЫЕ В ФАЙЛ + ОБЛАКО",command=self.append_ready_links).pack(anchor="w",padx=10,pady=4)
+        ttk.Button(f,text="НАСТРОИТЬ ОБЛАКО",command=self.configure_cloud).pack(anchor="w",padx=10,pady=4)
         ttk.Button(f,text="ОТКРЫТЬ ОБЛАЧНЫЙ ФАЙЛ",command=self.open_cloud_file).pack(anchor="w",padx=10,pady=4)
         ttk.Label(f,text="Кнопка сохраняет накопительный CSV на компьютере и автоматически синхронизирует его с единым CSV в Google Drive.").pack(anchor="w",padx=10,pady=2)
         ttk.Button(f,text="ЭКСПОРТИРОВАТЬ ПОЛНЫЙ XLSX",command=self.export).pack(anchor="w",padx=10,pady=4)
@@ -4361,14 +4362,67 @@ class App(tk.Tk):
     def open_cloud_file(self):
         webbrowser.open(CLOUD_READY_FILE_URL)
 
+    def configure_cloud(self):
+        """Настраивает URL Web App и токен до первой облачной записи."""
+        cfg = load_cfg()
+        endpoint = str(cfg.get("cloud_csv_webapp_url", "") or "").strip()
+        token = str(cfg.get("cloud_csv_token", "") or "").strip()
+
+        endpoint_new = simpledialog.askstring(
+            "Облачный CSV",
+            "URL Google Apps Script Web App (должен заканчиваться на /exec):",
+            initialvalue=endpoint,
+            parent=self.root,
+        )
+        if endpoint_new is None:
+            return False
+        endpoint_new = endpoint_new.strip()
+        if not endpoint_new or not endpoint_new.endswith("/exec"):
+            messagebox.showerror("Облачный CSV", "Нужен URL опубликованного Google Apps Script Web App, заканчивающийся на /exec.")
+            return False
+
+        token_new = simpledialog.askstring(
+            "Облачный CSV",
+            "Токен доступа к облачному CSV:",
+            initialvalue=token,
+            show="*",
+            parent=self.root,
+        )
+        if token_new is None:
+            return False
+        token_new = token_new.strip()
+        if not token_new:
+            messagebox.showerror("Облачный CSV", "Токен не может быть пустым.")
+            return False
+
+        cfg["cloud_csv_webapp_url"] = endpoint_new
+        cfg["cloud_csv_token"] = token_new
+        cfg["cloud_csv_file_id"] = CLOUD_READY_FILE_ID
+        save_cfg(cfg)
+        self.cfg = cfg
+        messagebox.showinfo("Облачный CSV", "Настройки облака сохранены. Теперь кнопка будет записывать данные и в Google Drive.")
+        return True
+
     def append_ready_links(self):
-        """Сохраняет готовые ссылки локально и синхронизирует общий CSV в Google Drive."""
+        """Добавляет готовые ссылки локально и затем синхронизирует единый CSV в Google Drive."""
         if not self.res:
             messagebox.showwarning("Нет данных", "Сначала выполните анализ.")
             return
         self._apply_ocfilter_audit()
 
         cfg = load_cfg()
+        endpoint = str(cfg.get("cloud_csv_webapp_url", "") or "").strip()
+        token = str(cfg.get("cloud_csv_token", "") or "").strip()
+
+        # ВАЖНО: сначала настраиваем облако, чтобы кнопка не выглядела как
+        # обычное локальное сохранение, если Web App ещё не подключён.
+        if not endpoint or not token:
+            if not self.configure_cloud():
+                return
+            cfg = load_cfg()
+            endpoint = str(cfg.get("cloud_csv_webapp_url", "") or "").strip()
+            token = str(cfg.get("cloud_csv_token", "") or "").strip()
+
         saved_path = str(cfg.get("ready_links_file", "") or "").strip()
         path = Path(saved_path) if saved_path else None
 
@@ -4383,58 +4437,33 @@ class App(tk.Tk):
                 return
             path = Path(chosen)
             cfg["ready_links_file"] = str(path)
+            save_cfg(cfg)
 
         try:
             added, total, saved = append_ready_links_file(self.res, path)
-
-            endpoint = str(cfg.get("cloud_csv_webapp_url", "") or "").strip()
-            token = str(cfg.get("cloud_csv_token", "") or "").strip()
-
-            if not endpoint:
-                endpoint = simpledialog.askstring(
-                    "Облачный CSV",
-                    "Введите URL Google Apps Script Web App (заканчивается на /exec):",
-                    parent=self.root,
-                ) or ""
-                endpoint = endpoint.strip()
-                if not endpoint:
-                    return
-                cfg["cloud_csv_webapp_url"] = endpoint
-
-            if not token:
-                token = simpledialog.askstring(
-                    "Облачный CSV",
-                    "Введите токен доступа к облачному CSV:",
-                    show="*",
-                    parent=self.root,
-                ) or ""
-                token = token.strip()
-                if not token:
-                    return
-                cfg["cloud_csv_token"] = token
-
-            cfg["cloud_csv_file_id"] = CLOUD_READY_FILE_ID
-            save_cfg(cfg)
-            self.cfg = cfg
-
             cloud_added, cloud_total, _ = sync_ready_links_cloud(path, endpoint, token)
 
             self.export_log.insert(
                 "end",
                 f"\nГотовые ссылки: добавлено локально {added} | локально всего {total}\n"
-                f"Облако Google Drive: добавлено/объединено {cloud_added} | всего в облаке {cloud_total}\n"
-                f"Файл: {saved}\n"
+                f"ОБЛАКО: добавлено новых {cloud_added} | всего в облачном файле {cloud_total}\n"
+                f"Локальный файл: {saved}\n"
+                f"Облачный файл: {CLOUD_READY_FILE_URL}\n"
             )
             self.export_log.see("end")
             messagebox.showinfo(
                 "Готово",
                 f"Локально добавлено: {added}\n"
-                f"Локально всего: {total}\n\n"
                 f"В Google Drive добавлено новых: {cloud_added}\n"
                 f"Всего в облачном файле: {cloud_total}"
             )
         except Exception as e:
-            messagebox.showerror("Запись данных", str(e))
+            messagebox.showerror(
+                "Облачная запись",
+                "Локальный файл мог быть обновлён, но облачная синхронизация НЕ выполнена.\n\n"
+                f"Причина: {e}\n\n"
+                "Проверьте, что Google Apps Script опубликован как Web App с доступом для пользователей и URL заканчивается на /exec."
+            )
 
     def append_ready_links_google(self):
         """Записывает готовые ссылки в общую Google Таблицу."""
