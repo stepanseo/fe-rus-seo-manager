@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-FE-RUS SEO Manager v1.23.6
+FE-RUS SEO Manager v1.23.7
 
 Единое Windows-приложение:
 1. Категория - получает category_id, OCFilter options и значения.
@@ -3048,11 +3048,21 @@ def cloud_download_section_file(endpoint, token, section_name, file_name, local_
     )
     if not data.get("found"):
         return False, data
+
     raw = base64.b64decode(str(data.get("content_b64") or ""))
     if data.get("compressed"):
         raw = gzip.decompress(raw)
+
     local_path = Path(local_path)
     local_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Пустой облачный файл не должен затирать уже собранный локальный TOP-30.
+    # Такое возможно, если прошлый upload не успел завершиться.
+    if not raw:
+        if local_path.exists() and local_path.stat().st_size > 0:
+            return False, data
+        return False, data
+
     local_path.write_bytes(raw)
     return True, data
 
@@ -3156,7 +3166,7 @@ def migrate_legacy_file_for_section(src, dst, filename, res):
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("FE-RUS SEO Manager v1.23.6")
+        self.title("FE-RUS SEO Manager v1.23.7")
         self.geometry("1280x860")
         self.q = queue.Queue()
         self.res = None
@@ -3786,7 +3796,12 @@ class App(tk.Tk):
             self.topdf=pd.read_csv(p,encoding="utf-8-sig")
             self.wkstatus.config(text=f"Загружено: {Path(p).name} | строк: {len(self.topdf)}")
             self.save_settings()
-        except Exception as e:messagebox.showerror("WordKeeper",str(e))
+        except pd.errors.EmptyDataError:
+            self.topdf=pd.DataFrame()
+            self.wkstatus.config(text=f"CSV пустой: {Path(p).name}")
+            self.save_settings()
+        except Exception as e:
+            messagebox.showerror("WordKeeper",str(e))
 
     def start_wordkeeper(self):
         if not self.res:
@@ -3884,6 +3899,9 @@ class App(tk.Tk):
                     removed_rows = int(mask.sum())
                     old = old.loc[~mask].copy()
                     old.to_csv(out_path, index=False, encoding="utf-8-sig")
+            except pd.errors.EmptyDataError:
+                # Пустой CSV считаем отсутствующим накопленным TOP-30.
+                removed_rows = 0
             except Exception as e:
                 messagebox.showerror("TOP-30", f"Не удалось очистить текущий раздел из CSV:\n{e}")
                 return
@@ -4189,7 +4207,10 @@ class App(tk.Tk):
             cached_result_query_keys=set()
 
             if out_path.exists():
-                old=pd.read_csv(out_path,encoding="utf-8-sig")
+                try:
+                    old=pd.read_csv(out_path,encoding="utf-8-sig")
+                except pd.errors.EmptyDataError:
+                    old=pd.DataFrame()
                 if not old.empty:
                     results=old.to_dict("records")
                     # ВАЖНО: если старый CSV был создан предыдущей версией, его
