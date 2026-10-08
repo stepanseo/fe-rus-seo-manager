@@ -4372,7 +4372,7 @@ class App(tk.Tk):
             "Облачный CSV",
             "URL Google Apps Script Web App (должен заканчиваться на /exec):",
             initialvalue=endpoint,
-            parent=self.root,
+            parent=self,
         )
         if endpoint_new is None:
             return False
@@ -4386,7 +4386,7 @@ class App(tk.Tk):
             "Токен доступа к облачному CSV:",
             initialvalue=token,
             show="*",
-            parent=self.root,
+            parent=self,
         )
         if token_new is None:
             return False
@@ -4480,7 +4480,7 @@ class App(tk.Tk):
             endpoint = simpledialog.askstring(
                 "Google Sheets",
                 "Введите URL веб-приложения Google Apps Script (заканчивается на /exec):",
-                parent=self.root,
+                parent=self,
             ) or ""
             endpoint = endpoint.strip()
             if not endpoint:
@@ -4492,7 +4492,7 @@ class App(tk.Tk):
                 "Google Sheets",
                 "Введите токен доступа к таблице:",
                 show="*",
-                parent=self.root,
+                parent=self,
             ) or ""
             token = token.strip()
             if not token:
