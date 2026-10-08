@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-FE-RUS SEO Manager v1.23.7
+FE-RUS SEO Manager v1.23.9
 
 Единое Windows-приложение:
 1. Категория - получает category_id, OCFilter options и значения.
@@ -3092,6 +3092,45 @@ def cloud_cache_dir(section_id):
     return Path(os.environ.get("APPDATA", Path.home())) / APP / "cloud_cache" / str(section_id)
 
 
+def cloud_manifest_path(section_id):
+    return cloud_cache_dir(section_id) / ".cloud_manifest.json"
+
+
+def load_cloud_manifest(section_id):
+    path = cloud_manifest_path(section_id)
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def save_cloud_manifest(section_id, manifest):
+    path = cloud_manifest_path(section_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(manifest or {}, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.replace(path)
+
+
+def cloud_sync_section_meta(endpoint, token, section_name, timeout=180):
+    return cloud_storage_request(
+        endpoint, token,
+        {"action":"sync_section_meta", "section_name":str(section_name or "").strip()},
+        timeout=timeout,
+    )
+
+
+def cloud_sync_section_data(endpoint, token, section_name, download_files=None, upload_files=None, timeout=600):
+    payload = {
+        "action":"sync_section_data",
+        "section_name":str(section_name or "").strip(),
+        "download_files":list(download_files or []),
+        "upload_files":upload_files or {},
+    }
+    return cloud_storage_request(endpoint, token, payload, timeout=timeout)
+
+
 def cloud_section_name_from_result(res):
     return str((res or {}).get("search_category") or (res or {}).get("category") or "").strip()
 
@@ -3166,7 +3205,7 @@ def migrate_legacy_file_for_section(src, dst, filename, res):
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("FE-RUS SEO Manager v1.23.7")
+        self.title("FE-RUS SEO Manager v1.23.9")
         self.geometry("1280x860")
         self.q = queue.Queue()
         self.res = None
@@ -3680,9 +3719,13 @@ class App(tk.Tk):
 
         legacy_value=str(cfg.get("legacy_folder") or cfg.get("folder") or os.getcwd()).strip()
         legacy_root=Path(legacy_value)
-        data=cloud_ensure_section(endpoint, token, section_name)
-        section_id=str(data.get("section_id") or "").strip()
-        actual_name=str(data.get("section_name") or section_name).strip()
+
+        # Первый запрос теперь возвращает сразу состояние всех рабочих файлов:
+        # папку, ID, размеры и даты изменения. Содержимое скачиваем только
+        # для действительно изменившихся файлов.
+        meta=cloud_sync_section_meta(endpoint, token, section_name, timeout=180)
+        section_id=str(meta.get("section_id") or "").strip()
+        actual_name=str(meta.get("section_name") or section_name).strip()
         if not section_id:
             raise RuntimeError("Google Drive не вернул ID папки текущего раздела.")
 
@@ -3701,13 +3744,95 @@ class App(tk.Tk):
         self.cfg["folder"]=str(local_dir)
         save_cfg(self.cfg)
 
+        manifest=load_cloud_manifest(section_id)
+        remote_files={str(x.get("file_name") or ""):x for x in (meta.get("files") or []) if x.get("file_name")}
+        download_files=[]
+        need_upload=[]
+
         for filename in CLOUD_SECTION_FILES:
             dst=local_dir/filename
-            found,_=cloud_download_section_file(endpoint, token, actual_name, filename, dst)
-            if not found and legacy_root != local_dir:
-                if migrate_legacy_file_for_section(legacy_root/filename, dst, filename, res):
-                    cloud_upload_section_file(endpoint, token, actual_name, filename, dst)
+            remote=remote_files.get(filename) or {}
+            remote_found=bool(remote.get("found")) and int(remote.get("bytes") or 0) > 0
 
+            if remote_found:
+                saved=manifest.get(filename) or {}
+                same_remote=(
+                    str(saved.get("file_id") or "") == str(remote.get("file_id") or "")
+                    and int(saved.get("bytes") or -1) == int(remote.get("bytes") or -2)
+                    and int(saved.get("updated_ms") or -1) == int(remote.get("updated_ms") or -2)
+                    and dst.exists() and dst.stat().st_size > 0
+                )
+                if not same_remote:
+                    download_files.append(filename)
+            else:
+                # Если облака ещё нет, сначала пробуем взять отфильтрованную
+                # версию из старого локального master-файла. Это делается
+                # локально и не требует сетевого запроса.
+                if not dst.exists() or not dst.stat().st_size:
+                    if legacy_root != local_dir:
+                        try:
+                            migrate_legacy_file_for_section(legacy_root/filename, dst, filename, res)
+                        except Exception:
+                            pass
+                if dst.exists() and dst.stat().st_size:
+                    need_upload.append(filename)
+
+        upload_files={}
+        for filename in need_upload:
+            path=local_dir/filename
+            if not path.exists() or not path.stat().st_size:
+                continue
+            zipped=gzip.compress(path.read_bytes(), compresslevel=6)
+            upload_files[filename]={
+                "compressed":True,
+                "content_b64":base64.b64encode(zipped).decode("ascii"),
+            }
+
+        # Второй запрос нужен только если есть что скачать или загрузить.
+        if download_files or upload_files:
+            data=cloud_sync_section_data(
+                endpoint, token, actual_name,
+                download_files=download_files,
+                upload_files=upload_files,
+                timeout=900,
+            )
+
+            for item in (data.get("downloaded") or []):
+                filename=str(item.get("file_name") or "")
+                if filename not in CLOUD_SECTION_FILES:
+                    continue
+                raw=base64.b64decode(str(item.get("content_b64") or ""))
+                if item.get("compressed"):
+                    raw=gzip.decompress(raw)
+                if raw:
+                    (local_dir/filename).write_bytes(raw)
+                    manifest[filename]={
+                        "file_id":str(item.get("file_id") or ""),
+                        "bytes":int(item.get("bytes") or len(raw)),
+                        "updated_ms":int(item.get("updated_ms") or 0),
+                    }
+
+            for item in (data.get("uploaded") or []):
+                filename=str(item.get("file_name") or "")
+                if filename in CLOUD_SECTION_FILES:
+                    manifest[filename]={
+                        "file_id":str(item.get("file_id") or ""),
+                        "bytes":int(item.get("bytes") or 0),
+                        "updated_ms":int(item.get("updated_ms") or 0),
+                    }
+
+        # Если облачный файл существует, но скачивать его не пришлось,
+        # просто фиксируем его метаданные для следующего мгновенного sync.
+        for filename,remote in remote_files.items():
+            if filename in CLOUD_SECTION_FILES and bool(remote.get("found")) and int(remote.get("bytes") or 0) > 0:
+                if filename not in manifest:
+                    manifest[filename]={
+                        "file_id":str(remote.get("file_id") or ""),
+                        "bytes":int(remote.get("bytes") or 0),
+                        "updated_ms":int(remote.get("updated_ms") or 0),
+                    }
+
+        save_cloud_manifest(section_id, manifest)
         self.cloud_ready=True
         return {"section":actual_name,"section_id":section_id,"folder":str(local_dir)}
 
@@ -3732,28 +3857,9 @@ class App(tk.Tk):
     def cloud_pull_current_section(self, update_ui=False):
         if not self.res:
             return
-        cfg=load_cfg()
-        endpoint=str(cfg.get("cloud_csv_webapp_url","") or "").strip()
-        token=str(cfg.get("cloud_csv_token","") or "").strip()
-        if not endpoint or not token:
-            raise RuntimeError("Не настроен Google Drive Web App.")
-        section_name=self.cloud_section_name or cloud_section_name_from_result(self.res)
-        if not section_name:
-            raise RuntimeError("Не определён текущий раздел.")
-        data=cloud_ensure_section(endpoint,token,section_name)
-        section_id=str(data.get("section_id") or self.cloud_section_id).strip()
-        if not section_id:
-            raise RuntimeError("Google Drive не вернул ID папки раздела.")
-        self.cloud_section_id=section_id
-        self.cloud_section_name=str(data.get("section_name") or section_name)
-        local_dir=cloud_cache_dir(section_id)
-        local_dir.mkdir(parents=True,exist_ok=True)
-        if update_ui:
-            self.folder.delete(0,"end"); self.folder.insert(0,str(local_dir))
-        self.cfg["folder"]=str(local_dir)
-        save_cfg(self.cfg)
-        for filename in CLOUD_SECTION_FILES:
-            cloud_download_section_file(endpoint,token,self.cloud_section_name,filename,local_dir/filename)
+        info=self.ensure_cloud_for_category(self.res, update_ui=update_ui)
+        if info is False:
+            raise RuntimeError("Не удалось подключить облачный раздел.")
 
     def cloud_push_current_files(self,filenames=None):
         if not self.res:
@@ -3767,16 +3873,34 @@ class App(tk.Tk):
         if not section_name:
             return
         local_dir=cloud_cache_dir(self.cloud_section_id) if self.cloud_section_id else Path(self.folder.get() or os.getcwd())
-        sync_errors=[]
-        for filename in (filenames or CLOUD_SECTION_FILES):
+        selected=list(filenames or CLOUD_SECTION_FILES)
+        upload_files={}
+        for filename in selected:
             path=local_dir/filename
             if path.exists() and path.stat().st_size:
-                try:
-                    cloud_upload_section_file(endpoint,token,section_name,filename,path)
-                except Exception as e:
-                    sync_errors.append(f"{filename}: {e}")
-        if sync_errors:
-            raise RuntimeError("Синхронизация с Google Drive не выполнена для: " + " | ".join(sync_errors))
+                zipped=gzip.compress(path.read_bytes(), compresslevel=6)
+                upload_files[filename]={
+                    "compressed":True,
+                    "content_b64":base64.b64encode(zipped).decode("ascii"),
+                }
+        if not upload_files:
+            return
+
+        data=cloud_sync_section_data(
+            endpoint, token, section_name,
+            download_files=[], upload_files=upload_files, timeout=900
+        )
+        manifest=load_cloud_manifest(self.cloud_section_id) if self.cloud_section_id else {}
+        for item in (data.get("uploaded") or []):
+            filename=str(item.get("file_name") or "")
+            if filename in selected:
+                manifest[filename]={
+                    "file_id":str(item.get("file_id") or ""),
+                    "bytes":int(item.get("bytes") or 0),
+                    "updated_ms":int(item.get("updated_ms") or 0),
+                }
+        if self.cloud_section_id:
+            save_cloud_manifest(self.cloud_section_id, manifest)
 
     def analyze_category(self):
         # Важно: пользователь мог снять характеристики и сразу нажать кнопку.
