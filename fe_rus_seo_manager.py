@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-FE-RUS SEO Manager v1.22.6
+FE-RUS SEO Manager v1.23.0
 
 Единое Windows-приложение:
 1. Категория - получает category_id, OCFilter options и значения.
@@ -21,6 +21,8 @@ import os
 import re
 import json
 import time
+import base64
+import gzip
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import queue
@@ -45,7 +47,17 @@ BASE = "https://fe-rus.ru"
 GOOGLE_SHEET_ID = "1NbEr9ZDR5dmFa_8zayfSQtQ5VL1dLn2jSN0nNT1fkD8"
 # Единый облачный CSV в Google Drive. ID не меняется при обновлении содержимого файла.
 CLOUD_READY_FILE_ID = "1YcEPhor7Up_5Wt2wCni86irElRqqkc0Y"
-CLOUD_READY_FILE_URL = "https://drive.google.com/file/d/1TDpnpSV1zWnEEuiOBdoN4GmxKqbk_NTd/view"
+CLOUD_READY_FILE_URL = "https://drive.google.com/file/d/1YcEPhor7Up_5Wt2wCni86irElRqqkc0Y/view"
+CLOUD_ROOT_FOLDER_ID = "1uyJ9YqbX7v1wYT2FX4hmO3GIWk0u-YYs"
+CLOUD_ROOT_FOLDER_URL = "https://drive.google.com/drive/folders/1uyJ9YqbX7v1wYT2FX4hmO3GIWk0u-YYs"
+CLOUD_SECTION_FILES = (
+    "seo_top30_result.csv",
+    "seo_top30_progress.json",
+    "seo_serp_page_classification.csv",
+    "seo_url_check_audit.csv",
+    "seo_ocfilter_check_audit.json",
+    "wordkeeper_error.log",
+)
 # URL веб-приложения Google Apps Script задаётся пользователем при первом нажатии.
 ADMIN = BASE + "/admin/"
 LOGIN_WK = "https://word-keeper.ru/login"
@@ -2106,7 +2118,7 @@ class Pipeline:
 
         # Загружаем постоянный кэш классификации URL.
         if cache_path is None:
-            cache_path = Path(os.getcwd()) / "seo_serp_page_classification.csv"
+            cache_path = Path(self.folder.get() or os.getcwd()) / "seo_serp_page_classification.csv"
         cache = load_serp_classification_cache(cache_path)
         session = http_session()
         page_map = {}
@@ -2943,6 +2955,153 @@ def export_excel(res, path, topdf=None):
     wb.save(path)
 
 
+
+def cloud_storage_request(endpoint, token, payload, timeout=180):
+    endpoint = str(endpoint or "").strip()
+    token = str(token or "").strip()
+    if not endpoint:
+        raise RuntimeError("Не задан URL Google Apps Script Web App.")
+    if not token:
+        raise RuntimeError("Не задан токен Google Drive.")
+    body = dict(payload or {})
+    body["token"] = token
+    try:
+        r = requests.post(endpoint, json=body, timeout=timeout)
+    except Exception as e:
+        raise RuntimeError(f"Не удалось обратиться к Google Drive Web App: {e}")
+    if r.status_code != 200:
+        txt = (r.text or "").strip()
+        if r.status_code in (401, 403) or "accounts.google.com" in txt or "<html" in txt.lower():
+            raise RuntimeError(
+                f"Google Web App вернул HTTP {r.status_code}. "
+                "Проверьте доступ Web App: запуск от имени владельца и доступ без обязательного входа Google."
+            )
+        raise RuntimeError(f"Google Drive Web App HTTP {r.status_code}: {txt[:500]}")
+    try:
+        data = r.json()
+    except Exception:
+        raise RuntimeError(f"Google Web App вернул не-JSON ответ: {r.text[:500]}")
+    if not data.get("ok"):
+        raise RuntimeError(str(data.get("error") or "Google Drive: неизвестная ошибка"))
+    return data
+
+
+def cloud_ensure_section(endpoint, token, section_name, timeout=120):
+    return cloud_storage_request(
+        endpoint, token,
+        {"action": "ensure_structure", "section_name": str(section_name or "").strip()},
+        timeout=timeout,
+    )
+
+
+def cloud_download_section_file(endpoint, token, section_name, file_name, local_path, timeout=180):
+    data = cloud_storage_request(
+        endpoint, token,
+        {"action":"download_file","section_name":str(section_name or "").strip(),"file_name":str(file_name or "").strip()},
+        timeout=timeout,
+    )
+    if not data.get("found"):
+        return False, data
+    raw = base64.b64decode(str(data.get("content_b64") or ""))
+    if data.get("compressed"):
+        raw = gzip.decompress(raw)
+    local_path = Path(local_path)
+    local_path.parent.mkdir(parents=True, exist_ok=True)
+    local_path.write_bytes(raw)
+    return True, data
+
+
+def cloud_upload_section_file(endpoint, token, section_name, file_name, local_path, timeout=180):
+    local_path = Path(local_path)
+    if not local_path.exists():
+        return False
+    raw = local_path.read_bytes()
+    zipped = gzip.compress(raw, compresslevel=6)
+    cloud_storage_request(
+        endpoint, token,
+        {
+            "action":"upload_file",
+            "section_name":str(section_name or "").strip(),
+            "file_name":str(file_name or "").strip(),
+            "compressed":True,
+            "content_b64":base64.b64encode(zipped).decode("ascii"),
+        },
+        timeout=timeout,
+    )
+    return True
+
+
+def cloud_cache_dir(section_id):
+    return Path(os.environ.get("APPDATA", Path.home())) / APP / "cloud_cache" / str(section_id)
+
+
+def cloud_section_name_from_result(res):
+    return str((res or {}).get("search_category") or (res or {}).get("category") or "").strip()
+
+
+def migrate_legacy_file_for_section(src, dst, filename, res):
+    """Однократно переносит старый локальный файл в папку текущего облачного раздела."""
+    src, dst = Path(src), Path(dst)
+    if not src.exists() or not src.stat().st_size:
+        return False
+    try:
+        category_url = str((res or {}).get("url", "") or "").strip()
+        current_keywords = {
+            str(x.get("keyword","")).strip()
+            for x in (res or {}).get("rows", [])
+            if str(x.get("keyword","")).strip()
+        }
+        current_variants = set()
+        for row in (res or {}).get("rows", []):
+            canonical = str(row.get("keyword","")).strip()
+            if not canonical:
+                continue
+            variants = wordkeeper_query_variants(
+                (res or {}).get("search_category") or (res or {}).get("category") or "",
+                row.get("value",""),
+            ) or [canonical]
+            current_variants.update(norm(q) for q in variants if str(q).strip())
+        variant_keys = {norm(q) for q in current_variants}
+
+        if filename == "seo_top30_result.csv":
+            df = pd.read_csv(src, encoding="utf-8-sig", dtype=str).fillna("")
+            if "source_query" in df.columns or "keyword" in df.columns:
+                mask = pd.Series(False, index=df.index)
+                if "source_query" in df.columns:
+                    mask = mask | df["source_query"].astype(str).map(norm).isin(variant_keys)
+                if "keyword" in df.columns:
+                    mask = mask | df["keyword"].astype(str).str.strip().isin(current_keywords)
+                df.loc[mask].to_csv(dst, index=False, encoding="utf-8-sig")
+            return dst.exists()
+
+        if filename == "seo_top30_progress.json":
+            data = json.loads(src.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                data["done_keywords"]=[x for x in data.get("done_keywords",[]) if str(x).strip() in current_keywords]
+                data["done_queries"]=[x for x in data.get("done_queries",[]) if norm(x) in variant_keys]
+                dst.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+                return True
+
+        if filename == "seo_url_check_audit.csv":
+            df=pd.read_csv(src, sep=";", encoding="utf-8-sig", dtype=str).fillna("")
+            if "category_url" in df.columns:
+                df=df[df["category_url"].astype(str).str.strip()==category_url]
+            df.to_csv(dst, sep=";", index=False, encoding="utf-8-sig", lineterminator="\n")
+            return True
+
+        if filename == "seo_ocfilter_check_audit.json":
+            data=json.loads(src.read_text(encoding="utf-8"))
+            if isinstance(data,dict):
+                data={k:v for k,v in data.items() if not category_url or str(v.get("category_url","")).strip()==category_url}
+                dst.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+                return True
+
+        dst.write_bytes(src.read_bytes())
+        return True
+    except Exception:
+        return False
+
+
 # -----------------------------------------------------------------------------
 # GUI
 # -----------------------------------------------------------------------------
@@ -2961,6 +3120,10 @@ class App(tk.Tk):
         self.analysis_stop_event = threading.Event()
         self.analysis_running = False
         self.url_check_running = False
+        self.cloud_section_id = ""
+        self.cloud_section_name = ""
+        self.cloud_sync_running = False
+        self.cloud_ready = False
         self.build()
         self.load_cfg_to_ui()
         self.setup_clipboard_shortcuts()
@@ -2981,9 +3144,10 @@ class App(tk.Tk):
         self.url=ttk.Entry(box); self.url.grid(row=0,column=1,columnspan=4,sticky="ew",padx=8)
         self.url.bind("<Control-c>", self.entry_copy)
         self.url.bind("<Control-C>", self.entry_copy)
-        ttk.Label(box,text="Рабочая папка:").grid(row=1,column=0,padx=8,pady=7,sticky="w")
-        self.folder=ttk.Entry(box); self.folder.grid(row=1,column=1,columnspan=3,sticky="ew",padx=8)
-        ttk.Button(box,text="ОБЗОР",command=self.pickfolder).grid(row=1,column=4,padx=8)
+        ttk.Label(box,text="Облачный раздел / локальный кэш:").grid(row=1,column=0,padx=8,pady=7,sticky="w")
+        self.folder=ttk.Entry(box); self.folder.grid(row=1,column=1,columnspan=2,sticky="ew",padx=8)
+        self.cloud_status=ttk.Label(box,text="Облако: не настроено"); self.cloud_status.grid(row=1,column=3,padx=8,sticky="w")
+        ttk.Button(box,text="НАСТРОИТЬ ОБЛАКО",command=self.configure_cloud).grid(row=1,column=4,padx=8)
         for c in range(5): box.columnconfigure(c,weight=1)
         ttk.Button(f,text="ПОЛУЧИТЬ КАТЕГОРИЮ И ФИЛЬТРЫ",command=self.analyze_category).pack(anchor="w",padx=10,pady=4)
         self.catstatus=ttk.Label(f,text="Нет анализа"); self.catstatus.pack(anchor="w",padx=12,pady=7)
@@ -3019,7 +3183,7 @@ class App(tk.Tk):
         self.wk_start_btn.pack(side="left")
         self.wk_stop_btn=ttk.Button(row,text="ОСТАНОВИТЬ АНАЛИЗ",command=self.stop_wordkeeper,state="disabled")
         self.wk_stop_btn.pack(side="left",padx=8)
-        ttk.Button(row,text="ЗАГРУЗИТЬ CSV",command=self.load_wk_csv).pack(side="left",padx=8)
+        ttk.Button(row,text="ЗАГРУЗИТЬ CSV (ЛОКАЛЬНО)",command=self.load_wk_csv).pack(side="left",padx=8)
         self.wkstatus=ttk.Label(row,text="TOP-30 ещё не загружен"); self.wkstatus.pack(side="left",padx=8)
 
         # Пересборка вынесена в отдельную строку, чтобы кнопка не исчезала
@@ -3307,6 +3471,11 @@ class App(tk.Tk):
     def load_cfg_to_ui(self):
         self.url.insert(0,self.cfg.get("url","https://fe-rus.ru/tavr-alyuminievyj/"))
         self.folder.insert(0,self.cfg.get("folder",r"D:\wordkeeper"))
+        if hasattr(self, "cloud_status"):
+            self.cloud_status.config(
+                text="Облако: подключено" if self.cfg.get("cloud_csv_webapp_url") and self.cfg.get("cloud_csv_token")
+                else "Облако: настройка нужна 1 раз"
+            )
         self.wk["Логин / email"].insert(0,self.cfg.get("wk_login",""))
         self.wk["Пароль"].insert(0,self.cfg.get("wk_password",""))
         ocfg=self.cfg.get("ocfilter",{}) if isinstance(self.cfg.get("ocfilter",{}),dict) else {}
@@ -3422,6 +3591,117 @@ class App(tk.Tk):
         self.catstatus.config(text=f"Выбрано характеристик: {len(opts)} | вариантов: {len(rows)}")
         self.logtext.insert("end",f"\nПрименены характеристики: {', '.join(o.get('name','') for o in opts)}\nВариантов: {len(rows)}\n")
 
+    def ensure_cloud_for_category(self, res, update_ui=True):
+        cfg=load_cfg()
+        endpoint=str(cfg.get("cloud_csv_webapp_url","") or "").strip()
+        token=str(cfg.get("cloud_csv_token","") or "").strip()
+        if not endpoint or not token:
+            if not self.configure_cloud():
+                return False
+            cfg=load_cfg()
+            endpoint=str(cfg.get("cloud_csv_webapp_url","") or "").strip()
+            token=str(cfg.get("cloud_csv_token","") or "").strip()
+        if not endpoint or not token:
+            return False
+
+        section_name=cloud_section_name_from_result(res)
+        if not section_name:
+            raise RuntimeError("Не удалось определить название текущего раздела для Google Drive.")
+
+        legacy_value=str(cfg.get("legacy_folder") or cfg.get("folder") or os.getcwd()).strip()
+        legacy_root=Path(legacy_value)
+        data=cloud_ensure_section(endpoint, token, section_name)
+        section_id=str(data.get("section_id") or "").strip()
+        actual_name=str(data.get("section_name") or section_name).strip()
+        if not section_id:
+            raise RuntimeError("Google Drive не вернул ID папки текущего раздела.")
+
+        local_dir=cloud_cache_dir(section_id)
+        local_dir.mkdir(parents=True, exist_ok=True)
+        self.cloud_section_id=section_id
+        self.cloud_section_name=actual_name
+        if update_ui:
+            self.folder.delete(0,"end")
+            self.folder.insert(0,str(local_dir))
+        self.cfg["cloud_section_id"]=section_id
+        self.cfg["cloud_section_name"]=actual_name
+        self.cfg["cloud_root_folder_id"]=CLOUD_ROOT_FOLDER_ID
+        if not self.cfg.get("legacy_folder"):
+            self.cfg["legacy_folder"]=str(legacy_root)
+        self.cfg["folder"]=str(local_dir)
+        save_cfg(self.cfg)
+
+        for filename in CLOUD_SECTION_FILES:
+            dst=local_dir/filename
+            found,_=cloud_download_section_file(endpoint, token, actual_name, filename, dst)
+            if not found and legacy_root != local_dir:
+                if migrate_legacy_file_for_section(legacy_root/filename, dst, filename, res):
+                    cloud_upload_section_file(endpoint, token, actual_name, filename, dst)
+
+        self.cloud_ready=True
+        return {"section":actual_name,"section_id":section_id,"folder":str(local_dir)}
+
+    def worker_cloud_prepare(self,res):
+        try:
+            info=self.ensure_cloud_for_category(res, update_ui=False)
+            self.q.put(("cloudready",info))
+        except Exception as e:
+            self.cloud_ready=False
+            self.q.put(("clouderror",str(e)))
+
+    def start_cloud_sync_for_category(self,res):
+        if self.cloud_sync_running:
+            return
+        self.cloud_sync_running=True
+        self.cloud_ready=False
+        if hasattr(self,"wk_start_btn"): self.wk_start_btn.config(state="disabled")
+        if hasattr(self,"wk_rebuild_btn"): self.wk_rebuild_btn.config(state="disabled")
+        if hasattr(self,"cloud_status"): self.cloud_status.config(text="Облако: синхронизация...")
+        threading.Thread(target=self.worker_cloud_prepare,args=(res,),daemon=True).start()
+
+    def cloud_pull_current_section(self, update_ui=False):
+        if not self.res:
+            return
+        cfg=load_cfg()
+        endpoint=str(cfg.get("cloud_csv_webapp_url","") or "").strip()
+        token=str(cfg.get("cloud_csv_token","") or "").strip()
+        if not endpoint or not token:
+            raise RuntimeError("Не настроен Google Drive Web App.")
+        section_name=self.cloud_section_name or cloud_section_name_from_result(self.res)
+        if not section_name:
+            raise RuntimeError("Не определён текущий раздел.")
+        data=cloud_ensure_section(endpoint,token,section_name)
+        section_id=str(data.get("section_id") or self.cloud_section_id).strip()
+        if not section_id:
+            raise RuntimeError("Google Drive не вернул ID папки раздела.")
+        self.cloud_section_id=section_id
+        self.cloud_section_name=str(data.get("section_name") or section_name)
+        local_dir=cloud_cache_dir(section_id)
+        local_dir.mkdir(parents=True,exist_ok=True)
+        if update_ui:
+            self.folder.delete(0,"end"); self.folder.insert(0,str(local_dir))
+        self.cfg["folder"]=str(local_dir)
+        save_cfg(self.cfg)
+        for filename in CLOUD_SECTION_FILES:
+            cloud_download_section_file(endpoint,token,self.cloud_section_name,filename,local_dir/filename)
+
+    def cloud_push_current_files(self,filenames=None):
+        if not self.res:
+            return
+        cfg=load_cfg()
+        endpoint=str(cfg.get("cloud_csv_webapp_url","") or "").strip()
+        token=str(cfg.get("cloud_csv_token","") or "").strip()
+        if not endpoint or not token:
+            return
+        section_name=self.cloud_section_name or cloud_section_name_from_result(self.res)
+        if not section_name:
+            return
+        local_dir=cloud_cache_dir(self.cloud_section_id) if self.cloud_section_id else Path(self.folder.get() or os.getcwd())
+        for filename in (filenames or CLOUD_SECTION_FILES):
+            path=local_dir/filename
+            if path.exists() and path.stat().st_size:
+                cloud_upload_section_file(endpoint,token,section_name,filename,path)
+
     def analyze_category(self):
         # Важно: пользователь мог снять характеристики и сразу нажать кнопку.
         # Сохраняем их выбор до того, как новый ответ API заменит self.res.
@@ -3446,6 +3726,16 @@ class App(tk.Tk):
         if not self.res:
             messagebox.showwarning("Категория","Сначала получите категорию и фильтры.")
             return
+        if self.cloud_sync_running:
+            messagebox.showinfo("Google Drive","Подождите: данные текущего раздела ещё синхронизируются с Google Drive.")
+            return
+        if not self.cloud_ready:
+            try:
+                self.ensure_cloud_for_category(self.res)
+                self.cloud_ready=True
+            except Exception as e:
+                messagebox.showerror("Google Drive",f"Не удалось подготовить облачный раздел:\n{e}")
+                return
         try:
             self.apply_selected_filters()
         except Exception:
@@ -3561,9 +3851,11 @@ class App(tk.Tk):
         self.start_wordkeeper()
 
     def worker_wordkeeper(self):
-        out_path=Path(self.folder.get() or os.getcwd())/"seo_top30_result.csv"
-        progress_path=Path(self.folder.get() or os.getcwd())/"seo_top30_progress.json"
         try:
+            self.cloud_pull_current_section(update_ui=False)
+            work_dir=cloud_cache_dir(self.cloud_section_id) if self.cloud_section_id else Path(self.folder.get() or os.getcwd())
+            out_path=work_dir/"seo_top30_result.csv"
+            progress_path=work_dir/"seo_top30_progress.json"
             login=self.wk["Логин / email"].get().strip()
             password=self.wk["Пароль"].get()
             region=int(self.region.get())
@@ -3775,7 +4067,7 @@ class App(tk.Tk):
                             "done_queries":safe_sorted_strings(done_queries),
                             "updated_at":time.strftime("%Y-%m-%d %H:%M:%S")
                         },ensure_ascii=False,indent=2),encoding="utf-8")
-                        error_log = Path(self.folder.get() or os.getcwd()) / "wordkeeper_error.log"
+                        error_log = work_dir / "wordkeeper_error.log"
                         try:
                             error_log.write_text(
                                 traceback.format_exc(),
@@ -3800,6 +4092,7 @@ class App(tk.Tk):
                 "done_queries":safe_sorted_strings(done_queries),
                 "updated_at":time.strftime("%Y-%m-%d %H:%M:%S")
             },ensure_ascii=False,indent=2),encoding="utf-8")
+            self.cloud_push_current_files(["seo_top30_result.csv","seo_top30_progress.json","wordkeeper_error.log"])
             if self.wk_stop_event.is_set():
                 self.q.put(("wkstop",{"path":out_path,"progress":progress_path,"done":len(set(keywords) & done),"total":len(keywords)}))
             else:
@@ -3841,7 +4134,8 @@ class App(tk.Tk):
 
     def worker_compare(self):
         try:
-            folder=Path(self.folder.get() or os.getcwd())
+            self.cloud_pull_current_section(update_ui=False)
+            folder=cloud_cache_dir(self.cloud_section_id) if self.cloud_section_id else Path(os.getcwd())
             cache_path=folder / "seo_serp_page_classification.csv"
             res=Pipeline().merge_analysis(
                 self.res,
@@ -3850,6 +4144,7 @@ class App(tk.Tk):
                 stop_event=self.analysis_stop_event,
                 cache_path=cache_path,
             )
+            self.cloud_push_current_files(["seo_serp_page_classification.csv"])
             self.q.put(("analysisdone", {"res":res, "cache":str(cache_path), "stopped":self.analysis_stop_event.is_set()}))
         except Exception as e:
             self.q.put(("analysiserr",str(e)))
@@ -3894,7 +4189,7 @@ class App(tk.Tk):
                 self.stats.insert("end",f"{x['keyword']} | {x['filter']} | {x['value']} | ТИП={x.get('promotion_type','')} | STATUS={x.get('status','')} | PRODUCT={x.get('product_domains_count',0)} | SEO={x.get('seo_domains_count',0)} | {x.get('reason','')}\n")
 
     def url_audit_path(self):
-        return Path(self.folder.get() or os.getcwd()) / "seo_url_check_audit.csv"
+        return (cloud_cache_dir(self.cloud_section_id) if self.cloud_section_id else Path(self.folder.get() or os.getcwd())) / "seo_url_check_audit.csv"
 
     def _load_url_audit(self):
         path = self.url_audit_path()
@@ -3975,6 +4270,7 @@ class App(tk.Tk):
 
     def worker_urls(self):
         try:
+            self.cloud_pull_current_section()
             s=http_session()
             items=[x for x in self.res["rows"] if x.get("status")=="CREATE"]
             total=len(items)
@@ -4114,6 +4410,7 @@ class App(tk.Tk):
                 self.q.put(("urlstatus", f"Проверено: {min(reused+checked_new,total)} из {total}"))
 
             self._save_url_audit(audit)
+            self.cloud_push_current_files(["seo_url_check_audit.csv"])
             stopped=self.url_check_stop_event.is_set()
             self.q.put(("urldone", {"checked": min(reused+checked_new,total), "total": total, "stopped": stopped, "reused": reused, "path": str(path)}))
         except Exception as e:
@@ -4123,7 +4420,7 @@ class App(tk.Tk):
 
 
     def ocfilter_audit_path(self):
-        return Path(self.folder.get() or os.getcwd()) / "seo_ocfilter_check_audit.json"
+        return (cloud_cache_dir(self.cloud_section_id) if self.cloud_section_id else Path(self.folder.get() or os.getcwd())) / "seo_ocfilter_check_audit.json"
 
     def _save_ocfilter_audit(self, results):
         """Сохраняет результат DRY-RUN OCFilter, чтобы он не терялся между запусками."""
@@ -4227,6 +4524,7 @@ class App(tk.Tk):
 
     def worker_oc(self,creds):
         try:
+            self.cloud_pull_current_section()
             results=Pipeline().ocfilter(self.res,creds,create=False,progress=lambda msg:self.q.put(("oclog",msg)))
             self.q.put(("ocdone",results))
         except Exception as e:
@@ -4236,6 +4534,7 @@ class App(tk.Tk):
 
     def worker_urls(self):
         try:
+            self.cloud_pull_current_section()
             s=http_session()
             items=[x for x in self.res["rows"] if x.get("status")=="CREATE"]
             total=len(items)
@@ -4375,6 +4674,7 @@ class App(tk.Tk):
                 self.q.put(("urlstatus", f"Проверено: {min(reused+checked_new,total)} из {total}"))
 
             self._save_url_audit(audit)
+            self.cloud_push_current_files(["seo_url_check_audit.csv"])
             stopped=self.url_check_stop_event.is_set()
             self.q.put(("urldone", {"checked": min(reused+checked_new,total), "total": total, "stopped": stopped, "reused": reused, "path": str(path)}))
         except Exception as e:
@@ -4687,8 +4987,40 @@ class App(tk.Tk):
                     self.res=x
                     self.render_filter_checkboxes(x.get("options", []))
                     self.catstatus.config(text=f"Готово: {x['category']} | category_id={x['category_id']} | вариантов={len(x['rows'])}")
-                    self.logtext.insert("end","\nГотово. Отметьте нужные характеристики и переходите в WordKeeper.\n")
+                    self.logtext.insert("end","\nГотово. Подключаю облачную папку текущего раздела...\n")
+                    try:
+                        cfg=load_cfg()
+                        if not cfg.get("cloud_csv_webapp_url") or not cfg.get("cloud_csv_token"):
+                            if not self.configure_cloud():
+                                raise RuntimeError("Настройка Google Drive отменена.")
+                        self.start_cloud_sync_for_category(x)
+                    except Exception as cloud_e:
+                        self.cloud_ready=False
+                        self.cloud_sync_running=False
+                        self.cloud_status.config(text="Облако: ошибка")
+                        self.logtext.insert("end",f"Google Drive: {cloud_e}\n")
+                        messagebox.showerror("Google Drive",f"Не удалось подготовить папку текущего раздела:\n{cloud_e}")
                 elif t=="err":messagebox.showerror("Ошибка",x)
+                elif t=="cloudready":
+                    self.cloud_sync_running=False
+                    self.cloud_ready=True
+                    if hasattr(self,"wk_start_btn"): self.wk_start_btn.config(state="normal")
+                    if hasattr(self,"wk_rebuild_btn"): self.wk_rebuild_btn.config(state="normal")
+                    self.cloud_section_id=str(x.get("section_id") or self.cloud_section_id)
+                    self.cloud_section_name=str(x.get("section") or self.cloud_section_name)
+                    if x.get("folder"):
+                        self.folder.delete(0,"end"); self.folder.insert(0,str(x.get("folder")))
+                    if hasattr(self,"cloud_status"): self.cloud_status.config(text=f"Облако: {x.get('section','готово')}")
+                    self.logtext.insert("end",f"Google Drive: раздел синхронизирован. Кэш: {x.get('folder','')}\n")
+                    self.logtext.see("end")
+                elif t=="clouderror":
+                    self.cloud_sync_running=False
+                    self.cloud_ready=False
+                    if hasattr(self,"wk_start_btn"): self.wk_start_btn.config(state="normal")
+                    if hasattr(self,"wk_rebuild_btn"): self.wk_rebuild_btn.config(state="normal")
+                    if hasattr(self,"cloud_status"): self.cloud_status.config(text="Облако: ошибка")
+                    self.logtext.insert("end",f"Google Drive: {x}\n")
+                    messagebox.showerror("Google Drive",str(x))
                 elif t=="wklog":self.wklog.insert("end",str(x)+"\n");self.wklog.see("end")
                 elif t=="wkdone":
                     p=x; self.topdf=pd.read_csv(p,encoding="utf-8-sig") if Path(p).exists() and Path(p).stat().st_size else pd.DataFrame(); self.wkstatus.config(text=f"Готово: {Path(p).name} | строк: {len(self.topdf)}"); self.wk_start_btn.config(state="normal"); self.wk_stop_btn.config(state="disabled"); self.wklog.insert("end",f"\nФайл TOP-30: {p}\n")
@@ -4753,6 +5085,10 @@ class App(tk.Tk):
                                 found.update(r)
                                 matched += 1
                     audit_path = self._save_ocfilter_audit(x)
+                    try:
+                        self.cloud_push_current_files(["seo_ocfilter_check_audit.json"])
+                    except Exception as cloud_e:
+                        self.oclog.insert("end",f"Google Drive: не удалось сохранить OCFilter audit: {cloud_e}\n")
                     self._apply_ocfilter_audit()
                     ready = len(generator_rows(self.res))
                     statuses = {}
