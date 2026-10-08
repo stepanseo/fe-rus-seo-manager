@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-FE-RUS SEO Manager v1.23.0
+FE-RUS SEO Manager v1.23.1
 
 Единое Windows-приложение:
 1. Категория - получает category_id, OCFilter options и значения.
@@ -2994,6 +2994,11 @@ def cloud_ensure_section(endpoint, token, section_name, timeout=120):
     )
 
 
+def cloud_list_sections(endpoint, token, timeout=120):
+    data = cloud_storage_request(endpoint, token, {"action":"list_sections"}, timeout=timeout)
+    return list(data.get("sections") or [])
+
+
 def cloud_download_section_file(endpoint, token, section_name, file_name, local_path, timeout=180):
     data = cloud_storage_request(
         endpoint, token,
@@ -3199,6 +3204,19 @@ class App(tk.Tk):
             rebuild_row,
             text="Удаляет только TOP-30 текущего раздела и запускает его заново",
         ).pack(side="left",padx=10)
+
+        migrate_row=ttk.Frame(f); migrate_row.pack(fill="x",padx=10,pady=(0,6))
+        self.wk_migrate_btn=ttk.Button(
+            migrate_row,
+            text="РАЗЛОЖИТЬ СТАРЫЙ TOP-30 ПО ОБЛАЧНЫМ РАЗДЕЛАМ",
+            command=self.migrate_old_top30_to_cloud,
+        )
+        self.wk_migrate_btn.pack(side="left")
+        ttk.Label(
+            migrate_row,
+            text="Берёт старый seo_top30_result.csv и раскладывает строки по уже созданным папкам разделов Google Drive",
+        ).pack(side="left",padx=10)
+
         self.wklog=tk.Text(f,font=("Consolas",10)); self.wklog.pack(fill="both",expand=True,padx=10,pady=8)
 
     def build_analysis(self):
@@ -3849,6 +3867,217 @@ class App(tk.Tk):
         self.wklog.see("end")
         self.save_settings()
         self.start_wordkeeper()
+
+    def migrate_old_top30_to_cloud(self):
+        """Запускает безопасный перенос старого накопительного TOP-30 по уже созданным облачным разделам."""
+        cfg=load_cfg()
+        endpoint=str(cfg.get("cloud_csv_webapp_url","") or "").strip()
+        token=str(cfg.get("cloud_csv_token","") or "").strip()
+        if not endpoint or not token:
+            if not self.configure_cloud():
+                return
+
+        chosen=filedialog.askopenfilename(
+            title="Выберите старый seo_top30_result.csv",
+            filetypes=[("TOP-30 CSV","seo_top30_result.csv"),("CSV","*.csv"),("Все файлы","*.*")]
+        )
+        if not chosen:
+            return
+
+        self.wk_migrate_btn.config(state="disabled")
+        self.wklog.delete("1.0","end")
+        self.wklog.insert("end",f"Миграция старого TOP-30:\n{chosen}\n")
+        self.wklog.insert("end","Получаю список уже созданных разделов Google Drive...\n")
+        self.wklog.see("end")
+        threading.Thread(
+            target=self.worker_migrate_old_top30,
+            args=(Path(chosen),),
+            daemon=True
+        ).start()
+
+    def _migration_section_clean_name(self, name):
+        s=re.sub(r"^\d+_", "", str(name or "").strip())
+        return re.sub(r"\s+", " ", s).strip()
+
+    def _migration_score(self, section_name, query):
+        """Строгое сопоставление: сначала полная фраза раздела, затем все слова раздела."""
+        s=norm(self._migration_section_clean_name(section_name))
+        q=norm(query)
+        if not s or not q:
+            return 0
+
+        # Полное название раздела в запросе — самый надёжный вариант.
+        if s in q:
+            return 100000 + len(s)*10 + len(s.split())
+
+        # Запасной вариант только для названий из 2+ содержательных слов.
+        tokens=[
+            x for x in re.findall(r"[a-zа-я0-9]+",s)
+            if len(x)>=3
+        ]
+        if len(tokens)<2:
+            return 0
+
+        q_tokens=set(re.findall(r"[a-zа-я0-9]+",q))
+        if all(t in q_tokens for t in tokens):
+            return 50000 + len(tokens)*100 + len(s)
+
+        return 0
+
+    def _read_legacy_top30(self, path):
+        last=None
+        for enc in ("utf-8-sig","utf-8","cp1251"):
+            try:
+                df=pd.read_csv(path,encoding=enc,dtype=str).fillna("")
+                if "source_query" in df.columns:
+                    return df
+                last=RuntimeError("В CSV нет колонки source_query.")
+            except Exception as e:
+                last=e
+        raise RuntimeError(f"Не удалось прочитать CSV: {last}")
+
+    def worker_migrate_old_top30(self, old_path):
+        try:
+            cfg=load_cfg()
+            endpoint=str(cfg.get("cloud_csv_webapp_url","") or "").strip()
+            token=str(cfg.get("cloud_csv_token","") or "").strip()
+            if not endpoint or not token:
+                raise RuntimeError("Не настроен Google Drive Web App.")
+
+            sections=cloud_list_sections(endpoint,token,timeout=120)
+            # Не считаем 00_ОБЩИЕ разделом.
+            sections=[
+                x for x in sections
+                if self._migration_section_clean_name(x.get("name","")).strip()
+                and self._migration_section_clean_name(x.get("name","")) != "00_ОБЩИЕ"
+            ]
+
+            if not sections:
+                raise RuntimeError(
+                    "В FE-RUS SEO Manager пока нет папок разделов. "
+                    "Сначала открой/обработай нужные разделы в новой версии программы — "
+                    "она создаст их автоматически, после чего запусти миграцию ещё раз."
+                )
+
+            df=self._read_legacy_top30(old_path)
+            total=len(df)
+            if total==0:
+                raise RuntimeError("Старый seo_top30_result.csv пуст.")
+
+            self.q.put(("wkmigratelog",f"Строк в старом TOP-30: {total}"))
+            self.q.put(("wkmigratelog",f"Облачных разделов найдено: {len(sections)}"))
+
+            groups={str(x.get("id")): [] for x in sections}
+            section_meta={str(x.get("id")): x for x in sections}
+            unmatched=[]
+            ambiguous=[]
+
+            # Индекс названий разделов.
+            prepared=[]
+            for s in sections:
+                sid=str(s.get("id") or "")
+                name=str(s.get("name") or "")
+                prepared.append((sid,name))
+
+            for idx,row in df.iterrows():
+                query=str(row.get("source_query","") or "").strip()
+                scores=[]
+                for sid,name in prepared:
+                    score=self._migration_score(name,query)
+                    if score>0:
+                        scores.append((score,sid,name))
+
+                if not scores:
+                    unmatched.append(idx)
+                    continue
+
+                scores.sort(reverse=True,key=lambda x:(x[0],len(self._migration_section_clean_name(x[2]))))
+                best=scores[0]
+
+                # Если два разных раздела получили одинаково сильное совпадение,
+                # не угадываем — отправляем строку в отчёт.
+                if len(scores)>1 and scores[1][0]==best[0]:
+                    ambiguous.append((idx,query,best[2],scores[1][2]))
+                    unmatched.append(idx)
+                    continue
+
+                groups[best[1]].append(idx)
+
+            report_rows=[]
+            for idx,query,best,second in ambiguous:
+                report_rows.append({
+                    "row":int(idx)+2,
+                    "source_query":query,
+                    "reason":"AMBIGUOUS",
+                    "candidate_1":best,
+                    "candidate_2":second,
+                })
+            for idx in unmatched:
+                if not any(int(x["row"])-2==int(idx) for x in report_rows):
+                    report_rows.append({
+                        "row":int(idx)+2,
+                        "source_query":str(df.iloc[idx].get("source_query","") or ""),
+                        "reason":"NO_MATCH",
+                        "candidate_1":"",
+                        "candidate_2":"",
+                    })
+
+            uploaded=0
+            uploaded_rows=0
+
+            for n,(sid,meta) in enumerate(section_meta.items(),start=1):
+                idxs=groups.get(sid,[])
+                if not idxs:
+                    continue
+
+                section_name=str(meta.get("name") or "").strip()
+                self.q.put(("wkmigratelog",f"[{n}/{len(section_meta)}] {section_name}: найдено строк {len(idxs)}"))
+
+                # Скачиваем существующий облачный файл раздела, чтобы не затереть новые данные.
+                local_dir=cloud_cache_dir(sid)
+                local_dir.mkdir(parents=True,exist_ok=True)
+                local_path=local_dir/"seo_top30_result.csv"
+                cloud_download_section_file(endpoint,token,section_name,"seo_top30_result.csv",local_path,timeout=180)
+
+                new_df=df.loc[idxs].copy()
+                if local_path.exists() and local_path.stat().st_size:
+                    try:
+                        existing=self._read_legacy_top30(local_path)
+                        if not existing.empty:
+                            new_df=pd.concat([existing,new_df],ignore_index=True)
+                            new_df=new_df.drop_duplicates().reset_index(drop=True)
+                    except Exception as e:
+                        self.q.put(("wkmigratelog",f"  Предупреждение: старый облачный файл не прочитан, будет заменён: {e}"))
+
+                new_df.to_csv(local_path,index=False,encoding="utf-8-sig")
+                cloud_upload_section_file(endpoint,token,section_name,"seo_top30_result.csv",local_path,timeout=240)
+
+                uploaded+=1
+                uploaded_rows+=len(idxs)
+
+            report_path=old_path.parent/"seo_top30_migration_report.csv"
+            if report_rows:
+                pd.DataFrame(report_rows).to_csv(report_path,index=False,encoding="utf-8-sig")
+                self.q.put(("wkmigratelog",f"Строк без однозначного раздела: {len(report_rows)}"))
+                self.q.put(("wkmigratelog",f"Отчёт: {report_path}"))
+            else:
+                if report_path.exists():
+                    try: report_path.unlink()
+                    except Exception: pass
+
+            matched=total-len(unmatched)
+            self.q.put(("wkmigratedone",{
+                "total":total,
+                "matched":matched,
+                "unmatched":len(unmatched),
+                "sections":uploaded,
+                "uploaded_rows":uploaded_rows,
+                "report":str(report_path) if report_rows else "",
+            }))
+        except Exception as e:
+            self.q.put(("wkmigrateerror",str(e)))
+        finally:
+            pass
 
     def worker_wordkeeper(self):
         try:
@@ -5021,6 +5250,33 @@ class App(tk.Tk):
                     if hasattr(self,"cloud_status"): self.cloud_status.config(text="Облако: ошибка")
                     self.logtext.insert("end",f"Google Drive: {x}\n")
                     messagebox.showerror("Google Drive",str(x))
+                elif t=="wkmigratelog":
+                    self.wklog.insert("end",str(x)+"\n"); self.wklog.see("end")
+                elif t=="wkmigratedone":
+                    self.wk_migrate_btn.config(state="normal")
+                    self.wklog.insert("end",
+                        f"\nМИГРАЦИЯ ЗАВЕРШЕНА\n"
+                        f"Всего строк: {x.get('total',0)}\n"
+                        f"Распознано по разделам: {x.get('matched',0)}\n"
+                        f"Не распределено: {x.get('unmatched',0)}\n"
+                        f"Обновлено облачных разделов: {x.get('sections',0)}\n"
+                        f"Загружено строк: {x.get('uploaded_rows',0)}\n"
+                        + (f"Отчёт: {x.get('report')}\n" if x.get('report') else "")
+                    )
+                    self.wklog.see("end")
+                    messagebox.showinfo(
+                        "Миграция TOP-30",
+                        f"Готово.\n\n"
+                        f"Всего строк: {x.get('total',0)}\n"
+                        f"Распознано: {x.get('matched',0)}\n"
+                        f"Не распределено: {x.get('unmatched',0)}\n"
+                        f"Обновлено разделов: {x.get('sections',0)}"
+                        + (f"\n\nОтчёт:\n{x.get('report')}" if x.get('report') else "")
+                    )
+                elif t=="wkmigrateerror":
+                    self.wk_migrate_btn.config(state="normal")
+                    self.wklog.insert("end",f"ОШИБКА МИГРАЦИИ: {x}\n"); self.wklog.see("end")
+                    messagebox.showerror("Миграция TOP-30",str(x))
                 elif t=="wklog":self.wklog.insert("end",str(x)+"\n");self.wklog.see("end")
                 elif t=="wkdone":
                     p=x; self.topdf=pd.read_csv(p,encoding="utf-8-sig") if Path(p).exists() and Path(p).stat().st_size else pd.DataFrame(); self.wkstatus.config(text=f"Готово: {Path(p).name} | строк: {len(self.topdf)}"); self.wk_start_btn.config(state="normal"); self.wk_stop_btn.config(state="disabled"); self.wklog.insert("end",f"\nФайл TOP-30: {p}\n")
