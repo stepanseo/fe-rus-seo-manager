@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-FE-RUS SEO Manager v1.23.9
+FE-RUS SEO Manager v1.24.0
 
 Единое Windows-приложение:
 1. Категория - получает category_id, OCFilter options и значения.
@@ -688,9 +688,11 @@ def wordkeeper_query_variants(category, value):
 
 SERP_CLASSIFIER_VERSION = "1.21.1"
 # Параллельная классификация URL на этапе «Анализ».
-# 8 потоков заметно ускоряют сетевые проверки, не создавая слишком
-# агрессивную нагрузку на сайты из TOP-30.
-SERP_CLASSIFY_WORKERS = 8
+# 16 потоков ускоряют сетевые проверки. Кэш при этом сохраняется реже,
+# а окно анализа обновляется пакетно, чтобы Tkinter не тормозил на тысячах URL.
+SERP_CLASSIFY_WORKERS = 16
+SERP_CLASSIFY_PROGRESS_EVERY = 25
+SERP_CLASSIFY_CACHE_EVERY = 200
 PRODUCT_PATH_MARKERS = (
     "/product/", "/products/", "/item/", "/goods/", "/tovar/", "/offer/",
     "/p/", "/detail/", "/produkt/", "/catalog/product/"
@@ -2195,7 +2197,8 @@ class Pipeline:
             progress(
                 f"Классификация TOP-30: уникальных URL {total_urls} | "
                 f"кэшировано {total_urls - len(pending_urls)} | "
-                f"новых {len(pending_urls)} | потоков {SERP_CLASSIFY_WORKERS}"
+                f"новых {len(pending_urls)} | потоков {SERP_CLASSIFY_WORKERS} | "
+                f"сохранение кэша каждые {SERP_CLASSIFY_CACHE_EVERY}"
             )
 
         # requests.Session не является гарантированно thread-safe, поэтому
@@ -2227,14 +2230,21 @@ class Pipeline:
                     cache[u] = item
                     page_map[u] = item
                     new_classified += 1
-                    if progress:
+                    # Не перерисовываем Tkinter на каждом URL: на тысячах
+                    # результатов это само по себе становится заметным тормозом.
+                    # Показываем первый, каждый 25-й и последний результат.
+                    if progress and (
+                        new_classified == 1
+                        or new_classified % SERP_CLASSIFY_PROGRESS_EVERY == 0
+                        or new_classified == len(pending_urls)
+                    ):
                         progress(
                             f"Классификация URL: {new_classified}/{len(pending_urls)} "
                             f"(всего {total_urls}) | {item.get('page_type')} | {u}"
                         )
-                    # Сохраняем регулярно, чтобы остановка/сбой не потеряли
-                    # уже завершённые параллельные проверки.
-                    if new_classified % 20 == 0:
+                    # Кэш сохраняем пакетно. При остановке/ошибке финальное
+                    # сохранение выполняется после завершения/отмены executor.
+                    if new_classified % SERP_CLASSIFY_CACHE_EVERY == 0:
                         save_serp_classification_cache(cache, cache_path)
             finally:
                 executor.shutdown(wait=True, cancel_futures=True)
@@ -3205,7 +3215,7 @@ def migrate_legacy_file_for_section(src, dst, filename, res):
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("FE-RUS SEO Manager v1.23.9")
+        self.title("FE-RUS SEO Manager v1.24.0")
         self.geometry("1280x860")
         self.q = queue.Queue()
         self.res = None
