@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-FE-RUS SEO Manager v1.23.3
+FE-RUS SEO Manager v1.23.4
 
 Единое Windows-приложение:
 1. Категория - получает category_id, OCFilter options и значения.
@@ -686,7 +686,7 @@ def wordkeeper_query_variants(category, value):
 # SERP PAGE CLASSIFICATION
 # -----------------------------------------------------------------------------
 
-SERP_CLASSIFIER_VERSION = "1.23.3"
+SERP_CLASSIFIER_VERSION = "1.21.1"
 # Параллельная классификация URL на этапе «Анализ».
 # 8 потоков заметно ускоряют сетевые проверки, не создавая слишком
 # агрессивную нагрузку на сайты из TOP-30.
@@ -3016,7 +3016,7 @@ def cloud_download_section_file(endpoint, token, section_name, file_name, local_
     return True, data
 
 
-def cloud_upload_section_file(endpoint, token, section_name, file_name, local_path, timeout=180):
+def cloud_upload_section_file(endpoint, token, section_name, file_name, local_path, timeout=180, backup=False):
     local_path = Path(local_path)
     if not local_path.exists():
         return False
@@ -3029,6 +3029,7 @@ def cloud_upload_section_file(endpoint, token, section_name, file_name, local_pa
             "section_name":str(section_name or "").strip(),
             "file_name":str(file_name or "").strip(),
             "compressed":True,
+            "backup_existing":bool(backup),
             "content_b64":base64.b64encode(zipped).decode("ascii"),
         },
         timeout=timeout,
@@ -3114,7 +3115,7 @@ def migrate_legacy_file_for_section(src, dst, filename, res):
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("FE-RUS SEO Manager v1.22.1")
+        self.title("FE-RUS SEO Manager v1.23.4")
         self.geometry("1280x860")
         self.q = queue.Queue()
         self.res = None
@@ -4033,24 +4034,19 @@ class App(tk.Tk):
                 section_name=str(meta.get("name") or "").strip()
                 self.q.put(("wkmigratelog",f"[{n}/{len(section_meta)}] {section_name}: найдено строк {len(idxs)}"))
 
-                # Скачиваем существующий облачный файл раздела, чтобы не затереть новые данные.
+                # Для миграции старый master-CSV является источником истины.
+                # Не скачиваем существующий облачный TOP-30: большой файл может давать
+                # 404/таймаут на стороне Web App. Перед заменой Web App делает резервную копию.
                 local_dir=cloud_cache_dir(sid)
                 local_dir.mkdir(parents=True,exist_ok=True)
                 local_path=local_dir/"seo_top30_result.csv"
-                cloud_download_section_file(endpoint,token,section_name,"seo_top30_result.csv",local_path,timeout=300)
 
                 new_df=df.loc[idxs].copy()
-                if local_path.exists() and local_path.stat().st_size:
-                    try:
-                        existing=self._read_legacy_top30(local_path)
-                        if not existing.empty:
-                            new_df=pd.concat([existing,new_df],ignore_index=True)
-                            new_df=new_df.drop_duplicates().reset_index(drop=True)
-                    except Exception as e:
-                        self.q.put(("wkmigratelog",f"  Предупреждение: старый облачный файл не прочитан, будет заменён: {e}"))
-
                 new_df.to_csv(local_path,index=False,encoding="utf-8-sig")
-                cloud_upload_section_file(endpoint,token,section_name,"seo_top30_result.csv",local_path,timeout=600)
+                cloud_upload_section_file(
+                    endpoint,token,section_name,"seo_top30_result.csv",
+                    local_path,timeout=600,backup=True
+                )
 
                 uploaded+=1
                 uploaded_rows+=len(idxs)
