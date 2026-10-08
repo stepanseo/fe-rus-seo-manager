@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-FE-RUS SEO Manager v1.23.4
+FE-RUS SEO Manager v1.23.5
 
 Единое Windows-приложение:
 1. Категория - получает category_id, OCFilter options и значения.
@@ -2963,12 +2963,52 @@ def cloud_storage_request(endpoint, token, payload, timeout=180):
         raise RuntimeError("Не задан URL Google Apps Script Web App.")
     if not token:
         raise RuntimeError("Не задан токен Google Drive.")
+
     body = dict(payload or {})
     body["token"] = token
+
+    # Google Apps Script ContentService возвращает ответ через 302
+    # на одноразовый script.googleusercontent.com URL. В 2026 году
+    # Google иногда отвечает 404 на этот URL сразу после редиректа.
+    # POST не повторяем, чтобы миграция/загрузка не выполнилась дважды.
     try:
-        r = requests.post(endpoint, json=body, timeout=timeout)
+        r = requests.post(
+            endpoint,
+            json=body,
+            timeout=timeout,
+            allow_redirects=False,
+        )
     except Exception as e:
         raise RuntimeError(f"Не удалось обратиться к Google Drive Web App: {e}")
+
+    if r.status_code in (301, 302, 303, 307, 308):
+        location = r.headers.get("Location") or r.headers.get("location")
+        if not location:
+            raise RuntimeError(
+                f"Google Web App вернул HTTP {r.status_code}, но не передал Location."
+            )
+
+        last_status = None
+        last_text = ""
+        for delay in (0, 1, 2, 3, 5):
+            if delay:
+                time.sleep(delay)
+            try:
+                rr = requests.get(location, timeout=min(timeout, 60))
+            except Exception as e:
+                last_text = str(e)
+                continue
+            last_status = rr.status_code
+            last_text = (rr.text or "").strip()
+            if rr.status_code == 200:
+                r = rr
+                break
+        else:
+            raise RuntimeError(
+                f"Google Web App вернул HTTP {last_status} при чтении ответа после POST. "
+                f"Последний ответ: {last_text[:500]}"
+            )
+
     if r.status_code != 200:
         txt = (r.text or "").strip()
         if r.status_code in (401, 403) or "accounts.google.com" in txt or "<html" in txt.lower():
@@ -2977,6 +3017,7 @@ def cloud_storage_request(endpoint, token, payload, timeout=180):
                 "Проверьте доступ Web App: запуск от имени владельца и доступ без обязательного входа Google."
             )
         raise RuntimeError(f"Google Drive Web App HTTP {r.status_code}: {txt[:500]}")
+
     try:
         data = r.json()
     except Exception:
@@ -3115,7 +3156,7 @@ def migrate_legacy_file_for_section(src, dst, filename, res):
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("FE-RUS SEO Manager v1.23.4")
+        self.title("FE-RUS SEO Manager v1.23.5")
         self.geometry("1280x860")
         self.q = queue.Queue()
         self.res = None
