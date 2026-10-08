@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-FE-RUS SEO Manager v1.23.5
+FE-RUS SEO Manager v1.23.6
 
 Единое Windows-приложение:
 1. Категория - получает category_id, OCFilter options и значения.
@@ -3156,7 +3156,7 @@ def migrate_legacy_file_for_section(src, dst, filename, res):
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("FE-RUS SEO Manager v1.23.5")
+        self.title("FE-RUS SEO Manager v1.23.6")
         self.geometry("1280x860")
         self.q = queue.Queue()
         self.res = None
@@ -3757,10 +3757,16 @@ class App(tk.Tk):
         if not section_name:
             return
         local_dir=cloud_cache_dir(self.cloud_section_id) if self.cloud_section_id else Path(self.folder.get() or os.getcwd())
+        sync_errors=[]
         for filename in (filenames or CLOUD_SECTION_FILES):
             path=local_dir/filename
             if path.exists() and path.stat().st_size:
-                cloud_upload_section_file(endpoint,token,section_name,filename,path)
+                try:
+                    cloud_upload_section_file(endpoint,token,section_name,filename,path)
+                except Exception as e:
+                    sync_errors.append(f"{filename}: {e}")
+        if sync_errors:
+            raise RuntimeError("Синхронизация с Google Drive не выполнена для: " + " | ".join(sync_errors))
 
     def analyze_category(self):
         # Важно: пользователь мог снять характеристики и сразу нажать кнопку.
@@ -4358,9 +4364,19 @@ class App(tk.Tk):
                 "done_queries":safe_sorted_strings(done_queries),
                 "updated_at":time.strftime("%Y-%m-%d %H:%M:%S")
             },ensure_ascii=False,indent=2),encoding="utf-8")
-            self.cloud_push_current_files(["seo_top30_result.csv","seo_top30_progress.json","wordkeeper_error.log"])
+            try:
+                self.cloud_push_current_files(["seo_top30_result.csv","seo_top30_progress.json","wordkeeper_error.log"])
+                cloud_sync_error = ""
+            except Exception as e:
+                cloud_sync_error = str(e)
+
             if self.wk_stop_event.is_set():
-                self.q.put(("wkstop",{"path":out_path,"progress":progress_path,"done":len(set(keywords) & done),"total":len(keywords)}))
+                payload={"path":out_path,"progress":progress_path,"done":len(set(keywords) & done),"total":len(keywords)}
+                if cloud_sync_error:
+                    payload["cloud_sync_error"]=cloud_sync_error
+                self.q.put(("wkstop",payload))
+            elif cloud_sync_error:
+                self.q.put(("wkdoneclouderror",{"path":out_path,"error":cloud_sync_error}))
             else:
                 self.q.put(("wkdone",out_path))
         except Exception as e:
@@ -5324,6 +5340,16 @@ class App(tk.Tk):
                     p=x; self.topdf=pd.read_csv(p,encoding="utf-8-sig") if Path(p).exists() and Path(p).stat().st_size else pd.DataFrame(); self.wkstatus.config(text=f"Готово: {Path(p).name} | строк: {len(self.topdf)}"); self.wk_start_btn.config(state="normal"); self.wk_stop_btn.config(state="disabled"); self.wklog.insert("end",f"\nФайл TOP-30: {p}\n")
                 elif t=="wkstop":
                     p=x["path"]; self.topdf=pd.read_csv(p,encoding="utf-8-sig") if Path(p).exists() and Path(p).stat().st_size else pd.DataFrame(); self.wkstatus.config(text=f"ОСТАНОВЛЕНО: {len(self.topdf)} строк | {Path(p).name}"); self.wk_start_btn.config(state="normal"); self.wk_stop_btn.config(state="disabled"); self.wklog.insert("end",f"\nАНАЛИЗ ОСТАНОВЛЕН.\nTOP-30: {p}\nCheckpoint: {x['progress']}\nЗавершено запросов: {x['done']} из {x['total']}\nМожно нажать ПОЛУЧИТЬ TOP-30 снова - продолжит с последнего сохранённого запроса.\n")
+                    if x.get("cloud_sync_error"):
+                        self.wklog.insert("end",f"ОБЛАЧНАЯ СИНХРОНИЗАЦИЯ НЕ ВЫПОЛНЕНА: {x['cloud_sync_error']}\n")
+                    self.wklog.see("end")
+                elif t=="wkdoneclouderror":
+                    p=x["path"]
+                    self.topdf=pd.read_csv(p,encoding="utf-8-sig") if Path(p).exists() and Path(p).stat().st_size else pd.DataFrame()
+                    self.wkstatus.config(text=f"Готово локально: {len(self.topdf)} строк | облако не обновлено")
+                    self.wk_start_btn.config(state="normal"); self.wk_stop_btn.config(state="disabled")
+                    self.wklog.insert("end",f"\nTOP-30 СОХРАНЁН ЛОКАЛЬНО: {p}\nОШИБКА ОБЛАЧНОЙ СИНХРОНИЗАЦИИ: {x['error']}\n")
+                    self.wklog.see("end")
                 elif t=="wkerr":
                     self.wk_running=False; self.wk_start_btn.config(state="normal"); self.wk_stop_btn.config(state="disabled"); messagebox.showerror("WordKeeper",x)
                 elif t=="analysislog":
