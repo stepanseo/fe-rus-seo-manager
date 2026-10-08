@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-FE-RUS SEO Manager v1.21.8
+FE-RUS SEO Manager v1.22.0
 
 Единое Windows-приложение:
 1. Категория - получает category_id, OCFilter options и значения.
@@ -8,7 +8,7 @@ FE-RUS SEO Manager v1.21.8
 3. Анализ - классификация CREATE / SKIP / EXISTS и конкуренты; подтвержденный СМЕШАННЫЙ сразу попадает в CREATE.
 4. Проверка URL - проверка ожидаемых OCFilter URL до создания.
 5. OCFilter - реальный direct POST в штатный addPage, без Playwright.
-6. Экспорт - XLSX/CSV для внешней программы генерации контента (CSV: ; + UTF-8 BOM).
+6. Экспорт - XLSX/CSV и единый накопительный CSV в Google Drive.
 
 Важно:
 - "Показывать в ТОП меню" всегда отправляется как menu_status=0.
@@ -32,7 +32,7 @@ from urllib.parse import urlparse, urljoin, unquote_plus
 from collections import Counter
 
 import tkinter as tk
-from tkinter import ttk, filedialog, messagebox
+from tkinter import ttk, filedialog, messagebox, simpledialog
 
 import requests
 import pandas as pd
@@ -42,6 +42,11 @@ from openpyxl.styles import Font
 
 APP = "FE-RUS SEO Manager"
 BASE = "https://fe-rus.ru"
+GOOGLE_SHEET_ID = "1NbEr9ZDR5dmFa_8zayfSQtQ5VL1dLn2jSN0nNT1fkD8"
+# Единый облачный CSV в Google Drive. ID не меняется при обновлении содержимого файла.
+CLOUD_READY_FILE_ID = "1TDpnpSV1zWnEEuiOBdoN4GmxKqbk_NTd"
+CLOUD_READY_FILE_URL = "https://drive.google.com/file/d/1TDpnpSV1zWnEEuiOBdoN4GmxKqbk_NTd/view"
+# URL веб-приложения Google Apps Script задаётся пользователем при первом нажатии.
 ADMIN = BASE + "/admin/"
 LOGIN_WK = "https://word-keeper.ru/login"
 TOP30_WK = "https://word-keeper.ru/core/ajax_top30"
@@ -2687,6 +2692,97 @@ def generator_rows(res):
 
 
 
+
+def append_ready_links_google_sheet(res, endpoint, token, timeout=30):
+    """Добавляет готовые URL в общую Google Таблицу через Apps Script Web App."""
+    endpoint = str(endpoint or "").strip()
+    token = str(token or "").strip()
+    if not endpoint:
+        raise RuntimeError("Не задан URL Google Apps Script Web App.")
+    if not token:
+        raise RuntimeError("Не задан токен Google Sheets.")
+
+    parent_url = str(res.get("url", "") or "").strip().rstrip("/") + "/"
+    if not parent_url or parent_url == "/":
+        raise RuntimeError("Не определена ссылка родительского раздела.")
+
+    ready = generator_rows(res)
+    if not ready:
+        raise RuntimeError("Нет готовых ссылок для записи. Нужны CREATE + URL/OCFilter READY.")
+
+    rows = []
+    seen = set()
+    for row in ready:
+        target = str(row.get("target_url", "") or "").strip()
+        if not target:
+            continue
+        key = (target.rstrip("/") + "/", parent_url)
+        if key not in seen:
+            seen.add(key)
+            rows.append({"url": key[0], "parent_url": key[1]})
+
+    if not rows:
+        raise RuntimeError("В текущем разделе нет готовых URL для записи.")
+
+    payload = {
+        "token": token,
+        "sheet_id": GOOGLE_SHEET_ID,
+        "rows": rows,
+    }
+    try:
+        r = requests.post(endpoint, json=payload, timeout=timeout)
+    except Exception as e:
+        raise RuntimeError(f"Не удалось обратиться к Google Sheets: {e}")
+
+    if r.status_code != 200:
+        raise RuntimeError(f"Google Sheets вернул HTTP {r.status_code}: {r.text[:500]}")
+    try:
+        data = r.json()
+    except Exception:
+        raise RuntimeError(f"Google Apps Script вернул не-JSON ответ: {r.text[:500]}")
+    if not data.get("ok"):
+        raise RuntimeError(str(data.get("error") or "Google Sheets: неизвестная ошибка"))
+    return int(data.get("added", 0)), int(data.get("total", 0)), data
+
+def sync_ready_links_cloud(csv_path, endpoint, token, timeout=60):
+    """Синхронизирует локальный накопительный CSV с единым CSV в Google Drive.
+
+    Web App на стороне Google принимает полный локальный CSV и объединяет его
+    с текущей версией облачного файла, поэтому параллельная работа нескольких
+    компьютеров не затирает уже записанные строки.
+    """
+    csv_path = Path(csv_path)
+    endpoint = str(endpoint or "").strip()
+    token = str(token or "").strip()
+    if not csv_path.exists():
+        raise RuntimeError("Локальный файл готовых ссылок не найден.")
+    if not endpoint:
+        raise RuntimeError("Не задан URL Google Apps Script Web App.")
+    if not token:
+        raise RuntimeError("Не задан токен облачного файла.")
+
+    csv_text = csv_path.read_text(encoding="utf-8-sig")
+    payload = {
+        "token": token,
+        "file_id": CLOUD_READY_FILE_ID,
+        "filename": csv_path.name,
+        "csv": csv_text,
+    }
+    try:
+        r = requests.post(endpoint, json=payload, timeout=timeout)
+    except Exception as e:
+        raise RuntimeError(f"Не удалось отправить файл в Google Drive: {e}")
+    if r.status_code != 200:
+        raise RuntimeError(f"Google Drive Web App вернул HTTP {r.status_code}: {r.text[:500]}")
+    try:
+        data = r.json()
+    except Exception:
+        raise RuntimeError(f"Google Drive Web App вернул не-JSON ответ: {r.text[:500]}")
+    if not data.get("ok"):
+        raise RuntimeError(str(data.get("error") or "Google Drive: неизвестная ошибка"))
+    return int(data.get("added", 0)), int(data.get("total", 0)), data
+
+
 def append_ready_links_file(res, path):
     """Добавляет готовые к созданию SEO-URL в единый двухколоночный файл."""
     path = Path(path)
@@ -2826,7 +2922,7 @@ def export_excel(res, path, topdf=None):
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("FE-RUS SEO Manager v1.21.7")
+        self.title("FE-RUS SEO Manager v1.22.0")
         self.geometry("1280x860")
         self.q = queue.Queue()
         self.res = None
@@ -2958,6 +3054,8 @@ class App(tk.Tk):
         ttk.Label(f,text="Финальный экспорт для внешней программы генерации контента").pack(anchor="w",padx=10,pady=12)
         ttk.Button(f,text="СОХРАНИТЬ CSV ДЛЯ ГЕНЕРАТОРА",command=self.export_generator).pack(anchor="w",padx=10,pady=4)
         ttk.Button(f,text="ЗАПИСАТЬ ДАННЫЕ В ФАЙЛ",command=self.append_ready_links).pack(anchor="w",padx=10,pady=4)
+        ttk.Button(f,text="ОТКРЫТЬ ОБЛАЧНЫЙ ФАЙЛ",command=self.open_cloud_file).pack(anchor="w",padx=10,pady=4)
+        ttk.Label(f,text="Кнопка сохраняет накопительный CSV на компьютере и автоматически синхронизирует его с единым CSV в Google Drive.").pack(anchor="w",padx=10,pady=2)
         ttk.Button(f,text="ЭКСПОРТИРОВАТЬ ПОЛНЫЙ XLSX",command=self.export).pack(anchor="w",padx=10,pady=4)
         ttk.Label(f,text="CSV содержит только готовые SEO/filter-страницы: promotion_type=SEO-СТРАНИЦА или СМЕШАННЫЙ + status=CREATE + URL/OCFilter=READY. target_url - будущий SEO URL, filter_result_url - старый URL фильтрации.").pack(anchor="w",padx=10,pady=8)
         self.export_log=tk.Text(f,font=("Consolas",10),height=24)
@@ -4260,8 +4358,11 @@ class App(tk.Tk):
         self.clipboard_append(value)
         self.update()
 
+    def open_cloud_file(self):
+        webbrowser.open(CLOUD_READY_FILE_URL)
+
     def append_ready_links(self):
-        """Записывает готовые к созданию ссылки в единый накопительный файл."""
+        """Сохраняет готовые ссылки локально и синхронизирует общий CSV в Google Drive."""
         if not self.res:
             messagebox.showwarning("Нет данных", "Сначала выполните анализ.")
             return
@@ -4273,7 +4374,7 @@ class App(tk.Tk):
 
         if path is None:
             chosen = filedialog.asksaveasfilename(
-                title="Выберите единый файл готовых ссылок",
+                title="Выберите локальный накопительный файл готовых ссылок",
                 defaultextension=".csv",
                 initialfile="seo_create_links.csv",
                 filetypes=[("CSV", "*.csv"), ("Все файлы", "*.*")]
@@ -4282,23 +4383,111 @@ class App(tk.Tk):
                 return
             path = Path(chosen)
             cfg["ready_links_file"] = str(path)
-            save_cfg(cfg)
 
         try:
             added, total, saved = append_ready_links_file(self.res, path)
+
+            endpoint = str(cfg.get("cloud_csv_webapp_url", "") or "").strip()
+            token = str(cfg.get("cloud_csv_token", "") or "").strip()
+
+            if not endpoint:
+                endpoint = simpledialog.askstring(
+                    "Облачный CSV",
+                    "Введите URL Google Apps Script Web App (заканчивается на /exec):",
+                    parent=self.root,
+                ) or ""
+                endpoint = endpoint.strip()
+                if not endpoint:
+                    return
+                cfg["cloud_csv_webapp_url"] = endpoint
+
+            if not token:
+                token = simpledialog.askstring(
+                    "Облачный CSV",
+                    "Введите токен доступа к облачному CSV:",
+                    show="*",
+                    parent=self.root,
+                ) or ""
+                token = token.strip()
+                if not token:
+                    return
+                cfg["cloud_csv_token"] = token
+
+            cfg["cloud_csv_file_id"] = CLOUD_READY_FILE_ID
+            save_cfg(cfg)
+            self.cfg = cfg
+
+            cloud_added, cloud_total, _ = sync_ready_links_cloud(path, endpoint, token)
+
             self.export_log.insert(
                 "end",
-                f"\nЗапись готовых ссылок: добавлено {added} | всего в файле {total}\n"
+                f"\nГотовые ссылки: добавлено локально {added} | локально всего {total}\n"
+                f"Облако Google Drive: добавлено/объединено {cloud_added} | всего в облаке {cloud_total}\n"
                 f"Файл: {saved}\n"
             )
             self.export_log.see("end")
             messagebox.showinfo(
                 "Готово",
-                f"Новых ссылок записано: {added}\n"
-                f"Всего строк в файле: {total}\n\n{saved}"
+                f"Локально добавлено: {added}\n"
+                f"Локально всего: {total}\n\n"
+                f"В Google Drive добавлено новых: {cloud_added}\n"
+                f"Всего в облачном файле: {cloud_total}"
             )
         except Exception as e:
             messagebox.showerror("Запись данных", str(e))
+
+    def append_ready_links_google(self):
+        """Записывает готовые ссылки в общую Google Таблицу."""
+        if not self.res:
+            messagebox.showwarning("Нет данных", "Сначала выполните анализ.")
+            return
+        self._apply_ocfilter_audit()
+
+        cfg = load_cfg()
+        endpoint = str(cfg.get("google_sheet_webapp_url", "") or "").strip()
+        token = str(cfg.get("google_sheet_token", "") or "").strip()
+
+        if not endpoint:
+            endpoint = simpledialog.askstring(
+                "Google Sheets",
+                "Введите URL веб-приложения Google Apps Script (заканчивается на /exec):",
+                parent=self.root,
+            ) or ""
+            endpoint = endpoint.strip()
+            if not endpoint:
+                return
+            cfg["google_sheet_webapp_url"] = endpoint
+
+        if not token:
+            token = simpledialog.askstring(
+                "Google Sheets",
+                "Введите токен доступа к таблице:",
+                show="*",
+                parent=self.root,
+            ) or ""
+            token = token.strip()
+            if not token:
+                return
+            cfg["google_sheet_token"] = token
+
+        cfg["google_sheet_id"] = GOOGLE_SHEET_ID
+        save_cfg(cfg)
+
+        try:
+            added, total, data = append_ready_links_google_sheet(self.res, endpoint, token)
+            self.export_log.insert(
+                "end",
+                f"\nGoogle Sheets: добавлено {added} | всего строк в общей таблице {total}\n"
+                f"Таблица: https://docs.google.com/spreadsheets/d/{GOOGLE_SHEET_ID}/edit\n"
+            )
+            self.export_log.see("end")
+            messagebox.showinfo(
+                "Google Sheets",
+                f"Новых ссылок записано: {added}\n"
+                f"Всего строк в общей таблице: {total}"
+            )
+        except Exception as e:
+            messagebox.showerror("Google Sheets", str(e))
 
     def export_generator(self):
         if not self.res:
