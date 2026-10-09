@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-FE-RUS SEO Manager v1.25.1
+FE-RUS SEO Manager v1.25.3
 
 Единое Windows-приложение:
 1. Категория - получает category_id, OCFilter options и значения.
@@ -3472,7 +3472,7 @@ def migrate_legacy_file_for_section(src, dst, filename, res):
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("FE-RUS SEO Manager v1.25.1")
+        self.title("FE-RUS SEO Manager v1.25.3")
         self.geometry("1280x860")
         self.q = queue.Queue()
         self.res = None
@@ -4428,6 +4428,13 @@ class App(tk.Tk):
         raise RuntimeError(f"Не удалось прочитать CSV: {last}")
 
     def worker_migrate_old_top30(self, old_path):
+        """Быстрая миграция старого TOP-30 по уже созданным облачным разделам.
+
+        В v1.25.1 сопоставление делалось Python-циклом по каждой строке и каждому
+        разделу. Для большого файла (200k+ строк) это могло занимать десятки минут
+        без единого сообщения в UI. Здесь нормализация и основные проверки делаются
+        векторно через pandas, а в лог выводится прогресс.
+        """
         try:
             cfg=load_cfg()
             endpoint=str(cfg.get("cloud_csv_webapp_url","") or "").strip()
@@ -4436,10 +4443,6 @@ class App(tk.Tk):
                 raise RuntimeError("Не настроен Google Drive Web App.")
 
             raw_sections=cloud_list_sections(endpoint,token,timeout=180)
-
-            # Web App обычно возвращает объекты {id,name,url}, но старые
-            # развертывания могли вернуть просто список имён. Поддерживаем оба
-            # формата, чтобы миграция не зависела от версии Apps Script.
             sections=[]
             for item in (raw_sections or []):
                 if isinstance(item,dict):
@@ -4451,14 +4454,10 @@ class App(tk.Tk):
                     name=str(item or "").strip()
                     url=""
                 clean=self._migration_section_clean_name(name)
-                # 00_ОБЩИЕ / ОБЩИЕ не участвует в миграции TOP-30.
                 if not clean or norm(clean)==norm("ОБЩИЕ"):
                     continue
                 sections.append({"id":sid,"name":name,"url":url})
 
-            # Диагностика: если список пуст, сразу показываем, что именно
-            # вернул Web App. Это намного полезнее, чем молча считать, что
-            # папок нет.
             self.q.put(("wkmigratelog",f"Ответ Web App: list_sections={len(raw_sections or [])}"))
             if raw_sections:
                 sample=[]
@@ -4476,10 +4475,6 @@ class App(tk.Tk):
                     "action=list_sections должен возвращать дочерние папки корня."
                 )
 
-            # Если старый Web App вернул только имена без ID, безопасно
-            # резолвим ID через ensure_structure. Для текущего Apps Script
-            # этот блок обычно не выполняется, но позволяет работать со
-            # старыми форматами ответа.
             resolved_sections=[]
             for item in sections:
                 sid=str(item.get("id") or "").strip()
@@ -4502,97 +4497,107 @@ class App(tk.Tk):
             total=len(df)
             if total==0:
                 raise RuntimeError("Старый seo_top30_result.csv пуст.")
-
             self.q.put(("wkmigratelog",f"Строк в старом TOP-30: {total}"))
             self.q.put(("wkmigratelog",f"Облачных разделов найдено: {len(sections)}"))
+            self.q.put(("wkmigratelog","Оптимизированное сопоставление 200k+ строк..."))
+
+            # Нормализуем source_query один раз. Если он пустой — используем keyword.
+            raw_q=df.get("source_query",pd.Series("",index=df.index)).fillna("").astype(str).str.strip()
+            raw_kw=df.get("keyword",pd.Series("",index=df.index)).fillna("").astype(str).str.strip()
+            raw_q=raw_q.where(raw_q.ne(""),raw_kw)
+            qnorm=raw_q.map(self._migration_phrase)
+
+            # Для каждого раздела строим только векторные маски. Это на порядки
+            # быстрее старого двойного Python-цикла.
+            best_score=pd.Series(0,index=df.index,dtype="int64")
+            best_sid=pd.Series("",index=df.index,dtype="object")
+            best_name=pd.Series("",index=df.index,dtype="object")
+            tie=pd.Series(False,index=df.index,dtype="bool")
+
+            prepared=[]
+            for item in sections:
+                sid=str(item.get("id") or "")
+                name=str(item.get("name") or "")
+                clean=self._migration_phrase(self._migration_section_clean_name(name))
+                if not clean:
+                    continue
+                tokens=[x for x in clean.split() if len(x)>=3]
+                prepared.append((sid,name,clean,tokens))
+
+            for si,(sid,name,s,tokens) in enumerate(prepared,1):
+                score=pd.Series(0,index=df.index,dtype="int64")
+                exact=qnorm.eq(s)
+                prefix=qnorm.str.startswith(s+" ")
+                # Фраза внутри запроса. qnorm уже нормализован, поэтому regex безопасен.
+                phrase=qnorm.str.contains(r"(?:^|\s)"+re.escape(s)+r"(?:$|\s)",regex=True,na=False)
+                score=score.mask(exact,100000000+len(s)*100+len(tokens))
+                score=score.mask(~exact & prefix,90000000+len(s)*100+len(tokens))
+                score=score.mask(~exact & ~prefix & phrase,80000000+len(s)*100+len(tokens))
+
+                # Fallback: все содержательные слова раздела присутствуют в запросе.
+                # Используем один regex с lookahead вместо Python-цикла по строкам.
+                if len(tokens)>=2:
+                    look="".join(r"(?=.*(?:^|\s)"+re.escape(t)+r"(?:$|\s))" for t in tokens)
+                    all_tokens=qnorm.str.contains("^"+look+".*$",regex=True,na=False)
+                    score=score.mask((score.eq(0)) & all_tokens,70000000+len(tokens)*100+len(s))
+
+                better=score.gt(best_score)
+                equal=score.gt(0) & score.eq(best_score)
+                tie=tie.mask(better,False)
+                tie=tie | equal
+                best_score=best_score.mask(better,score)
+                best_sid=best_sid.mask(better,sid)
+                best_name=best_name.mask(better,name)
+
+                if si==len(prepared) or si%5==0:
+                    self.q.put(("wkmigratelog",f"Сопоставление разделов: {si}/{len(prepared)}"))
+
+            # Собираем группы индексов и отчёт. В tie входят и строки, где два
+            # раздела имеют одинаковый максимальный score; такие строки не угадываем.
+            matched_mask=best_score.gt(0) & ~tie
+            ambiguous_mask=best_score.gt(0) & tie
+            no_match_mask=best_score.eq(0)
 
             groups={str(x.get("id")): [] for x in sections}
             section_meta={str(x.get("id")): x for x in sections}
-            unmatched=[]
-            ambiguous=[]
-
-            # Индекс названий разделов.
-            prepared=[]
-            for s in sections:
-                sid=str(s.get("id") or "")
-                name=str(s.get("name") or "")
-                prepared.append((sid,name))
-
-            for idx,row in df.iterrows():
-                query=str(row.get("source_query","") or "").strip()
-                # В старом CSV встречаются технические пустые строки в начале.
-                # Если source_query пустой, пробуем keyword как резервный источник.
-                if not query:
-                    query=str(row.get("keyword","") or "").strip()
-                if not query:
-                    unmatched.append(idx)
-                    continue
-                scores=[]
-                for sid,name in prepared:
-                    score=self._migration_score(name,query)
-                    if score>0:
-                        scores.append((score,sid,name))
-
-                if not scores:
-                    unmatched.append(idx)
-                    continue
-
-                scores.sort(reverse=True,key=lambda x:(x[0],len(self._migration_section_clean_name(x[2]))))
-                best=scores[0]
-
-                # Если два разных раздела получили одинаково сильное совпадение,
-                # не угадываем — отправляем строку в отчёт.
-                if len(scores)>1 and scores[1][0]==best[0]:
-                    ambiguous.append((idx,query,best[2],scores[1][2]))
-                    unmatched.append(idx)
-                    continue
-
-                groups[best[1]].append(idx)
+            for sid in groups:
+                idxs=df.index[matched_mask & best_sid.eq(sid)].tolist()
+                groups[sid]=idxs
 
             report_rows=[]
-            for idx,query,best,second in ambiguous:
+            for idx in df.index[ambiguous_mask]:
+                q=str(raw_q.loc[idx] or "")
                 report_rows.append({
-                    "row":int(idx)+2,
-                    "source_query":query,
+                    "row":int(df.index.get_loc(idx))+2,
+                    "source_query":q,
                     "reason":"AMBIGUOUS",
-                    "candidate_1":best,
-                    "candidate_2":second,
+                    "candidate_1":str(best_name.loc[idx] or ""),
+                    "candidate_2":"одинаковый максимальный score",
                 })
-            for idx in unmatched:
-                if not any(int(x["row"])-2==int(idx) for x in report_rows):
-                    report_rows.append({
-                        "row":int(idx)+2,
-                        "source_query":str(df.iloc[idx].get("source_query","") or ""),
-                        "reason":"NO_MATCH",
-                        "candidate_1":"",
-                        "candidate_2":"",
-                    })
+            for idx in df.index[no_match_mask]:
+                report_rows.append({
+                    "row":int(df.index.get_loc(idx))+2,
+                    "source_query":str(raw_q.loc[idx] or ""),
+                    "reason":"NO_MATCH",
+                    "candidate_1":"",
+                    "candidate_2":"",
+                })
 
             uploaded=0
             uploaded_rows=0
-
-            for n,(sid,meta) in enumerate(section_meta.items(),start=1):
-                idxs=groups.get(sid,[])
-                if not idxs:
-                    continue
-
+            nonempty=[(sid,meta,groups.get(sid,[])) for sid,meta in section_meta.items() if groups.get(sid)]
+            for n,(sid,meta,idxs) in enumerate(nonempty,start=1):
                 section_name=str(meta.get("name") or "").strip()
-                self.q.put(("wkmigratelog",f"[{n}/{len(section_meta)}] {section_name}: найдено строк {len(idxs)}"))
-
-                # Для миграции старый master-CSV является источником истины.
-                # Не скачиваем существующий облачный TOP-30: большой файл может давать
-                # 404/таймаут на стороне Web App. Перед заменой Web App делает резервную копию.
+                self.q.put(("wkmigratelog",f"[{n}/{len(nonempty)}] {section_name}: найдено строк {len(idxs)}"))
                 local_dir=cloud_cache_dir(sid)
                 local_dir.mkdir(parents=True,exist_ok=True)
                 local_path=local_dir/"seo_top30_result.csv"
-
                 new_df=df.loc[idxs].copy()
                 new_df.to_csv(local_path,index=False,encoding="utf-8-sig")
                 cloud_upload_section_file(
                     endpoint,token,section_name,"seo_top30_result.csv",
                     local_path,timeout=600,backup=True
                 )
-
                 uploaded+=1
                 uploaded_rows+=len(idxs)
 
@@ -4606,11 +4611,11 @@ class App(tk.Tk):
                     try: report_path.unlink()
                     except Exception: pass
 
-            matched=total-len(unmatched)
+            matched=int(matched_mask.sum())
             self.q.put(("wkmigratedone",{
                 "total":total,
                 "matched":matched,
-                "unmatched":len(unmatched),
+                "unmatched":int(no_match_mask.sum()+ambiguous_mask.sum()),
                 "sections":uploaded,
                 "uploaded_rows":uploaded_rows,
                 "report":str(report_path) if report_rows else "",
