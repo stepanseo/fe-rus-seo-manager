@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-FE-RUS SEO Manager v1.25.3
+FE-RUS SEO Manager v1.26.0
 
 Единое Windows-приложение:
 1. Категория - получает category_id, OCFilter options и значения.
@@ -8,7 +8,7 @@ FE-RUS SEO Manager v1.25.3
 3. Анализ - классификация CREATE / SKIP / EXISTS и конкуренты; подтвержденный СМЕШАННЫЙ сразу попадает в CREATE.
 4. Проверка URL - проверка ожидаемых OCFilter URL до создания.
 5. OCFilter - реальный direct POST в штатный addPage, без Playwright.
-6. Экспорт - XLSX/CSV и единый накопительный CSV в Google Drive.
+6. Экспорт - XLSX/CSV, единый накопительный CSV и общий реестр разделов в Google Sheets.
 
 Важно:
 - "Показывать в ТОП меню" всегда отправляется как menu_status=0.
@@ -45,6 +45,7 @@ from openpyxl.styles import Font
 APP = "FE-RUS SEO Manager"
 BASE = "https://fe-rus.ru"
 GOOGLE_SHEET_ID = "1NbEr9ZDR5dmFa_8zayfSQtQ5VL1dLn2jSN0nNT1fkD8"
+GOOGLE_STATUS_SHEET_NAME = "РАЗДЕЛЫ"
 # Единый облачный CSV в Google Drive. ID не меняется при обновлении содержимого файла.
 CLOUD_READY_FILE_ID = "1YcEPhor7Up_5Wt2wCni86irElRqqkc0Y"
 CLOUD_READY_FILE_URL = "https://drive.google.com/file/d/1YcEPhor7Up_5Wt2wCni86irElRqqkc0Y/view"
@@ -3023,6 +3024,38 @@ def append_ready_links_google_sheet(res, endpoint, token, timeout=30):
         raise RuntimeError(str(data.get("error") or "Google Sheets: неизвестная ошибка"))
     return int(data.get("added", 0)), int(data.get("total", 0)), data
 
+def update_section_status_google_sheet(status_row, endpoint, token, timeout=30):
+    """Создаёт/обновляет одну строку статуса родительского раздела в листе РАЗДЕЛЫ."""
+    endpoint = str(endpoint or "").strip()
+    token = str(token or "").strip()
+    if not endpoint:
+        raise RuntimeError("Не задан URL Google Apps Script Web App для Google Sheets.")
+    if not token:
+        raise RuntimeError("Не задан токен Google Sheets.")
+
+    payload = {
+        "action": "upsert_section_status",
+        "sheet_id": GOOGLE_SHEET_ID,
+        "sheet_name": GOOGLE_STATUS_SHEET_NAME,
+        "token": token,
+        "row": dict(status_row or {}),
+    }
+    try:
+        r = requests.post(endpoint, json=payload, timeout=timeout)
+    except Exception as e:
+        raise RuntimeError(f"Не удалось обновить статус раздела в Google Sheets: {e}")
+
+    if r.status_code != 200:
+        raise RuntimeError(f"Google Sheets вернул HTTP {r.status_code}: {r.text[:500]}")
+    try:
+        data = r.json()
+    except Exception:
+        raise RuntimeError(f"Google Apps Script вернул не-JSON ответ: {r.text[:500]}")
+    if not data.get("ok"):
+        raise RuntimeError(str(data.get("error") or "Google Sheets: неизвестная ошибка"))
+    return data
+
+
 def sync_ready_links_cloud(csv_path, endpoint, token, timeout=60):
     """Синхронизирует локальный накопительный CSV с единым CSV в Google Drive.
 
@@ -3472,7 +3505,7 @@ def migrate_legacy_file_for_section(src, dst, filename, res):
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("FE-RUS SEO Manager v1.25.3")
+        self.title("FE-RUS SEO Manager v1.26.0")
         self.geometry("1280x860")
         self.q = queue.Queue()
         self.res = None
@@ -3623,6 +3656,7 @@ class App(tk.Tk):
         ttk.Button(f,text="СОХРАНИТЬ CSV ДЛЯ ГЕНЕРАТОРА",command=self.export_generator).pack(anchor="w",padx=10,pady=4)
         ttk.Button(f,text="ЗАПИСАТЬ ДАННЫЕ В ФАЙЛ + ОБЛАКО",command=self.append_ready_links).pack(anchor="w",padx=10,pady=4)
         ttk.Button(f,text="НАСТРОИТЬ ОБЛАКО",command=self.configure_cloud).pack(anchor="w",padx=10,pady=4)
+        ttk.Button(f,text="ОБНОВИТЬ СТАТУС РАЗДЕЛА В GOOGLE SHEETS",command=self.update_section_status_now).pack(anchor="w",padx=10,pady=4)
         ttk.Button(f,text="ОТКРЫТЬ ОБЛАЧНЫЙ ФАЙЛ",command=self.open_cloud_file).pack(anchor="w",padx=10,pady=4)
         ttk.Label(f,text="Кнопка сохраняет накопительный CSV на компьютере и автоматически синхронизирует его с единым CSV в Google Drive.").pack(anchor="w",padx=10,pady=2)
         ttk.Button(f,text="ЭКСПОРТИРОВАТЬ ПОЛНЫЙ XLSX",command=self.export).pack(anchor="w",padx=10,pady=4)
@@ -5756,6 +5790,7 @@ class App(tk.Tk):
                 f"Облачный файл: {CLOUD_READY_FILE_URL}\n"
             )
             self.export_log.see("end")
+            self._update_section_status_async()
             messagebox.showinfo(
                 "Готово",
                 f"Локально добавлено: {added}\n"
@@ -5823,6 +5858,208 @@ class App(tk.Tk):
         except Exception as e:
             messagebox.showerror("Google Sheets", str(e))
 
+    def _build_section_status_row(
+        self,
+        stage="",
+        top30_values_done=None,
+        top30_values_total=None,
+        top30_queries_done=None,
+        top30_queries_total=None,
+        top30_rows=None,
+    ):
+        """Формирует одну строку для общего реестра РАЗДЕЛЫ."""
+        res = dict(self.res or {})
+        rows = list(res.get("rows") or [])
+        category_url = str(res.get("url", "") or "").strip()
+        category_name = str(
+            res.get("search_category")
+            or res.get("category")
+            or self.cloud_section_name
+            or ""
+        ).strip()
+        category_id = str(res.get("category_id", "") or "").strip()
+
+        # TOP-30.
+        if top30_rows is None:
+            try:
+                top30_rows = int(len(self.topdf)) if self.topdf is not None and not self.topdf.empty else 0
+            except Exception:
+                top30_rows = 0
+
+        unique_top30_urls = 0
+        try:
+            if self.topdf is not None and not self.topdf.empty:
+                uc = find_col(self.topdf, ["url", "link", "href"])
+                if uc:
+                    unique_top30_urls = int(
+                        self.topdf[uc].astype(str).str.strip().str.rstrip("/").replace("", pd.NA).dropna().nunique()
+                    )
+        except Exception:
+            unique_top30_urls = 0
+
+        # CREATE / SKIP / EXISTS после анализа.
+        create_count = sum(1 for x in rows if str(x.get("status", "")) == "CREATE")
+        skip_count = sum(1 for x in rows if str(x.get("status", "")) == "SKIP")
+        exists_count = sum(1 for x in rows if str(x.get("status", "")) == "EXISTS")
+
+        # URL audit.
+        url_checked = sum(
+            1 for x in rows
+            if str(x.get("verification_state", "")).strip() == "VERIFIED"
+        )
+        url_errors = sum(
+            1 for x in rows
+            if str(x.get("url_status", "")).strip() == "ERROR"
+            or str(x.get("verification_state", "")).strip() == "ERROR"
+        )
+        url_total = create_count
+
+        # OCFilter.
+        create_rows = [x for x in rows if str(x.get("status", "")) == "CREATE"]
+        oc_checked = sum(
+            1 for x in create_rows
+            if str(x.get("oc_status", "")).strip()
+        )
+        oc_errors = sum(
+            1 for x in create_rows
+            if str(x.get("oc_status", "")).strip().upper() == "ERROR"
+        )
+        oc_total = len(create_rows)
+
+        # Финальные уникальные страницы.
+        try:
+            ready_rows = generator_rows(res)
+            ready_urls = {
+                str(x.get("target_url", "") or "").strip().rstrip("/")
+                for x in ready_rows
+                if str(x.get("target_url", "") or "").strip()
+            }
+            ready_count = len(ready_urls)
+        except Exception:
+            ready_count = 0
+
+        # Если этап не передан явно, определяем его по текущим данным.
+        status = str(stage or "").strip()
+        if not status:
+            if ready_count:
+                status = "ГОТОВ"
+            elif oc_total and oc_checked >= oc_total:
+                status = "OCFILTER ПРОВЕРЕН"
+            elif url_total and url_checked >= url_total:
+                status = "URL ПРОВЕРЕН"
+            elif create_count or skip_count or exists_count:
+                status = "АНАЛИЗ ГОТОВ"
+            elif top30_values_total and top30_values_done is not None and top30_values_done >= top30_values_total:
+                status = "TOP-30 ГОТОВ"
+            elif top30_rows:
+                status = "TOP-30 ЗАГРУЖЕН"
+            else:
+                status = "КАТЕГОРИЯ ПОДКЛЮЧЕНА"
+
+        return {
+            "section_name": category_name,
+            "category_url": category_url,
+            "category_id": category_id,
+            "values_total": len(rows),
+            "top30_values_done": "" if top30_values_done is None else int(top30_values_done),
+            "top30_values_total": "" if top30_values_total is None else int(top30_values_total),
+            "top30_queries_done": "" if top30_queries_done is None else int(top30_queries_done),
+            "top30_queries_total": "" if top30_queries_total is None else int(top30_queries_total),
+            "top30_rows": int(top30_rows or 0),
+            "unique_top30_urls": int(unique_top30_urls or 0),
+            "analysis_create": int(create_count),
+            "analysis_skip": int(skip_count),
+            "analysis_exists": int(exists_count),
+            "url_checked": int(url_checked),
+            "url_total": int(url_total),
+            "url_errors": int(url_errors),
+            "ocfilter_checked": int(oc_checked),
+            "ocfilter_total": int(oc_total),
+            "ocfilter_errors": int(oc_errors),
+            "ready_pages": int(ready_count),
+            "status": status,
+            "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "app_version": "1.26.0",
+        }
+
+    def _update_section_status_async(self, stage="", **kwargs):
+        """Обновляет общий реестр без блокировки интерфейса. Ошибка статуса не ломает основной процесс."""
+        try:
+            res_snapshot = self.res
+            topdf_snapshot = self.topdf
+            if not res_snapshot:
+                return
+            cfg = load_cfg()
+            endpoint = str(cfg.get("google_sheet_webapp_url", "") or "").strip()
+            token = str(cfg.get("google_sheet_token", "") or "").strip()
+            if not endpoint or not token:
+                return
+
+            # Снимки, чтобы фоновый поток не зависел от дальнейших изменений Tk/объектов.
+            saved_res = json.loads(json.dumps(res_snapshot, ensure_ascii=False, default=str))
+            saved_topdf = None
+            if topdf_snapshot is not None and not topdf_snapshot.empty:
+                saved_topdf = topdf_snapshot.copy()
+
+            def worker():
+                try:
+                    class Snapshot:
+                        pass
+                    snap = Snapshot()
+                    snap.res = saved_res
+                    snap.topdf = saved_topdf
+                    snap.cloud_section_name = getattr(self, "cloud_section_name", "")
+                    # Используем метод через временную привязку без изменения UI.
+                    row = App._build_section_status_row(
+                        snap,
+                        stage=stage,
+                        **kwargs,
+                    )
+                    update_section_status_google_sheet(row, endpoint, token, timeout=60)
+                except Exception as e:
+                    try:
+                        self.q.put(("sectionstatuslog", f"Google Sheets: статус раздела не обновлён: {e}"))
+                    except Exception:
+                        pass
+
+            threading.Thread(target=worker, daemon=True).start()
+        except Exception:
+            pass
+
+    def update_section_status_now(self):
+        """Ручное обновление статуса текущего раздела."""
+        if not self.res:
+            messagebox.showwarning("Статус раздела", "Сначала получите категорию.")
+            return
+        cfg = load_cfg()
+        endpoint = str(cfg.get("google_sheet_webapp_url", "") or "").strip()
+        token = str(cfg.get("google_sheet_token", "") or "").strip()
+        if not endpoint or not token:
+            messagebox.showwarning(
+                "Статус раздела",
+                "Сначала один раз настройте Google Sheets через кнопку записи готовых ссылок."
+            )
+            return
+        try:
+            row = self._build_section_status_row()
+            data = update_section_status_google_sheet(row, endpoint, token, timeout=60)
+            self.export_log.insert(
+                "end",
+                f"\nСтатус раздела обновлён: {row['section_name']} | "
+                f"статус={row['status']} | готовых страниц={row['ready_pages']}\n"
+            )
+            self.export_log.see("end")
+            messagebox.showinfo(
+                "Статус раздела",
+                f"Раздел: {row['section_name']}\n"
+                f"Статус: {row['status']}\n"
+                f"Готовых страниц: {row['ready_pages']}\n"
+                f"Всего строк в реестре: {data.get('total', '')}"
+            )
+        except Exception as e:
+            messagebox.showerror("Статус раздела", str(e))
+
+
     def export_generator(self):
         if not self.res:
             messagebox.showwarning("Нет данных","Сначала выполните анализ категории.")
@@ -5853,6 +6090,9 @@ class App(tk.Tk):
             while True:
                 t,x=self.q.get_nowait()
                 if t=="log":self.logtext.insert("end",str(x)+"\n");self.logtext.see("end")
+                elif t=="sectionstatuslog":
+                    self.export_log.insert("end",str(x)+"\n")
+                    self.export_log.see("end")
                 elif t=="cat":
                     self.res=x
                     self.render_filter_checkboxes(x.get("options", []))
@@ -5883,6 +6123,7 @@ class App(tk.Tk):
                     if hasattr(self,"cloud_status"): self.cloud_status.config(text=f"Облако: {x.get('section','готово')}")
                     self.logtext.insert("end",f"Google Drive: раздел синхронизирован. Кэш: {x.get('folder','')}\n")
                     self.logtext.see("end")
+                    self._update_section_status_async("КАТЕГОРИЯ ПОДКЛЮЧЕНА")
                 elif t=="clouderror":
                     self.cloud_sync_running=False
                     self.cloud_ready=False
@@ -5905,6 +6146,8 @@ class App(tk.Tk):
                         + (f"Отчёт: {x.get('report')}\n" if x.get('report') else "")
                     )
                     self.wklog.see("end")
+                    # Миграция старого TOP-30 затрагивает несколько разделов,
+                    # поэтому здесь не обновляем статус текущего окна как одного раздела.
                     messagebox.showinfo(
                         "Миграция TOP-30",
                         f"Готово.\n\n"
@@ -5921,11 +6164,13 @@ class App(tk.Tk):
                 elif t=="wklog":self.wklog.insert("end",str(x)+"\n");self.wklog.see("end")
                 elif t=="wkdone":
                     p=x; self.topdf=pd.read_csv(p,encoding="utf-8-sig") if Path(p).exists() and Path(p).stat().st_size else pd.DataFrame(); self.wkstatus.config(text=f"Готово: {Path(p).name} | строк: {len(self.topdf)}"); self.wk_start_btn.config(state="normal"); self.wk_stop_btn.config(state="disabled"); self.wklog.insert("end",f"\nФайл TOP-30: {p}\n")
+                    self._update_section_status_async("TOP-30 ГОТОВ", top30_values_done=len(self.res.get("rows", [])), top30_values_total=len(self.res.get("rows", [])))
                 elif t=="wkstop":
                     p=x["path"]; self.topdf=pd.read_csv(p,encoding="utf-8-sig") if Path(p).exists() and Path(p).stat().st_size else pd.DataFrame(); self.wkstatus.config(text=f"ОСТАНОВЛЕНО: {len(self.topdf)} строк | {Path(p).name}"); self.wk_start_btn.config(state="normal"); self.wk_stop_btn.config(state="disabled"); self.wklog.insert("end",f"\nАНАЛИЗ ОСТАНОВЛЕН.\nTOP-30: {p}\nCheckpoint: {x['progress']}\nЗавершено запросов: {x['done']} из {x['total']}\nМожно нажать ПОЛУЧИТЬ TOP-30 снова - продолжит с последнего сохранённого запроса.\n")
                     if x.get("cloud_sync_error"):
                         self.wklog.insert("end",f"ОБЛАЧНАЯ СИНХРОНИЗАЦИЯ НЕ ВЫПОЛНЕНА: {x['cloud_sync_error']}\n")
                     self.wklog.see("end")
+                    self._update_section_status_async("TOP-30 ОСТАНОВЛЕН", top30_values_done=x.get("done", 0), top30_values_total=x.get("total", 0))
                 elif t=="wkdoneclouderror":
                     p=x["path"]
                     self.topdf=pd.read_csv(p,encoding="utf-8-sig") if Path(p).exists() and Path(p).stat().st_size else pd.DataFrame()
@@ -5933,6 +6178,7 @@ class App(tk.Tk):
                     self.wk_start_btn.config(state="normal"); self.wk_stop_btn.config(state="disabled")
                     self.wklog.insert("end",f"\nTOP-30 СОХРАНЁН ЛОКАЛЬНО: {p}\nОШИБКА ОБЛАЧНОЙ СИНХРОНИЗАЦИИ: {x['error']}\n")
                     self.wklog.see("end")
+                    self._update_section_status_async("TOP-30 ГОТОВ (ОБЛАКО НЕ ОБНОВЛЕНО)")
                 elif t=="wkerr":
                     self.wk_running=False; self.wk_start_btn.config(state="normal"); self.wk_stop_btn.config(state="disabled"); messagebox.showerror("WordKeeper",x)
                 elif t=="analysislog":
@@ -5949,6 +6195,7 @@ class App(tk.Tk):
                     else:
                         self.stats.insert("end",f"\nКлассификация сохранена: {cache_txt}\n")
                     self.stats.see("end")
+                    self._update_section_status_async("АНАЛИЗ ОСТАНОВЛЕН" if x.get("stopped") else "АНАЛИЗ ГОТОВ")
                 elif t=="analysiserr":
                     self.analysis_running=False
                     self.compare_btn.config(state="normal")
@@ -5964,6 +6211,7 @@ class App(tk.Tk):
                     if x.get("stopped"): msg += " | ОСТАНОВЛЕНО"
                     self.urlstatus.config(text=msg)
                     self.urllog.insert("end",f"\n{msg}\n")
+                    self._update_section_status_async("URL ОСТАНОВЛЕН" if x.get("stopped") else "URL ПРОВЕРЕН")
                 elif t=="urlerr":
                     self.url_check_running=False
                     self.url_check_btn.config(state="normal")
@@ -6013,6 +6261,7 @@ class App(tk.Tk):
                         for r in results:self.oclog.insert("end",f"{r.get('keyword')} -> {r.get('oc_status')} | {r.get('target_url','')}\n")
                     self.oclog.insert("end",f"\nСледующий шаг: вкладка 6. Экспорт -> СОХРАНИТЬ CSV ДЛЯ ГЕНЕРАТОРА.\n")
                     self.oclog.see("end")
+                    self._update_section_status_async()
                 elif t=="ocerr":
                     self.oc_running=False
                     self.oc_check_btn.config(state="normal")
