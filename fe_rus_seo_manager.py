@@ -4130,15 +4130,15 @@ class App(tk.Tk):
 
     def cloud_push_current_files(self,filenames=None):
         if not self.res:
-            return False
+            return
         cfg=load_cfg()
         endpoint=str(cfg.get("cloud_csv_webapp_url","") or "").strip()
         token=str(cfg.get("cloud_csv_token","") or "").strip()
         if not endpoint or not token:
-            return False
+            return
         section_name=self.cloud_section_name or cloud_section_name_from_result(self.res)
         if not section_name:
-            return False
+            return
         local_dir=cloud_cache_dir(self.cloud_section_id) if self.cloud_section_id else Path(self.folder.get() or os.getcwd())
         selected=list(filenames or CLOUD_SECTION_FILES)
         upload_files={}
@@ -4151,7 +4151,7 @@ class App(tk.Tk):
                     "content_b64":base64.b64encode(zipped).decode("ascii"),
                 }
         if not upload_files:
-            return False
+            return
 
         data=cloud_sync_section_data(
             endpoint, token, section_name,
@@ -4168,14 +4168,6 @@ class App(tk.Tk):
                 }
         if self.cloud_section_id:
             save_cloud_manifest(self.cloud_section_id, manifest)
-
-        uploaded_names={str(item.get("file_name") or "") for item in (data.get("uploaded") or [])}
-        missing=set(upload_files) - uploaded_names
-        if missing:
-            raise RuntimeError(
-                "Google Drive не подтвердил загрузку файлов: " + ", ".join(sorted(missing))
-            )
-        return True
 
     def analyze_category(self):
         # Важно: пользователь мог снять характеристики и сразу нажать кнопку.
@@ -4322,38 +4314,12 @@ class App(tk.Tk):
                 messagebox.showerror("TOP-30", f"Не удалось обновить checkpoint:\n{e}")
                 return
 
-        # КРИТИЧНО: сначала фиксируем очищенный раздел в Google Drive.
-        # worker_wordkeeper() в начале делает cloud_pull_current_section();
-        # если оставить старую облачную копию, она может вернуть удалённые
-        # строки обратно сразу после нажатия «Пересобрать».
-        # Поэтому новый сбор разрешаем только после успешной отправки
-        # очищенного TOP-30 и checkpoint в облако.
-        if self.cloud_sync_running:
-            messagebox.showinfo(
-                "Google Drive",
-                "Синхронизация текущего раздела ещё выполняется. Дождитесь её завершения и повторите пересборку.",
-            )
-            return
-        try:
-            pushed = self.cloud_push_current_files(["seo_top30_result.csv", "seo_top30_progress.json"])
-            if not pushed:
-                raise RuntimeError("облачное хранилище не подтвердило отправку очищенных файлов")
-        except Exception as e:
-            messagebox.showerror(
-                "Google Drive",
-                "Не удалось записать очищенный TOP-30 в облако.\n"
-                "Новый сбор НЕ запущен, чтобы старые облачные данные не вернулись.\n\n"
-                f"Ошибка: {e}",
-            )
-            return
-
         self.topdf = pd.DataFrame()
-        self.wkstatus.config(text="Старый TOP-30 текущего раздела сброшен и очищен в Google Drive")
+        self.wkstatus.config(text="Старый TOP-30 текущего раздела сброшен")
         self.wklog.delete("1.0", "end")
         self.wklog.insert("end", f"Пересборка текущего раздела: {category or 'текущий раздел'}\n")
         self.wklog.insert("end", f"Удалено старых строк TOP-30: {removed_rows}\n")
         self.wklog.insert("end", f"Сброшено checkpoint-запросов: {removed_queries}\n")
-        self.wklog.insert("end", "Очищенный TOP-30 записан в Google Drive.\n")
         self.wklog.insert("end", "Запускаем новый сбор TOP-30...\n")
         self.wklog.see("end")
         self.save_settings()
@@ -4387,31 +4353,65 @@ class App(tk.Tk):
         ).start()
 
     def _migration_section_clean_name(self, name):
-        s=re.sub(r"^\d+_", "", str(name or "").strip())
+        """Возвращает имя раздела без технического числового префикса.
+
+        Поддерживаем варианты вроде:
+        05_Лист нержавеющий гладкий
+        05 - Лист нержавеющий гладкий
+        05. Лист нержавеющий гладкий
+        """
+        s=str(name or "").replace("\u00a0", " ").strip()
+        s=re.sub(r"^\s*\d+\s*(?:[_\-.]\s*|[-–—:]\s*)", "", s)
+        return re.sub(r"\s+", " ", s).strip()
+
+    def _migration_phrase(self, value):
+        """Нормализует фразу для миграции TOP-30 -> раздел."""
+        s=str(value or "").replace("\u00a0", " ").lower().replace("ё", "е")
+        # Для названий разделов/запросов дефисы, подчёркивания и слэши
+        # считаем разделителями слов, а не частью токена.
+        s=re.sub(r"[_/\\|]+", " ", s)
+        s=re.sub(r"[-–—]+", " ", s)
+        s=re.sub(r"[^a-zа-я0-9]+", " ", s)
         return re.sub(r"\s+", " ", s).strip()
 
     def _migration_score(self, section_name, query):
-        """Строгое сопоставление: сначала полная фраза раздела, затем все слова раздела."""
-        s=norm(self._migration_section_clean_name(section_name))
-        q=norm(query)
+        """Сопоставляет раздел с source_query без ложных совпадений.
+
+        Приоритет:
+        1. точное имя раздела;
+        2. source_query начинается с имени раздела + отдельное слово;
+        3. имя раздела встречается отдельной фразой внутри запроса;
+        4. все содержательные слова раздела присутствуют в запросе.
+
+        Важно: одиночное короткое слово никогда не является достаточным
+        основанием для миграции.
+        """
+        s=self._migration_phrase(self._migration_section_clean_name(section_name))
+        q=self._migration_phrase(query)
         if not s or not q:
             return 0
 
-        # Полное название раздела в запросе — самый надёжный вариант.
-        if s in q:
-            return 100000 + len(s)*10 + len(s.split())
+        if q == s:
+            return 100000000 + len(s)*100 + len(s.split())
 
-        # Запасной вариант только для названий из 2+ содержательных слов.
-        tokens=[
-            x for x in re.findall(r"[a-zа-я0-9]+",s)
-            if len(x)>=3
-        ]
+        # Основной сценарий старого TOP-30:
+        # "Лист нержавеющий гладкий AISI 304" ->
+        # "Лист нержавеющий гладкий".
+        if q.startswith(s + " "):
+            return 90000000 + len(s)*100 + len(s.split())
+
+        # Имя раздела может находиться не в начале запроса, но должно быть
+        # отдельной фразой, а не подстрокой внутри другого слова.
+        if re.search(r"(?:^|\s)" + re.escape(s) + r"(?:$|\s)", q):
+            return 80000000 + len(s)*100 + len(s.split())
+
+        tokens=[x for x in s.split() if len(x)>=3]
         if len(tokens)<2:
             return 0
 
-        q_tokens=set(re.findall(r"[a-zа-я0-9]+",q))
+        q_tokens=set(q.split())
         if all(t in q_tokens for t in tokens):
-            return 50000 + len(tokens)*100 + len(s)
+            return 70000000 + len(tokens)*100 + len(s)
 
         return 0
 
@@ -4435,20 +4435,68 @@ class App(tk.Tk):
             if not endpoint or not token:
                 raise RuntimeError("Не настроен Google Drive Web App.")
 
-            sections=cloud_list_sections(endpoint,token,timeout=180)
-            # Не считаем 00_ОБЩИЕ разделом.
-            sections=[
-                x for x in sections
-                if self._migration_section_clean_name(x.get("name","")).strip()
-                and self._migration_section_clean_name(x.get("name","")) != "00_ОБЩИЕ"
-            ]
+            raw_sections=cloud_list_sections(endpoint,token,timeout=180)
+
+            # Web App обычно возвращает объекты {id,name,url}, но старые
+            # развертывания могли вернуть просто список имён. Поддерживаем оба
+            # формата, чтобы миграция не зависела от версии Apps Script.
+            sections=[]
+            for item in (raw_sections or []):
+                if isinstance(item,dict):
+                    sid=str(item.get("id") or item.get("folder_id") or "").strip()
+                    name=str(item.get("name") or item.get("folder_name") or "").strip()
+                    url=str(item.get("url") or "").strip()
+                else:
+                    sid=""
+                    name=str(item or "").strip()
+                    url=""
+                clean=self._migration_section_clean_name(name)
+                # 00_ОБЩИЕ / ОБЩИЕ не участвует в миграции TOP-30.
+                if not clean or norm(clean)==norm("ОБЩИЕ"):
+                    continue
+                sections.append({"id":sid,"name":name,"url":url})
+
+            # Диагностика: если список пуст, сразу показываем, что именно
+            # вернул Web App. Это намного полезнее, чем молча считать, что
+            # папок нет.
+            self.q.put(("wkmigratelog",f"Ответ Web App: list_sections={len(raw_sections or [])}"))
+            if raw_sections:
+                sample=[]
+                for item in list(raw_sections)[:10]:
+                    if isinstance(item,dict):
+                        sample.append(str(item.get("name") or item.get("folder_name") or "").strip())
+                    else:
+                        sample.append(str(item or "").strip())
+                self.q.put(("wkmigratelog",f"Первые разделы: {' | '.join(x for x in sample if x)}"))
 
             if not sections:
                 raise RuntimeError(
-                    "В FE-RUS SEO Manager пока нет папок разделов. "
-                    "Сначала открой/обработай нужные разделы в новой версии программы — "
-                    "она создаст их автоматически, после чего запусти миграцию ещё раз."
+                    "Google Web App вернул 0 разделов. "
+                    "Проверь ROOT_FOLDER_ID и развертывание Apps Script: "
+                    "action=list_sections должен возвращать дочерние папки корня."
                 )
+
+            # Если старый Web App вернул только имена без ID, безопасно
+            # резолвим ID через ensure_structure. Для текущего Apps Script
+            # этот блок обычно не выполняется, но позволяет работать со
+            # старыми форматами ответа.
+            resolved_sections=[]
+            for item in sections:
+                sid=str(item.get("id") or "").strip()
+                name=str(item.get("name") or "").strip()
+                if sid:
+                    resolved_sections.append(item)
+                    continue
+                if not name:
+                    continue
+                meta=cloud_ensure_section(endpoint,token,name,timeout=120)
+                resolved_id=str(meta.get("section_id") or (meta.get("section") or {}).get("id") or "").strip()
+                resolved_name=str(meta.get("section_name") or (meta.get("section") or {}).get("name") or name).strip()
+                if resolved_id:
+                    resolved_sections.append({"id":resolved_id,"name":resolved_name,"url":str(meta.get("section_url") or "").strip()})
+            sections=resolved_sections
+            if not sections:
+                raise RuntimeError("Не удалось получить ID облачных разделов из Google Web App.")
 
             df=self._read_legacy_top30(old_path)
             total=len(df)
@@ -4472,6 +4520,13 @@ class App(tk.Tk):
 
             for idx,row in df.iterrows():
                 query=str(row.get("source_query","") or "").strip()
+                # В старом CSV встречаются технические пустые строки в начале.
+                # Если source_query пустой, пробуем keyword как резервный источник.
+                if not query:
+                    query=str(row.get("keyword","") or "").strip()
+                if not query:
+                    unmatched.append(idx)
+                    continue
                 scores=[]
                 for sid,name in prepared:
                     score=self._migration_score(name,query)
