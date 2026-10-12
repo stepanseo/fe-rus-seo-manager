@@ -1,10 +1,10 @@
 # -*- coding: utf-8 -*-
 """
-FE-RUS SEO Manager v1.26.0
+FE-RUS SEO Manager v1.27.0 TOP10
 
-Единое Windows-приложение:
+Экспериментальная отдельная TOP-10 версия Windows-приложения:
 1. Категория - получает category_id, OCFilter options и значения.
-2. WordKeeper - авторизация, получение TOP-30 с продолжением после перезапуска.
+2. WordKeeper - авторизация, получение TOP-10 с продолжением после перезапуска.
 3. Анализ - классификация CREATE / SKIP / EXISTS и конкуренты; подтвержденный СМЕШАННЫЙ сразу попадает в CREATE.
 4. Проверка URL - проверка ожидаемых OCFilter URL до создания.
 5. OCFilter - реальный direct POST в штатный addPage, без Playwright.
@@ -45,24 +45,24 @@ from openpyxl.styles import Font
 APP = "FE-RUS SEO Manager"
 BASE = "https://fe-rus.ru"
 GOOGLE_SHEET_ID = "1NbEr9ZDR5dmFa_8zayfSQtQ5VL1dLn2jSN0nNT1fkD8"
-GOOGLE_STATUS_SHEET_NAME = "РАЗДЕЛЫ"
+GOOGLE_STATUS_SHEET_NAME = "РАЗДЕЛЫ TOP10"
 # Единый облачный CSV в Google Drive. ID не меняется при обновлении содержимого файла.
 CLOUD_READY_FILE_ID = "1YcEPhor7Up_5Wt2wCni86irElRqqkc0Y"
 CLOUD_READY_FILE_URL = "https://drive.google.com/file/d/1YcEPhor7Up_5Wt2wCni86irElRqqkc0Y/view"
 CLOUD_ROOT_FOLDER_ID = "1uyJ9YqbX7v1wYT2FX4hmO3GIWk0u-YYs"
 CLOUD_ROOT_FOLDER_URL = "https://drive.google.com/drive/folders/1uyJ9YqbX7v1wYT2FX4hmO3GIWk0u-YYs"
 CLOUD_SECTION_FILES = (
-    "seo_top30_result.csv",
-    "seo_top30_progress.json",
-    "seo_serp_page_classification.csv",
-    "seo_url_check_audit.csv",
-    "seo_ocfilter_check_audit.json",
-    "wordkeeper_error.log",
+    "seo_top10_result.csv",
+    "seo_top10_progress.json",
+    "seo_top10_serp_page_classification.csv",
+    "seo_top10_url_check_audit.csv",
+    "seo_top10_ocfilter_check_audit.json",
+    "wordkeeper_top10_error.log",
 )
 # URL веб-приложения Google Apps Script задаётся пользователем при первом нажатии.
 ADMIN = BASE + "/admin/"
 LOGIN_WK = "https://word-keeper.ru/login"
-TOP30_WK = "https://word-keeper.ru/core/ajax_top30"
+TOP10_WK = "https://word-keeper.ru/core/ajax_top10"
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/152 Safari/537.36"
 CFG = Path(os.environ.get("APPDATA", Path.home())) / APP / "config.json"
 
@@ -70,7 +70,7 @@ CREATE_ROUTE = "extension/module/ocfilter/addPage"
 PAGE_ROUTE = "extension/module/ocfilter/page"
 MENU_STATUS = "0"  # ВСЕГДА отключено
 
-# Ускорение TOP-30 WordKeeper.
+# Ускорение TOP-10 WordKeeper.
 # 0.5 сек между запросами вместо прежних 2 сек.
 WK_DELAY = 0.5
 # CSV/checkpoint сохраняются пакетно, чтобы не переписывать весь накопительный
@@ -577,12 +577,12 @@ def safe_sorted_strings(values):
 
 
 def wordkeeper_ajax_post(ajax_session, query, region, cookie_header=""):
-    """Выполняет AJAX TOP-30 через постоянную HTTP-сессию.
+    """Выполняет AJAX TOP-10 через постоянную HTTP-сессию.
 
     Авторизационные cookies передаются как готовая строка Cookie, поэтому мы
     не используем проблемный cookie-jar авторизационной сессии WordKeeper.
     При этом отдельная ajax-сессия переиспользует TCP/TLS-соединение между
-    запросами, что заметно ускоряет большой пакет TOP-30.
+    запросами, что заметно ускоряет большой пакет TOP-10.
     """
     query = str(query or "").strip()
     region = str(region or "").strip()
@@ -597,7 +597,7 @@ def wordkeeper_ajax_post(ajax_session, query, region, cookie_header=""):
         headers["Cookie"] = cookie_header
 
     return ajax_session.post(
-        TOP30_WK,
+        TOP10_WK,
         data={"word": query, "region": region},
         headers=headers,
         timeout=120,
@@ -740,7 +740,7 @@ def _jsonld_types(soup):
 
 
 def _classify_serp_page(session, url, title="", snippet="", keyword="", value=""):
-    """Определяет тип результата TOP-30.
+    """Определяет тип результата TOP-10.
 
     Возвращает PRODUCT / SEO_PAGE / ARTICLE / OTHER / UNKNOWN.
     Сначала используются URL-сигналы, затем HTML для неоднозначных страниц.
@@ -971,7 +971,8 @@ def save_serp_classification_cache(cache, path):
     df[cols].to_csv(path, sep=";", index=False, encoding="utf-8-sig", lineterminator="\n")
 
 
-def parse_top30(html, keyword):
+def parse_top10(html, keyword):
+    """Берёт только первые 10 уникальных внешних результатов WordKeeper."""
     soup = BeautifulSoup(html, "html.parser")
     excluded = {"word-keeper.ru", "yandex.ru", "yandexwebcache.net", "xtool.ru"}
     rows = []
@@ -1002,7 +1003,7 @@ def parse_top30(html, keyword):
             "title": a.get_text(" ", strip=True),
             "snippet": "",
         })
-        if pos >= 30:
+        if pos >= 10:
             break
     return rows
 
@@ -1981,14 +1982,14 @@ def promotion_type_for_counts(product_domains, seo_domains, article_domains, unk
 
 
 # -----------------------------------------------------------------------------
-# SEO CANDIDATE SELECTION v1.25
+# SEO CANDIDATE SELECTION v1.27 TOP10
 # -----------------------------------------------------------------------------
 
-SEO_SELECTION_VERSION = "1.25.0"
-SEO_CREATE_MIN_SCORE = 6
-SEO_MIN_FILTER_DOMAINS_TEXT = 5
-SEO_MIN_FILTER_DOMAINS_NUMERIC = 7
-SEO_MIN_FILTER_DOMAINS_SMALL = 3
+SEO_SELECTION_VERSION = "1.27.0-TOP10"
+SEO_CREATE_MIN_SCORE = 5
+SEO_MIN_FILTER_DOMAINS_TEXT = 3
+SEO_MIN_FILTER_DOMAINS_NUMERIC = 4
+SEO_MIN_FILTER_DOMAINS_SMALL = 2
 SEO_CREATE_CAP_NUMERIC = 25
 SEO_CREATE_CAP_TEXT = 20
 
@@ -2027,9 +2028,9 @@ def _is_numeric_filter(filter_name, values):
 def _seo_candidate_score(row):
     """Оценивает силу SEO-кандидата без новых сетевых запросов.
 
-    Скоринг использует только уже собранные данные TOP-30 и классификации:
+    Скоринг использует только уже собранные данные TOP-10 и классификации:
     точные filter-конкуренты, разнообразие доменов, SEO/product-интент,
-    положение конкурентов в TOP-30, качество URL и размер сетки характеристики.
+    положение конкурентов в TOP-10, качество URL и размер сетки характеристики.
     """
     fd = int(row.get("filter_domains_count") or 0)
     sd = int(row.get("seo_domains_count") or 0)
@@ -2086,7 +2087,7 @@ def _seo_candidate_score(row):
 
 
 def _apply_seo_candidate_selection(res, progress=None):
-    """Финальный отбор CREATE-кандидатов v1.25.
+    """Финальный отбор CREATE-кандидатов v1.27 TOP10.
 
     Важный принцип: базовая классификация собирает доказательства, а эта функция
     уже решает, сколько реальных SEO-посадочных страниц стоит создавать.
@@ -2125,6 +2126,7 @@ def _apply_seo_candidate_selection(res, progress=None):
             min_domains = SEO_MIN_FILTER_DOMAINS_TEXT
 
         r["seo_selection_version"] = SEO_SELECTION_VERSION
+        r["evidence_depth"] = "TOP10"
         r["filter_value_count"] = value_count
         r["seo_numeric_filter"] = "1" if numeric else "0"
         r["seo_create_min_domains"] = min_domains
@@ -2138,13 +2140,13 @@ def _apply_seo_candidate_selection(res, progress=None):
         if fd < min_domains:
             r["status"] = "SKIP"
             r["reason"] = (
-                f"SEO-отбор v1.25: недостаточно независимых filter-конкурентов "
+                f"SEO-отбор v1.27 TOP10: недостаточно независимых filter-конкурентов "
                 f"({fd}/{min_domains}); значений характеристики={value_count}"
             )
         elif score < SEO_CREATE_MIN_SCORE:
             r["status"] = "SKIP"
             r["reason"] = (
-                f"SEO-отбор v1.25: низкий SEO Score={score}/{SEO_CREATE_MIN_SCORE}; "
+                f"SEO-отбор v1.27 TOP10: низкий SEO Score={score}/{SEO_CREATE_MIN_SCORE}; "
                 f"filter-конкурентов={fd}, SEO-доменов={r.get('seo_domains_count',0)}, "
                 f"PRODUCT-доменов={r.get('product_domains_count',0)}"
             )
@@ -2179,7 +2181,7 @@ def _apply_seo_candidate_selection(res, progress=None):
                 continue
             r["status"] = "SKIP"
             r["reason"] = (
-                f"SEO-отбор v1.25: дубликат target URL; приоритет у "
+                f"SEO-отбор v1.27 TOP10: дубликат target URL; приоритет у "
                 f"«{winner.get('filter')} = {winner.get('value')}» "
                 f"(Score={winner.get('seo_selection_score')})"
             )
@@ -2211,7 +2213,7 @@ def _apply_seo_candidate_selection(res, progress=None):
         for r in candidates[cap:]:
             r["status"] = "SKIP"
             r["reason"] = (
-                f"SEO-отбор v1.25: превышен лимит характеристики "
+                f"SEO-отбор v1.27 TOP10: превышен лимит характеристики "
                 f"{cap} страниц; кандидат исключён как менее сильный "
                 f"(Score={r.get('seo_selection_score')})"
             )
@@ -2220,7 +2222,7 @@ def _apply_seo_candidate_selection(res, progress=None):
     final_create = sum(1 for r in rows if r.get("status") == "CREATE")
     if progress:
         progress(
-            f"SEO-отбор v1.25: CREATE={final_create} | "
+            f"SEO-отбор v1.27 TOP10: CREATE={final_create} | "
             f"дубликатов URL убрано={duplicate_removed} | "
             f"лишних по лимитам характеристик={capped}"
         )
@@ -2293,7 +2295,7 @@ class Pipeline:
                     "alias": alias,
                     "target_url": expected_url(r.url, alias),
                     "status": "UNVERIFIED",
-                    "reason": "требует TOP-30 + проверки OCFilter",
+                    "reason": "требует TOP-10 + проверки OCFilter",
                     "competitor_1": "", "competitor_2": "", "competitor_3": "", "competitor_4": "", "competitor_5": "",
                 })
         self.log(f"Категория: {cat}")
@@ -2305,15 +2307,15 @@ class Pipeline:
         return {"url": r.url, "category": search_category, "category_slug": urlparse(r.url).path.rstrip("/").split("/")[-1], "search_category": search_category, "category_id": cid, "options": opts, "rows": rows}
 
     def merge_analysis(self, res, topdf, progress=None, stop_event=None, cache_path=None):
-        """Сопоставляет TOP-30 с OCFilter и определяет тип продвижения.
+        """Сопоставляет TOP-10 с OCFilter и определяет тип продвижения.
 
-        Для каждого URL TOP-30 определяется тип страницы:
+        Для каждого URL TOP-10 определяется тип страницы:
         PRODUCT / SEO_PAGE / ARTICLE / OTHER.
         Затем по независимым доменам определяется promotion_type:
         ТОВАР / SEO-СТРАНИЦА / СМЕШАННЫЙ / ИНФОРМАЦИОННАЯ / НЕДОСТАТОЧНО ДАННЫХ.
 
         Базовый слой собирает доказательства filter-интента. Финальный CREATE
-        определяется отдельным SEO-отбором v1.25: требуется больше независимых
+        определяется отдельным SEO-отбором v1.27 TOP10: требуется больше независимых
         конкурентов (5 для обычных и 7 для числовых характеристик), считается
         SEO Score, удаляются дубли target URL и ограничивается число страниц
         для широких характеристик. Явно ТОВАРНЫЙ интент не переводится в CREATE.
@@ -2322,7 +2324,7 @@ class Pipeline:
             for x in res["rows"]:
                 x["promotion_type"] = "НЕДОСТАТОЧНО ДАННЫХ"
                 x["status"] = "SKIP"
-                x["reason"] = "TOP-30 не загружен"
+                x["reason"] = "TOP-10 не загружен"
             return res
 
         kc = find_col(topdf, ["keyword", "query", "запрос"])
@@ -2368,7 +2370,7 @@ class Pipeline:
 
         # Загружаем постоянный кэш классификации URL.
         if cache_path is None:
-            cache_path = Path(self.folder.get() or os.getcwd()) / "seo_serp_page_classification.csv"
+            cache_path = Path(self.folder.get() or os.getcwd()) / "seo_top10_serp_page_classification.csv"
         cache = load_serp_classification_cache(cache_path)
         session = http_session()
         page_map = {}
@@ -2412,7 +2414,7 @@ class Pipeline:
                 relevant = pd.concat([relevant, extra], ignore_index=False).drop_duplicates()
 
         if progress:
-            progress(f"TOP-30: найдено строк текущей категории/вариантов запроса: {len(relevant)}")
+            progress(f"TOP-10: найдено строк текущей категории/вариантов запроса: {len(relevant)}")
 
         unique_urls = []
         seen_urls = set()
@@ -2443,7 +2445,7 @@ class Pipeline:
 
         if progress:
             progress(
-                f"Классификация TOP-30: уникальных URL {total_urls} | "
+                f"Классификация TOP-10: уникальных URL {total_urls} | "
                 f"кэшировано {total_urls - len(pending_urls)} | "
                 f"новых {len(pending_urls)} | потоков {SERP_CLASSIFY_WORKERS} | "
                 f"сохранение кэша каждые {SERP_CLASSIFY_CACHE_EVERY}"
@@ -2499,7 +2501,7 @@ class Pipeline:
 
         save_serp_classification_cache(cache, cache_path)
 
-        # Добавляем классификацию к исходному TOP-30 DataFrame для полного XLSX.
+        # Добавляем классификацию к исходному TOP-10 DataFrame для полного XLSX.
         classification_cols = ["page_type","page_confidence","page_signals","page_http_status","page_fetched","page_h1","page_breadcrumbs"]
 
         # Pandas 2.x может прочитать уже существующие колонки как StringDtype.
@@ -2696,9 +2698,9 @@ class Pipeline:
 
             if fe_filter:
                 x["status"] = "EXISTS"
-                x["reason"] = "FE-RUS уже имеет filter URL для этого значения в TOP-30"
+                x["reason"] = "FE-RUS уже имеет filter URL для этого значения в TOP-10"
             elif promotion == "ТОВАР":
-                # Явно товарный TOP-30 не переводим в CREATE только из-за
+                # Явно товарный TOP-10 не переводим в CREATE только из-за
                 # наличия отдельных filter URL у конкурентов.
                 x["status"] = "SKIP"
                 x["reason"] = f"Товарный интент: PRODUCT-доменов={len(product_domains)}, SEO-доменов={len(seo_domains)}"
@@ -2709,7 +2711,7 @@ class Pipeline:
                 # Базовый слой только собирает кандидата. Финальное решение
                 # принимает _apply_seo_candidate_selection ниже.
                 x["status"] = "CREATE"
-                x["reason"] = f"Базовый кандидат: {len(filter_domains)} независимых конкурента с точным filter URL; TOP-30={promotion.lower()}"
+                x["reason"] = f"Базовый кандидат: {len(filter_domains)} независимых конкурента с точным filter URL; TOP-10={promotion.lower()}"
             elif promotion == "СМЕШАННЫЙ":
                 x["status"] = "SKIP"
                 x["reason"] = f"Смешанный интент, но точных filter-конкурентов недостаточно: {len(filter_domains)}"
@@ -2731,7 +2733,7 @@ class Pipeline:
 
         _apply_seo_candidate_selection(res, progress=progress)
         if progress:
-            progress("Классификация TOP-30 завершена.")
+            progress("Классификация TOP-10 завершена.")
         return res
 
     def check_urls(self, res):
@@ -2926,7 +2928,7 @@ def generator_rows(res):
         if x.get("status") != "CREATE":
             continue
         # СМЕШАННЫЙ также допускается, если кандидат прошёл новый
-        # SEO-отбор v1.25 и все последующие проверки.
+        # SEO-отбор v1.27 TOP10 и все последующие проверки.
         if not is_filter_creation_intent(x):
             continue
         if x.get("url_status") not in ("READY_FOR_OCFILTER", "HTTP_404"):
@@ -3248,7 +3250,7 @@ def export_excel(res, path, topdf=None):
         for v in o.get("values", []):
             ws.append([o.get("name"),o.get("keyword"),o.get("option_id"),v.get("name"),v.get("value_id"),v.get("keyword"),v.get("params"),value_alias(o,v)])
     if topdf is not None and not topdf.empty:
-        ws = wb.create_sheet("WORDKEEPER_TOP30")
+        ws = wb.create_sheet("WORDKEEPER_TOP10")
         for j,cname in enumerate(topdf.columns,1): ws.cell(1,j,cname)
         for i,row in enumerate(topdf.itertuples(index=False),2):
             for j,val in enumerate(row,1): ws.cell(i,j,str(val) if pd.notna(val) else "")
@@ -3356,7 +3358,7 @@ def cloud_download_section_file(endpoint, token, section_name, file_name, local_
     local_path = Path(local_path)
     local_path.parent.mkdir(parents=True, exist_ok=True)
 
-    # Пустой облачный файл не должен затирать уже собранный локальный TOP-30.
+    # Пустой облачный файл не должен затирать уже собранный локальный TOP-10.
     # Такое возможно, если прошлый upload не успел завершиться.
     if not raw:
         if local_path.exists() and local_path.stat().st_size > 0:
@@ -3459,7 +3461,7 @@ def migrate_legacy_file_for_section(src, dst, filename, res):
             current_variants.update(norm(q) for q in variants if str(q).strip())
         variant_keys = {norm(q) for q in current_variants}
 
-        if filename == "seo_top30_result.csv":
+        if filename == "seo_top10_result.csv":
             df = pd.read_csv(src, encoding="utf-8-sig", dtype=str).fillna("")
             if "source_query" in df.columns or "keyword" in df.columns:
                 mask = pd.Series(False, index=df.index)
@@ -3470,7 +3472,7 @@ def migrate_legacy_file_for_section(src, dst, filename, res):
                 df.loc[mask].to_csv(dst, index=False, encoding="utf-8-sig")
             return dst.exists()
 
-        if filename == "seo_top30_progress.json":
+        if filename == "seo_top10_progress.json":
             data = json.loads(src.read_text(encoding="utf-8"))
             if isinstance(data, dict):
                 data["done_keywords"]=[x for x in data.get("done_keywords",[]) if str(x).strip() in current_keywords]
@@ -3478,14 +3480,14 @@ def migrate_legacy_file_for_section(src, dst, filename, res):
                 dst.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
                 return True
 
-        if filename == "seo_url_check_audit.csv":
+        if filename == "seo_top10_url_check_audit.csv":
             df=pd.read_csv(src, sep=";", encoding="utf-8-sig", dtype=str).fillna("")
             if "category_url" in df.columns:
                 df=df[df["category_url"].astype(str).str.strip()==category_url]
             df.to_csv(dst, sep=";", index=False, encoding="utf-8-sig", lineterminator="\n")
             return True
 
-        if filename == "seo_ocfilter_check_audit.json":
+        if filename == "seo_top10_ocfilter_check_audit.json":
             data=json.loads(src.read_text(encoding="utf-8"))
             if isinstance(data,dict):
                 data={k:v for k,v in data.items() if not category_url or str(v.get("category_url","")).strip()==category_url}
@@ -3505,7 +3507,7 @@ def migrate_legacy_file_for_section(src, dst, filename, res):
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("FE-RUS SEO Manager v1.26.0")
+        self.title("FE-RUS SEO Manager TOP10 v1.27.0")
         self.geometry("1280x860")
         self.q = queue.Queue()
         self.res = None
@@ -3570,42 +3572,42 @@ class App(tk.Tk):
             ttk.Label(box,text=n+":").grid(row=r,column=c,padx=8,pady=6,sticky="w")
             e=ttk.Entry(box,show="*" if sec else ""); e.grid(row=r,column=c+1,sticky="ew",padx=8); self.wk[n]=e
         box.columnconfigure(1,weight=1); box.columnconfigure(3,weight=1)
-        # Основное управление сбором TOP-30.
+        # Основное управление сбором TOP-10.
         row=ttk.Frame(f); row.pack(fill="x",padx=10,pady=(6,2))
         ttk.Label(row,text="Регион:").pack(side="left")
         self.region=tk.IntVar(value=int(self.cfg.get("region",213) or 213))
         ttk.Spinbox(row,from_=0,to=9999,textvariable=self.region,width=7).pack(side="left",padx=8)
-        self.wk_start_btn=ttk.Button(row,text="ПОЛУЧИТЬ TOP-30 WORDKEEPER",command=self.start_wordkeeper)
+        self.wk_start_btn=ttk.Button(row,text="ПОЛУЧИТЬ TOP-10 WORDKEEPER",command=self.start_wordkeeper)
         self.wk_start_btn.pack(side="left")
         self.wk_stop_btn=ttk.Button(row,text="ОСТАНОВИТЬ АНАЛИЗ",command=self.stop_wordkeeper,state="disabled")
         self.wk_stop_btn.pack(side="left",padx=8)
         ttk.Button(row,text="ЗАГРУЗИТЬ CSV (ЛОКАЛЬНО)",command=self.load_wk_csv).pack(side="left",padx=8)
-        self.wkstatus=ttk.Label(row,text="TOP-30 ещё не загружен"); self.wkstatus.pack(side="left",padx=8)
+        self.wkstatus=ttk.Label(row,text="TOP-10 ещё не загружен"); self.wkstatus.pack(side="left",padx=8)
 
         # Пересборка вынесена в отдельную строку, чтобы кнопка не исчезала
         # за пределами окна при небольшой ширине интерфейса.
         rebuild_row=ttk.Frame(f); rebuild_row.pack(fill="x",padx=10,pady=(2,6))
         self.wk_rebuild_btn=ttk.Button(
             rebuild_row,
-            text="ПЕРЕСОБРАТЬ TOP-30 ТЕКУЩЕГО РАЗДЕЛА",
+            text="ПЕРЕСОБРАТЬ TOP-10 ТЕКУЩЕГО РАЗДЕЛА",
             command=self.rebuild_wordkeeper_current_section,
         )
         self.wk_rebuild_btn.pack(side="left")
         ttk.Label(
             rebuild_row,
-            text="Удаляет только TOP-30 текущего раздела и запускает его заново",
+            text="Удаляет только TOP-10 текущего раздела и запускает его заново",
         ).pack(side="left",padx=10)
 
         migrate_row=ttk.Frame(f); migrate_row.pack(fill="x",padx=10,pady=(0,6))
         self.wk_migrate_btn=ttk.Button(
             migrate_row,
-            text="РАЗЛОЖИТЬ СТАРЫЙ TOP-30 ПО ОБЛАЧНЫМ РАЗДЕЛАМ",
-            command=self.migrate_old_top30_to_cloud,
+            text="РАЗЛОЖИТЬ СТАРЫЙ TOP-10 ПО ОБЛАЧНЫМ РАЗДЕЛАМ",
+            command=self.migrate_old_top10_to_cloud,
         )
         self.wk_migrate_btn.pack(side="left")
         ttk.Label(
             migrate_row,
-            text="Берёт старый seo_top30_result.csv и раскладывает строки по уже созданным папкам разделов Google Drive",
+            text="Берёт старый seo_top10_result.csv и раскладывает строки по уже созданным папкам разделов Google Drive",
         ).pack(side="left",padx=10)
 
         self.wklog=tk.Text(f,font=("Consolas",10)); self.wklog.pack(fill="both",expand=True,padx=10,pady=8)
@@ -3993,7 +3995,7 @@ class App(tk.Tk):
                     "value_keyword":v.get("keyword",""),"alias":alias,
                     "filter_result_url":filter_result_url(base_url, o.get("keyword",""), v.get("keyword",""), v.get("name","")),
                     "target_url":expected_url(base_url,alias),"status":"UNVERIFIED",
-                    "reason":"требует TOP-30 + проверки OCFilter",
+                    "reason":"требует TOP-10 + проверки OCFilter",
                     "competitor_1":"","competitor_2":"","competitor_3":"","competitor_4":"","competitor_5":"",
                 })
         self.res["options"]=opts
@@ -4265,12 +4267,12 @@ class App(tk.Tk):
         self.wklog.see("end")
 
     def rebuild_wordkeeper_current_section(self):
-        """Удаляет накопленные TOP-30 только для текущего раздела и запускает его заново."""
+        """Удаляет накопленные TOP-10 только для текущего раздела и запускает его заново."""
         if not self.res or not self.res.get("rows"):
-            messagebox.showwarning("TOP-30", "Сначала получите категорию и фильтры текущего раздела.")
+            messagebox.showwarning("TOP-10", "Сначала получите категорию и фильтры текущего раздела.")
             return
         if self.wk_running:
-            messagebox.showwarning("TOP-30", "Сначала дождитесь завершения или остановите текущий сбор TOP-30.")
+            messagebox.showwarning("TOP-10", "Сначала дождитесь завершения или остановите текущий сбор TOP-10.")
             return
 
         category = str(self.res.get("category") or self.res.get("search_category") or "").strip()
@@ -4291,12 +4293,12 @@ class App(tk.Tk):
             current_variants.update(norm(q) for q in variants if str(q).strip())
 
         if not current_keywords:
-            messagebox.showwarning("TOP-30", "У текущего раздела нет запросов для пересборки.")
+            messagebox.showwarning("TOP-10", "У текущего раздела нет запросов для пересборки.")
             return
 
         ok = messagebox.askyesno(
-            "Пересобрать TOP-30",
-            f"Пересобрать TOP-30 заново только для текущего раздела?\n\n"
+            "Пересобрать TOP-10",
+            f"Пересобрать TOP-10 заново только для текущего раздела?\n\n"
             f"Раздел: {category or 'текущий'}\n"
             f"Значений/запросов: {len(current_keywords)}\n\n"
             "Старые результаты этого раздела будут удалены из накопительного CSV и checkpoint. "
@@ -4306,8 +4308,8 @@ class App(tk.Tk):
             return
 
         folder = Path(self.folder.get() or os.getcwd())
-        out_path = folder / "seo_top30_result.csv"
-        progress_path = folder / "seo_top30_progress.json"
+        out_path = folder / "seo_top10_result.csv"
+        progress_path = folder / "seo_top10_progress.json"
         removed_rows = 0
         removed_queries = 0
 
@@ -4325,10 +4327,10 @@ class App(tk.Tk):
                     old = old.loc[~mask].copy()
                     old.to_csv(out_path, index=False, encoding="utf-8-sig")
             except pd.errors.EmptyDataError:
-                # Пустой CSV считаем отсутствующим накопленным TOP-30.
+                # Пустой CSV считаем отсутствующим накопленным TOP-10.
                 removed_rows = 0
             except Exception as e:
-                messagebox.showerror("TOP-30", f"Не удалось очистить текущий раздел из CSV:\n{e}")
+                messagebox.showerror("TOP-10", f"Не удалось очистить текущий раздел из CSV:\n{e}")
                 return
 
         # Из checkpoint удаляем только текущие canonical keywords и их варианты.
@@ -4345,22 +4347,22 @@ class App(tk.Tk):
                 progress["updated_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
                 progress_path.write_text(json.dumps(progress, ensure_ascii=False, indent=2), encoding="utf-8")
             except Exception as e:
-                messagebox.showerror("TOP-30", f"Не удалось обновить checkpoint:\n{e}")
+                messagebox.showerror("TOP-10", f"Не удалось обновить checkpoint:\n{e}")
                 return
 
         self.topdf = pd.DataFrame()
-        self.wkstatus.config(text="Старый TOP-30 текущего раздела сброшен")
+        self.wkstatus.config(text="Старый TOP-10 текущего раздела сброшен")
         self.wklog.delete("1.0", "end")
         self.wklog.insert("end", f"Пересборка текущего раздела: {category or 'текущий раздел'}\n")
-        self.wklog.insert("end", f"Удалено старых строк TOP-30: {removed_rows}\n")
+        self.wklog.insert("end", f"Удалено старых строк TOP-10: {removed_rows}\n")
         self.wklog.insert("end", f"Сброшено checkpoint-запросов: {removed_queries}\n")
-        self.wklog.insert("end", "Запускаем новый сбор TOP-30...\n")
+        self.wklog.insert("end", "Запускаем новый сбор TOP-10...\n")
         self.wklog.see("end")
         self.save_settings()
         self.start_wordkeeper()
 
-    def migrate_old_top30_to_cloud(self):
-        """Запускает безопасный перенос старого накопительного TOP-30 по уже созданным облачным разделам."""
+    def migrate_old_top10_to_cloud(self):
+        """Запускает безопасный перенос старого накопительного TOP-10 по уже созданным облачным разделам."""
         cfg=load_cfg()
         endpoint=str(cfg.get("cloud_csv_webapp_url","") or "").strip()
         token=str(cfg.get("cloud_csv_token","") or "").strip()
@@ -4369,19 +4371,19 @@ class App(tk.Tk):
                 return
 
         chosen=filedialog.askopenfilename(
-            title="Выберите старый seo_top30_result.csv",
-            filetypes=[("TOP-30 CSV","seo_top30_result.csv"),("CSV","*.csv"),("Все файлы","*.*")]
+            title="Выберите старый seo_top10_result.csv",
+            filetypes=[("TOP-10 CSV","seo_top10_result.csv"),("CSV","*.csv"),("Все файлы","*.*")]
         )
         if not chosen:
             return
 
         self.wk_migrate_btn.config(state="disabled")
         self.wklog.delete("1.0","end")
-        self.wklog.insert("end",f"Миграция старого TOP-30:\n{chosen}\n")
+        self.wklog.insert("end",f"Миграция старого TOP-10:\n{chosen}\n")
         self.wklog.insert("end","Получаю список уже созданных разделов Google Drive...\n")
         self.wklog.see("end")
         threading.Thread(
-            target=self.worker_migrate_old_top30,
+            target=self.worker_migrate_old_top10,
             args=(Path(chosen),),
             daemon=True
         ).start()
@@ -4399,7 +4401,7 @@ class App(tk.Tk):
         return re.sub(r"\s+", " ", s).strip()
 
     def _migration_phrase(self, value):
-        """Нормализует фразу для миграции TOP-30 -> раздел."""
+        """Нормализует фразу для миграции TOP-10 -> раздел."""
         s=str(value or "").replace("\u00a0", " ").lower().replace("ё", "е")
         # Для названий разделов/запросов дефисы, подчёркивания и слэши
         # считаем разделителями слов, а не частью токена.
@@ -4428,7 +4430,7 @@ class App(tk.Tk):
         if q == s:
             return 100000000 + len(s)*100 + len(s.split())
 
-        # Основной сценарий старого TOP-30:
+        # Основной сценарий старого TOP-10:
         # "Лист нержавеющий гладкий AISI 304" ->
         # "Лист нержавеющий гладкий".
         if q.startswith(s + " "):
@@ -4449,7 +4451,7 @@ class App(tk.Tk):
 
         return 0
 
-    def _read_legacy_top30(self, path):
+    def _read_legacy_top10(self, path):
         last=None
         for enc in ("utf-8-sig","utf-8","cp1251"):
             try:
@@ -4461,10 +4463,10 @@ class App(tk.Tk):
                 last=e
         raise RuntimeError(f"Не удалось прочитать CSV: {last}")
 
-    def worker_migrate_old_top30(self, old_path):
-        """Быстрая миграция старого TOP-30 по уже созданным облачным разделам.
+    def worker_migrate_old_top10(self, old_path):
+        """Быстрая миграция старого TOP-10 по уже созданным облачным разделам.
 
-        В v1.25.1 сопоставление делалось Python-циклом по каждой строке и каждому
+        В v1.27 TOP10.1 сопоставление делалось Python-циклом по каждой строке и каждому
         разделу. Для большого файла (200k+ строк) это могло занимать десятки минут
         без единого сообщения в UI. Здесь нормализация и основные проверки делаются
         векторно через pandas, а в лог выводится прогресс.
@@ -4527,11 +4529,11 @@ class App(tk.Tk):
             if not sections:
                 raise RuntimeError("Не удалось получить ID облачных разделов из Google Web App.")
 
-            df=self._read_legacy_top30(old_path)
+            df=self._read_legacy_top10(old_path)
             total=len(df)
             if total==0:
-                raise RuntimeError("Старый seo_top30_result.csv пуст.")
-            self.q.put(("wkmigratelog",f"Строк в старом TOP-30: {total}"))
+                raise RuntimeError("Старый seo_top10_result.csv пуст.")
+            self.q.put(("wkmigratelog",f"Строк в старом TOP-10: {total}"))
             self.q.put(("wkmigratelog",f"Облачных разделов найдено: {len(sections)}"))
             self.q.put(("wkmigratelog","Оптимизированное сопоставление 200k+ строк..."))
 
@@ -4625,17 +4627,17 @@ class App(tk.Tk):
                 self.q.put(("wkmigratelog",f"[{n}/{len(nonempty)}] {section_name}: найдено строк {len(idxs)}"))
                 local_dir=cloud_cache_dir(sid)
                 local_dir.mkdir(parents=True,exist_ok=True)
-                local_path=local_dir/"seo_top30_result.csv"
+                local_path=local_dir/"seo_top10_result.csv"
                 new_df=df.loc[idxs].copy()
                 new_df.to_csv(local_path,index=False,encoding="utf-8-sig")
                 cloud_upload_section_file(
-                    endpoint,token,section_name,"seo_top30_result.csv",
+                    endpoint,token,section_name,"seo_top10_result.csv",
                     local_path,timeout=600,backup=True
                 )
                 uploaded+=1
                 uploaded_rows+=len(idxs)
 
-            report_path=old_path.parent/"seo_top30_migration_report.csv"
+            report_path=old_path.parent/"seo_top10_migration_report.csv"
             if report_rows:
                 pd.DataFrame(report_rows).to_csv(report_path,index=False,encoding="utf-8-sig")
                 self.q.put(("wkmigratelog",f"Строк без однозначного раздела: {len(report_rows)}"))
@@ -4663,8 +4665,8 @@ class App(tk.Tk):
         try:
             self.cloud_pull_current_section(update_ui=False)
             work_dir=cloud_cache_dir(self.cloud_section_id) if self.cloud_section_id else Path(self.folder.get() or os.getcwd())
-            out_path=work_dir/"seo_top30_result.csv"
-            progress_path=work_dir/"seo_top30_progress.json"
+            out_path=work_dir/"seo_top10_result.csv"
+            progress_path=work_dir/"seo_top10_progress.json"
             login=self.wk["Логин / email"].get().strip()
             password=self.wk["Пароль"].get()
             region=int(self.region.get())
@@ -4681,7 +4683,7 @@ class App(tk.Tk):
 
             # Отдельная постоянная сессия для AJAX: не трогаем cookie-jar
             # авторизационной сессии, но переиспользуем HTTP-соединение между
-            # десятками/сотнями TOP-30 запросов.
+            # десятками/сотнями TOP-10 запросов.
             ajax_session = requests.Session()
             ajax_session.headers.update({"User-Agent": UA, "Accept-Language": "ru-RU,ru;q=0.9"})
             cookie_header = "; ".join(
@@ -4700,7 +4702,7 @@ class App(tk.Tk):
                 if x.get("keyword") and str(x.get("keyword", "")).strip()
             ))
             # Формируем карту АКТУАЛЬНЫХ запросов текущей категории до загрузки кэша.
-            # Старые seo_top30_result.csv / progress.json могут содержать результаты
+            # Старые seo_top10_result.csv / progress.json могут содержать результаты
             # других категорий. Их нельзя считать выполненными только по факту наличия
             # source_query: учитываем только запросы, которые реально относятся к
             # текущей категории.
@@ -4775,7 +4777,7 @@ class App(tk.Tk):
             # Если checkpoint говорит «запрос выполнен», но в накопительном CSV
             # вообще нет ни одной строки с этим source_query, не доверяем старому
             # checkpoint: такой запрос повторяем, иначе 0-результат/старый checkpoint
-            # может навсегда скрыть реальные TOP-30.
+            # может навсегда скрыть реальные TOP-10.
             done_query_keys = {
                 qk for qk in done_query_keys
                 if qk in cached_result_query_keys
@@ -4795,11 +4797,11 @@ class App(tk.Tk):
                 if not any(norm(q) not in done_query_keys for q in variants)
             }
             pending_queries=sum(len(v) for _,v in query_plan)
-            self.q.put(("wklog",f"TOP-30 CSV: {out_path}"))
+            self.q.put(("wklog",f"TOP-10 CSV: {out_path}"))
             self.q.put(("wklog",f"Checkpoint: {progress_path}"))
             self.q.put(("wklog",f"Всего значений текущей категории: {len(keywords)} | уже полностью обработано: {len(current_done)} | осталось значений: {len(keywords)-len(current_done)}"))
             self.q.put(("wklog",f"Запросов WordKeeper к выполнению: {pending_queries} | кэшем подтверждено запросов текущей категории: {len(done_query_keys)}"))
-            self.q.put(("wklog",f"Строк TOP-30 в накопительном CSV: {len(results)} | source_query с результатами текущей категории: {len(cached_result_query_keys)}"))
+            self.q.put(("wklog",f"Строк TOP-10 в накопительном CSV: {len(results)} | source_query с результатами текущей категории: {len(cached_result_query_keys)}"))
 
             # Один раз строим индекс уже сохранённых пар (source_query, URL).
             # Раньше этот set пересобирался из всего CSV на каждом запросе,
@@ -4837,7 +4839,7 @@ class App(tk.Tk):
                             raise RuntimeError(
                                 f"WordKeeper вернул пустой ответ (HTTP={rr_status}, тип={type(rr).__name__})"
                             )
-                        rows=parse_top30(rr_text,canonical)
+                        rows=parse_top10(rr_text,canonical)
                         for rrow in rows:
                             rrow["source_query"]=actual_query
                         done_queries.add(actual_query)
@@ -4879,7 +4881,7 @@ class App(tk.Tk):
                             "done_queries":safe_sorted_strings(done_queries),
                             "updated_at":time.strftime("%Y-%m-%d %H:%M:%S")
                         },ensure_ascii=False,indent=2),encoding="utf-8")
-                        error_log = work_dir / "wordkeeper_error.log"
+                        error_log = work_dir / "wordkeeper_top10_error.log"
                         try:
                             error_log.write_text(
                                 traceback.format_exc(),
@@ -4905,7 +4907,7 @@ class App(tk.Tk):
                 "updated_at":time.strftime("%Y-%m-%d %H:%M:%S")
             },ensure_ascii=False,indent=2),encoding="utf-8")
             try:
-                self.cloud_push_current_files(["seo_top30_result.csv","seo_top30_progress.json","wordkeeper_error.log"])
+                self.cloud_push_current_files(["seo_top10_result.csv","seo_top10_progress.json","wordkeeper_top10_error.log"])
                 cloud_sync_error = ""
             except Exception as e:
                 cloud_sync_error = str(e)
@@ -4938,14 +4940,14 @@ class App(tk.Tk):
         except Exception:
             return
         if self.topdf is None or self.topdf.empty:
-            messagebox.showwarning("WordKeeper", "Сначала загрузите или получите TOP-30 WordKeeper.")
+            messagebox.showwarning("WordKeeper", "Сначала загрузите или получите TOP-10 WordKeeper.")
             return
         self.analysis_stop_event.clear()
         self.analysis_running=True
         self.compare_btn.config(state="disabled")
         self.analysis_stop_btn.config(state="normal")
         self.stats.delete("1.0","end")
-        self.stats.insert("end", "Запуск анализа TOP-30...\n\n")
+        self.stats.insert("end", "Запуск анализа TOP-10...\n\n")
         threading.Thread(target=self.worker_compare,daemon=True).start()
 
     def stop_analysis(self):
@@ -4958,7 +4960,7 @@ class App(tk.Tk):
         try:
             self.cloud_pull_current_section(update_ui=False)
             folder=cloud_cache_dir(self.cloud_section_id) if self.cloud_section_id else Path(os.getcwd())
-            cache_path=folder / "seo_serp_page_classification.csv"
+            cache_path=folder / "seo_top10_serp_page_classification.csv"
             res=Pipeline().merge_analysis(
                 self.res,
                 self.topdf,
@@ -4966,7 +4968,7 @@ class App(tk.Tk):
                 stop_event=self.analysis_stop_event,
                 cache_path=cache_path,
             )
-            self.cloud_push_current_files(["seo_serp_page_classification.csv"])
+            self.cloud_push_current_files(["seo_top10_serp_page_classification.csv"])
             self.q.put(("analysisdone", {"res":res, "cache":str(cache_path), "stopped":self.analysis_stop_event.is_set()}))
         except Exception as e:
             self.q.put(("analysiserr",str(e)))
@@ -4980,13 +4982,14 @@ class App(tk.Tk):
         p=Counter(x.get("promotion_type") for x in self.res["rows"])
         self.stats.delete("1.0","end")
         self.stats.insert("end",f"Категория: {self.res['category']}\nCategory ID: {self.res['category_id']}\nВариантов: {len(self.res['rows'])}\n\n")
+        self.stats.insert("end", "АНАЛИЗ: используются только позиции 1-10 каждого запроса WordKeeper. Конкуренты считаются по независимым доменам; решение CREATE/SKIP принимается только по этим TOP-10 данным.\n\n")
         self.stats.insert("end", "ТИП ПРОДВИЖЕНИЯ:\n")
         for k in ("SEO-СТРАНИЦА","ТОВАР","СМЕШАННЫЙ","ИНФОРМАЦИОННАЯ","НЕДОСТАТОЧНО ДАННЫХ"):
             self.stats.insert("end",f"{k}: {p[k]}\n")
         self.stats.insert("end", "\nСТАТУС SEO-СТРАНИЦ:\n")
         for k in ("CREATE","SKIP","EXISTS"):
             self.stats.insert("end",f"{k}: {c[k]}\n")
-        self.stats.insert("end", "\nCREATE = SEO-отбор v1.25: минимум 5 независимых filter-конкурентов (7 для числовых характеристик; 3 для характеристик до 5 значений) + SEO Score. Дубли URL и слабые кандидаты идут в SKIP.\n")
+        self.stats.insert("end", "\nCREATE = SEO-отбор v1.27 TOP10: минимум 3 независимых filter-конкурента (4 для числовых характеристик; 2 для характеристик до 5 значений) внутри TOP-10 + SEO Score. Порог Score=5. Дубли URL и слабые кандидаты идут в SKIP.\n")
         self.stats.insert("end", "ТОВАР = запрос преимущественно ведет на карточки товаров; отдельную SEO-посадочную не создаем.\n\n")
         self.stats.insert("end", "СПИСОК:\n")
         for x in self.res["rows"]:
@@ -5011,7 +5014,7 @@ class App(tk.Tk):
                 self.stats.insert("end",f"{x['keyword']} | {x['filter']} | {x['value']} | SCORE={x.get('seo_selection_score','')} | ТИП={x.get('promotion_type','')} | STATUS={x.get('status','')} | PRODUCT={x.get('product_domains_count',0)} | SEO={x.get('seo_domains_count',0)} | {x.get('reason','')}\n")
 
     def url_audit_path(self):
-        return (cloud_cache_dir(self.cloud_section_id) if self.cloud_section_id else Path(self.folder.get() or os.getcwd())) / "seo_url_check_audit.csv"
+        return (cloud_cache_dir(self.cloud_section_id) if self.cloud_section_id else Path(self.folder.get() or os.getcwd())) / "seo_top10_url_check_audit.csv"
 
     def _load_url_audit(self):
         path = self.url_audit_path()
@@ -5248,7 +5251,7 @@ class App(tk.Tk):
                 self.q.put(("urlstatus", f"Проверено: {min(reused+checked_new,total)} из {total}"))
 
             self._save_url_audit(audit)
-            self.cloud_push_current_files(["seo_url_check_audit.csv"])
+            self.cloud_push_current_files(["seo_top10_url_check_audit.csv"])
             stopped=self.url_check_stop_event.is_set()
             self.q.put(("urldone", {"checked": min(reused+checked_new,total), "total": total, "stopped": stopped, "reused": reused, "path": str(path)}))
         except Exception as e:
@@ -5258,7 +5261,7 @@ class App(tk.Tk):
 
 
     def ocfilter_audit_path(self):
-        return (cloud_cache_dir(self.cloud_section_id) if self.cloud_section_id else Path(self.folder.get() or os.getcwd())) / "seo_ocfilter_check_audit.json"
+        return (cloud_cache_dir(self.cloud_section_id) if self.cloud_section_id else Path(self.folder.get() or os.getcwd())) / "seo_top10_ocfilter_check_audit.json"
 
     def _save_ocfilter_audit(self, results):
         """Сохраняет результат DRY-RUN OCFilter, чтобы он не терялся между запусками."""
@@ -5573,7 +5576,7 @@ class App(tk.Tk):
                 self.q.put(("urlstatus", f"Проверено: {min(reused+checked_new,total)} из {total}"))
 
             self._save_url_audit(audit)
-            self.cloud_push_current_files(["seo_url_check_audit.csv"])
+            self.cloud_push_current_files(["seo_top10_url_check_audit.csv"])
             stopped=self.url_check_stop_event.is_set()
             self.q.put(("urldone", {"checked": min(reused+checked_new,total), "total": total, "stopped": stopped, "reused": reused, "path": str(path)}))
         except Exception as e:
@@ -5861,11 +5864,11 @@ class App(tk.Tk):
     def _build_section_status_row(
         self,
         stage="",
-        top30_values_done=None,
-        top30_values_total=None,
-        top30_queries_done=None,
-        top30_queries_total=None,
-        top30_rows=None,
+        top10_values_done=None,
+        top10_values_total=None,
+        top10_queries_done=None,
+        top10_queries_total=None,
+        top10_rows=None,
     ):
         """Формирует одну строку для общего реестра РАЗДЕЛЫ."""
         res = dict(self.res or {})
@@ -5879,23 +5882,23 @@ class App(tk.Tk):
         ).strip()
         category_id = str(res.get("category_id", "") or "").strip()
 
-        # TOP-30.
-        if top30_rows is None:
+        # TOP-10.
+        if top10_rows is None:
             try:
-                top30_rows = int(len(self.topdf)) if self.topdf is not None and not self.topdf.empty else 0
+                top10_rows = int(len(self.topdf)) if self.topdf is not None and not self.topdf.empty else 0
             except Exception:
-                top30_rows = 0
+                top10_rows = 0
 
-        unique_top30_urls = 0
+        unique_top10_urls = 0
         try:
             if self.topdf is not None and not self.topdf.empty:
                 uc = find_col(self.topdf, ["url", "link", "href"])
                 if uc:
-                    unique_top30_urls = int(
+                    unique_top10_urls = int(
                         self.topdf[uc].astype(str).str.strip().str.rstrip("/").replace("", pd.NA).dropna().nunique()
                     )
         except Exception:
-            unique_top30_urls = 0
+            unique_top10_urls = 0
 
         # CREATE / SKIP / EXISTS после анализа.
         create_count = sum(1 for x in rows if str(x.get("status", "")) == "CREATE")
@@ -5949,10 +5952,10 @@ class App(tk.Tk):
                 status = "URL ПРОВЕРЕН"
             elif create_count or skip_count or exists_count:
                 status = "АНАЛИЗ ГОТОВ"
-            elif top30_values_total and top30_values_done is not None and top30_values_done >= top30_values_total:
-                status = "TOP-30 ГОТОВ"
-            elif top30_rows:
-                status = "TOP-30 ЗАГРУЖЕН"
+            elif top10_values_total and top10_values_done is not None and top10_values_done >= top10_values_total:
+                status = "TOP-10 ГОТОВ"
+            elif top10_rows:
+                status = "TOP-10 ЗАГРУЖЕН"
             else:
                 status = "КАТЕГОРИЯ ПОДКЛЮЧЕНА"
 
@@ -5961,12 +5964,12 @@ class App(tk.Tk):
             "category_url": category_url,
             "category_id": category_id,
             "values_total": len(rows),
-            "top30_values_done": "" if top30_values_done is None else int(top30_values_done),
-            "top30_values_total": "" if top30_values_total is None else int(top30_values_total),
-            "top30_queries_done": "" if top30_queries_done is None else int(top30_queries_done),
-            "top30_queries_total": "" if top30_queries_total is None else int(top30_queries_total),
-            "top30_rows": int(top30_rows or 0),
-            "unique_top30_urls": int(unique_top30_urls or 0),
+            "top10_values_done": "" if top10_values_done is None else int(top10_values_done),
+            "top10_values_total": "" if top10_values_total is None else int(top10_values_total),
+            "top10_queries_done": "" if top10_queries_done is None else int(top10_queries_done),
+            "top10_queries_total": "" if top10_queries_total is None else int(top10_queries_total),
+            "top10_rows": int(top10_rows or 0),
+            "unique_top10_urls": int(unique_top10_urls or 0),
             "analysis_create": int(create_count),
             "analysis_skip": int(skip_count),
             "analysis_exists": int(exists_count),
@@ -5979,7 +5982,7 @@ class App(tk.Tk):
             "ready_pages": int(ready_count),
             "status": status,
             "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-            "app_version": "1.26.0",
+            "app_version": "1.27.0 TOP10",
         }
 
     def _update_section_status_async(self, stage="", **kwargs):
@@ -6146,10 +6149,10 @@ class App(tk.Tk):
                         + (f"Отчёт: {x.get('report')}\n" if x.get('report') else "")
                     )
                     self.wklog.see("end")
-                    # Миграция старого TOP-30 затрагивает несколько разделов,
+                    # Миграция старого TOP-10 затрагивает несколько разделов,
                     # поэтому здесь не обновляем статус текущего окна как одного раздела.
                     messagebox.showinfo(
-                        "Миграция TOP-30",
+                        "Миграция TOP-10",
                         f"Готово.\n\n"
                         f"Всего строк: {x.get('total',0)}\n"
                         f"Распознано: {x.get('matched',0)}\n"
@@ -6160,25 +6163,25 @@ class App(tk.Tk):
                 elif t=="wkmigrateerror":
                     self.wk_migrate_btn.config(state="normal")
                     self.wklog.insert("end",f"ОШИБКА МИГРАЦИИ: {x}\n"); self.wklog.see("end")
-                    messagebox.showerror("Миграция TOP-30",str(x))
+                    messagebox.showerror("Миграция TOP-10",str(x))
                 elif t=="wklog":self.wklog.insert("end",str(x)+"\n");self.wklog.see("end")
                 elif t=="wkdone":
-                    p=x; self.topdf=pd.read_csv(p,encoding="utf-8-sig") if Path(p).exists() and Path(p).stat().st_size else pd.DataFrame(); self.wkstatus.config(text=f"Готово: {Path(p).name} | строк: {len(self.topdf)}"); self.wk_start_btn.config(state="normal"); self.wk_stop_btn.config(state="disabled"); self.wklog.insert("end",f"\nФайл TOP-30: {p}\n")
-                    self._update_section_status_async("TOP-30 ГОТОВ", top30_values_done=len(self.res.get("rows", [])), top30_values_total=len(self.res.get("rows", [])))
+                    p=x; self.topdf=pd.read_csv(p,encoding="utf-8-sig") if Path(p).exists() and Path(p).stat().st_size else pd.DataFrame(); self.wkstatus.config(text=f"Готово: {Path(p).name} | строк: {len(self.topdf)}"); self.wk_start_btn.config(state="normal"); self.wk_stop_btn.config(state="disabled"); self.wklog.insert("end",f"\nФайл TOP-10: {p}\n")
+                    self._update_section_status_async("TOP-10 ГОТОВ", top10_values_done=len(self.res.get("rows", [])), top10_values_total=len(self.res.get("rows", [])))
                 elif t=="wkstop":
-                    p=x["path"]; self.topdf=pd.read_csv(p,encoding="utf-8-sig") if Path(p).exists() and Path(p).stat().st_size else pd.DataFrame(); self.wkstatus.config(text=f"ОСТАНОВЛЕНО: {len(self.topdf)} строк | {Path(p).name}"); self.wk_start_btn.config(state="normal"); self.wk_stop_btn.config(state="disabled"); self.wklog.insert("end",f"\nАНАЛИЗ ОСТАНОВЛЕН.\nTOP-30: {p}\nCheckpoint: {x['progress']}\nЗавершено запросов: {x['done']} из {x['total']}\nМожно нажать ПОЛУЧИТЬ TOP-30 снова - продолжит с последнего сохранённого запроса.\n")
+                    p=x["path"]; self.topdf=pd.read_csv(p,encoding="utf-8-sig") if Path(p).exists() and Path(p).stat().st_size else pd.DataFrame(); self.wkstatus.config(text=f"ОСТАНОВЛЕНО: {len(self.topdf)} строк | {Path(p).name}"); self.wk_start_btn.config(state="normal"); self.wk_stop_btn.config(state="disabled"); self.wklog.insert("end",f"\nАНАЛИЗ ОСТАНОВЛЕН.\nTOP-10: {p}\nCheckpoint: {x['progress']}\nЗавершено запросов: {x['done']} из {x['total']}\nМожно нажать ПОЛУЧИТЬ TOP-10 снова - продолжит с последнего сохранённого запроса.\n")
                     if x.get("cloud_sync_error"):
                         self.wklog.insert("end",f"ОБЛАЧНАЯ СИНХРОНИЗАЦИЯ НЕ ВЫПОЛНЕНА: {x['cloud_sync_error']}\n")
                     self.wklog.see("end")
-                    self._update_section_status_async("TOP-30 ОСТАНОВЛЕН", top30_values_done=x.get("done", 0), top30_values_total=x.get("total", 0))
+                    self._update_section_status_async("TOP-10 ОСТАНОВЛЕН", top10_values_done=x.get("done", 0), top10_values_total=x.get("total", 0))
                 elif t=="wkdoneclouderror":
                     p=x["path"]
                     self.topdf=pd.read_csv(p,encoding="utf-8-sig") if Path(p).exists() and Path(p).stat().st_size else pd.DataFrame()
                     self.wkstatus.config(text=f"Готово локально: {len(self.topdf)} строк | облако не обновлено")
                     self.wk_start_btn.config(state="normal"); self.wk_stop_btn.config(state="disabled")
-                    self.wklog.insert("end",f"\nTOP-30 СОХРАНЁН ЛОКАЛЬНО: {p}\nОШИБКА ОБЛАЧНОЙ СИНХРОНИЗАЦИИ: {x['error']}\n")
+                    self.wklog.insert("end",f"\nTOP-10 СОХРАНЁН ЛОКАЛЬНО: {p}\nОШИБКА ОБЛАЧНОЙ СИНХРОНИЗАЦИИ: {x['error']}\n")
                     self.wklog.see("end")
-                    self._update_section_status_async("TOP-30 ГОТОВ (ОБЛАКО НЕ ОБНОВЛЕНО)")
+                    self._update_section_status_async("TOP-10 ГОТОВ (ОБЛАКО НЕ ОБНОВЛЕНО)")
                 elif t=="wkerr":
                     self.wk_running=False; self.wk_start_btn.config(state="normal"); self.wk_stop_btn.config(state="disabled"); messagebox.showerror("WordKeeper",x)
                 elif t=="analysislog":
@@ -6243,7 +6246,7 @@ class App(tk.Tk):
                     audit_path = self._save_ocfilter_audit(results) if results else self.ocfilter_audit_path()
                     try:
                         if results:
-                            self.cloud_push_current_files(["seo_ocfilter_check_audit.json"])
+                            self.cloud_push_current_files(["seo_top10_ocfilter_check_audit.json"])
                     except Exception as cloud_e:
                         self.oclog.insert("end",f"Google Drive: не удалось сохранить OCFilter audit: {cloud_e}\n")
                     self._apply_ocfilter_audit()
