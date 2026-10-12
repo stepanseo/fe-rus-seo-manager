@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-FE-RUS SEO Manager TOP10 v1.28.5
+FE-RUS SEO Manager TOP10 v1.28.6
 
 Экспериментальная отдельная TOP-10 версия Windows-приложения через реальный веб-инструмент WordKeeper:
 1. Категория - получает category_id, OCFilter options и значения.
@@ -1099,7 +1099,139 @@ def _pw_find_region_input(page):
         'input[name*="region" i]',
         'input[placeholder*="регион" i]',
     ]
-    return _pw_locator_first(page, candidates)
+    loc = _pw_locator_first(page, candidates)
+    if loc:
+        return loc
+
+    # На /core/parse_top поле региона визуально подписано
+    # «Выберите регион», но у самого input может не быть name/placeholder.
+    try:
+        labels = page.get_by_text(re.compile(r'Выберите\s+регион', re.I))
+        for i in range(min(labels.count(), 20)):
+            el = labels.nth(i)
+            for xp in ('xpath=..', 'xpath=../..', 'xpath=../../..', 'xpath=../../../..'):
+                try:
+                    parent = el.locator(xp)
+                    inp = parent.locator('input:not([type="hidden"]), select').first
+                    if inp.count() > 0:
+                        return inp
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+    # Последний fallback: ищем обычный input, у которого родительский блок
+    # содержит подпись «Выберите регион / мои регионы».
+    try:
+        inputs = page.locator('input:not([type="hidden"])')
+        for i in range(min(inputs.count(), 100)):
+            el = inputs.nth(i)
+            meta = el.evaluate("""e => ({
+                ph: e.placeholder || '',
+                name: e.name || '',
+                id: e.id || '',
+                aria: e.getAttribute('aria-label') || '',
+                parent: e.parentElement ? e.parentElement.innerText : '',
+                grand: e.parentElement && e.parentElement.parentElement
+                    ? e.parentElement.parentElement.innerText : ''
+            })""")
+            blob = ' '.join(str(meta.get(k, '')) for k in meta)
+            if re.search(r'Выберите\s+регион|мои\s+регионы', blob, re.I):
+                return el
+    except Exception:
+        pass
+    return None
+
+
+def _pw_set_region(page, region):
+    """Выбирает регион в реальном TOP-10 UI, включая autocomplete-поле."""
+    ri = _pw_find_region_input(page)
+    if not ri:
+        return False
+
+    try:
+        tag = (ri.evaluate('(e)=>e.tagName') or '').upper()
+    except Exception:
+        tag = ''
+
+    region_id = str(region or '').strip()
+    # Для нашего текущего региона 213 WordKeeper показывает человекочитаемое
+    # значение «Москва»; сначала пробуем ID, затем название.
+    values = [region_id]
+    if region_id == '213':
+        values.append('Москва')
+
+    if tag == 'SELECT':
+        try:
+            ri.select_option(value=region_id)
+            return True
+        except Exception:
+            try:
+                opts = ri.locator('option')
+                for i in range(min(opts.count(), 500)):
+                    op = opts.nth(i)
+                    val = str(op.get_attribute('value') or '').strip()
+                    label = str(op.inner_text() or '').strip()
+                    if region_id and (val == region_id or region_id in label):
+                        ri.select_option(value=val)
+                        return True
+            except Exception:
+                pass
+        return False
+
+    for value in values:
+        try:
+            ri.click()
+            ri.fill(value)
+            page.wait_for_timeout(700)
+
+            # Autocomplete: выбираем видимый вариант из выпадающего списка.
+            option_selectors = [
+                '[role="option"]:visible',
+                '.ui-autocomplete li:visible',
+                '.ui-menu-item:visible',
+                '.select2-results__option:visible',
+                '.dropdown-menu li:visible',
+                'li:visible',
+            ]
+            for selector in option_selectors:
+                try:
+                    opts = page.locator(selector)
+                    for i in range(min(opts.count(), 100)):
+                        op = opts.nth(i)
+                        s = (op.inner_text() or '').strip()
+                        if not s:
+                            continue
+                        if value.lower() in s.lower() or (region_id == '213' and 'моск' in s.lower()):
+                            op.click(timeout=3000)
+                            page.wait_for_timeout(300)
+                            return True
+                except Exception:
+                    pass
+
+            # Некоторые реализации принимают значение по Enter.
+            try:
+                ri.press('Enter')
+                page.wait_for_timeout(300)
+            except Exception:
+                pass
+
+            current = str(ri.input_value() or '').strip()
+            if current and current.lower() != value.lower():
+                return True
+            if region_id == '213' and 'моск' in current.lower():
+                return True
+        except Exception:
+            pass
+    return False
+
+
+def _pw_region_error_visible(page):
+    try:
+        body = _pw_text(page.locator('body'))
+        return bool(re.search(r'Необходимо\s+выбрать\s+регион', body, re.I))
+    except Exception:
+        return False
 
 
 def _pw_find_create_button(page):
@@ -1157,8 +1289,7 @@ def _pw_normalize_export_rows(rows):
     return out
 
 
-WK_TOP10_HELPER_SOURCE = '# -*- coding: utf-8 -*-\nimport sys, json, csv, re, time, traceback\nfrom pathlib import Path\n\ndef txt(el):\n    try: return (el.inner_text() or \'\').strip()\n    except Exception: return \'\'\n\ndef attr(el, name):\n    try: return str(el.get_attribute(name) or \'\').strip()\n    except Exception: return \'\'\n\ndef locator_first(page, selectors):\n    for selector in selectors:\n        try:\n            loc=page.locator(selector)\n            if loc.count()>0: return loc.first\n        except Exception: pass\n    return None\n\ndef click_text(page, patterns, exact=False):\n    for pattern in patterns:\n        try:\n            loc=page.get_by_text(re.compile(pattern, re.I), exact=exact)\n            if loc.count()>0:\n                loc.first.click(timeout=10000); return True\n        except Exception: pass\n        try:\n            loc=page.locator(\'button, a, input[type=button], input[type=submit]\')\n            for i in range(min(loc.count(), 500)):\n                el=loc.nth(i)\n                s=(txt(el) or attr(el,\'value\') or attr(el,\'aria-label\') or \'\').strip()\n                if s and re.search(pattern,s,re.I):\n                    el.click(timeout=10000); return True\n        except Exception: pass\n    return False\n\ndef find_query_input(page):\n    return locator_first(page,[\n        \'textarea[name*="text" i]\',\'textarea[name*="word" i]\',\'textarea[name*="query" i]\',\n        \'textarea[name*="phrase" i]\',\'textarea[name*="key" i]\',\n        \'textarea[placeholder*="фраз" i]\',\'textarea[placeholder*="запрос" i]\',\'textarea[placeholder*="ключ" i]\',\n        \'textarea\',\'input[name*="text" i]\',\'input[name*="word" i]\',\'input[name*="query" i]\'\n    ])\n\ndef find_region_input(page):\n    return locator_first(page,[\n        \'select[name*="geo" i]\',\'select[name*="region" i]\',\n        \'input[name*="geo" i]\',\'input[name*="region" i]\',\'input[placeholder*="регион" i]\'\n    ])\n\ndef find_create_button(page):\n    return click_text(page,[r\'создать\\s+задани\',r\'запустить\',r\'создать\\s+задач\',r\'собрать\\s+топ\'])\n\ndef normalize(rows):\n    out=[]\n    for r in rows or []:\n        rr={str(k).strip():v for k,v in dict(r).items()}\n        def pick(names):\n            for n in names:\n                for k,v in rr.items():\n                    if str(k).strip().lower()==n.lower(): return str(v or \'\').strip()\n            for n in names:\n                for k,v in rr.items():\n                    if n.lower() in str(k).strip().lower(): return str(v or \'\').strip()\n            return \'\'\n        url=pick([\'url\',\'ссылка\',\'страница\'])\n        if not url: continue\n        out.append({\'keyword\':pick([\'keyword\',\'запрос\',\'фраза\',\'query\',\'ключ\']),\n                    \'position\':pick([\'position\',\'позиция\',\'pos\',\'поз\']),\n                    \'domain\':pick([\'domain\',\'домен\']),\n                    \'url\':url,\'title\':pick([\'title\',\'заголовок\',\'h1\']),\n                    \'snippet\':pick([\'snippet\',\'сниппет\',\'description\'])})\n    return out\n\ndef parse_csv_file(path):\n    raw=Path(path).read_bytes()\n    for enc in (\'utf-8-sig\',\'utf-8\',\'cp1251\'):\n        try:\n            text=raw.decode(enc)\n            for sep in (\',\',\';\',\'\\t\'):\n                rows=list(csv.DictReader(text.splitlines(),delimiter=sep))\n                if rows and len(rows[0])>=2: return normalize(rows)\n        except Exception: pass\n    return []\n\ndef main():\n    request=Path(sys.argv[1]); result=Path(sys.argv[2]); progress_file=Path(sys.argv[3])\n    data=json.loads(request.read_text(encoding=\'utf-8\'))\n    login=str(data.get(\'login\',\'\')); password=str(data.get(\'password\',\'\')); region=str(data.get(\'region\',\'213\'))\n    queries=[]\n    for q in data.get(\'queries\',[]):\n        q=str(q or \'\').strip()\n        if q and q not in queries: queries.append(q)\n    profile=Path(data[\'profile\']); timeout=int(data.get(\'timeout\',60000)); task_timeout=int(data.get(\'task_timeout\',3600000))\n    progress_file.parent.mkdir(parents=True,exist_ok=True)\n    def progress(s):\n        with progress_file.open(\'a\',encoding=\'utf-8\') as f: f.write(str(s)+\'\\n\')\n    try:\n        from playwright.sync_api import sync_playwright\n    except Exception as e:\n        raise RuntimeError(\'Python 3.14 не видит Playwright: \'+repr(e))\n    progress(\'Playwright: запуск через Python 3.14.\')\n    progress(\'Открываю браузерный профиль WordKeeper...\')\n    profile.mkdir(parents=True,exist_ok=True); captured=[]; result_rows=[]\n    with sync_playwright() as pw:\n        browser=pw.chromium.launch_persistent_context(str(profile),headless=False,viewport={\'width\':1400,\'height\':900},accept_downloads=True)\n        page=browser.pages[0] if browser.pages else browser.new_page(); page.set_default_timeout(timeout)\n        responses=[]\n        page.on(\'response\', lambda r: responses.append(r) if \'word-keeper.ru\' in r.url else None)\n        try:\n            page.goto(\'https://word-keeper.ru/login\',wait_until=\'domcontentloaded\',timeout=timeout); page.wait_for_timeout(1200)\n            if \'/login\' in page.url:\n                li=locator_first(page,[\'input[name="login"]\',\'input[type="email"]\',\'input[name*="mail" i]\',\'input[placeholder*="почт" i]\'])\n                pi=locator_first(page,[\'input[name="password"]\',\'input[type="password"]\'])\n                if not li or not pi: raise RuntimeError(\'Не удалось найти поля авторизации WordKeeper.\')\n                li.fill(login); pi.fill(password)\n                if not click_text(page,[r\'войти\',r\'авторизац\']): pi.press(\'Enter\')\n                page.wait_for_timeout(2500)\n                if \'/login\' in page.url: raise RuntimeError(\'Авторизация WordKeeper в браузере не удалась.\')\n            page.goto(\'https://word-keeper.ru/core/parse_top\',wait_until=\'domcontentloaded\',timeout=timeout); page.wait_for_timeout(1200)\n            if page.url.rstrip(\'/\').endswith(\'/login\'):\n                raise RuntimeError(\'WordKeeper вернул страницу авторизации вместо /core/parse_top. Проверьте авторизацию.\')\n            qi=find_query_input(page)\n            if not qi: raise RuntimeError(\'Инструмент TOP-10 открылся, но поле списка фраз не найдено. Страница: \'+page.url)\n            tag=(qi.evaluate(\'(e)=>e.tagName\') or \'\').upper(); ri=find_region_input(page)\n            if ri:\n                try:\n                    if (ri.evaluate(\'(e)=>e.tagName\') or \'\').upper()==\'SELECT\': ri.select_option(region)\n                    else: ri.fill(region)\n                except Exception: pass\n            if tag!=\'TEXTAREA\': raise RuntimeError(\'TOP-10 сейчас не даёт пакетное поле (найден \'+tag+\'). Нужна адаптация интерфейса.\')\n            qi.fill(\'\\n\'.join(queries)); before=len(responses)\n            if not find_create_button(page): raise RuntimeError(\'Не найдена кнопка запуска TOP-10.\')\n            progress(\'Задание отправлено: \'+str(len(queries))+\' запросов.\')\n            deadline=time.time()+task_timeout/1000; downloaded=None\n            while time.time()<deadline:\n                page.wait_for_timeout(3000); links=page.locator(\'a,button,[role="button"]\')\n                for i in range(min(links.count(),500)):\n                    el=links.nth(i); blob=\' \'.join([txt(el),attr(el,\'href\'),attr(el,\'title\'),attr(el,\'aria-label\')])\n                    if re.search(r\'csv|выгруз|скач|export|download\',blob,re.I):\n                        try:\n                            with page.expect_download(timeout=3000) as di: el.click(timeout=3000)\n                            downloaded=di.value; break\n                        except Exception: pass\n                if downloaded: break\n                for resp in responses[before:]:\n                    if re.search(r\'(csv|json|download|export|top)\',resp.url,re.I):\n                        try:\n                            body=resp.text()\n                            if \'http\' in body and (\'url\' in body.lower() or \'domain\' in body.lower()): captured.append(body)\n                        except Exception: pass\n            if downloaded:\n                target=profile/\'last_top10_export.csv\'; downloaded.save_as(str(target)); result_rows=parse_csv_file(target)\n            if not result_rows:\n                for body in captured:\n                    for sep in (\',\',\';\',\'\\t\'):\n                        try:\n                            rows=list(csv.DictReader(body.splitlines(),delimiter=sep))\n                            if rows and len(rows[0])>=2: result_rows.extend(normalize(rows)); break\n                        except Exception: pass\n            if not result_rows:\n                diag=profile/\'top10_debug.html\'; diag.write_text(page.content(),encoding=\'utf-8\')\n                raise RuntimeError(\'TOP-10 отправлен, но экспорт результата не найден. Диагностика: \'+str(diag))\n            uniq={}\n            for r in result_rows:\n                k=(r.get(\'keyword\',\'\').strip(),r.get(\'url\',\'\').strip())\n                if k[0] and k[1]: uniq[k]=r\n            result.write_text(json.dumps({\'ok\':True,\'rows\':list(uniq.values())},ensure_ascii=False),encoding=\'utf-8\')\n            progress(\'Экспорт получен: \'+str(len(uniq))+\' уникальных строк.\')\n        finally:\n            try: browser.close()\n            except Exception: pass\n\nif __name__==\'__main__\':\n    try: main()\n    except Exception as e:\n        result=Path(sys.argv[2]); result.write_text(json.dumps({\'ok\':False,\'error\':str(e),\'traceback\':traceback.format_exc()},ensure_ascii=False),encoding=\'utf-8\')\n        raise\n'
-
+WK_TOP10_HELPER_SOURCE = '# -*- coding: utf-8 -*-\nimport sys, json, csv, re, time, traceback\nfrom pathlib import Path\n\ndef txt(el):\n    try: return (el.inner_text() or \'\').strip()\n    except Exception: return \'\'\n\ndef attr(el, name):\n    try: return str(el.get_attribute(name) or \'\').strip()\n    except Exception: return \'\'\n\ndef locator_first(page, selectors):\n    for selector in selectors:\n        try:\n            loc=page.locator(selector)\n            if loc.count()>0: return loc.first\n        except Exception: pass\n    return None\n\ndef click_text(page, patterns, exact=False):\n    for pattern in patterns:\n        try:\n            loc=page.get_by_text(re.compile(pattern, re.I), exact=exact)\n            if loc.count()>0:\n                loc.first.click(timeout=10000); return True\n        except Exception: pass\n        try:\n            loc=page.locator(\'button, a, input[type=button], input[type=submit]\')\n            for i in range(min(loc.count(), 500)):\n                el=loc.nth(i)\n                s=(txt(el) or attr(el,\'value\') or attr(el,\'aria-label\') or \'\').strip()\n                if s and re.search(pattern,s,re.I):\n                    el.click(timeout=10000); return True\n        except Exception: pass\n    return False\n\ndef find_query_input(page):\n    return locator_first(page,[\n        \'textarea[name*="text" i]\',\'textarea[name*="word" i]\',\'textarea[name*="query" i]\',\n        \'textarea[name*="phrase" i]\',\'textarea[name*="key" i]\',\n        \'textarea[placeholder*="фраз" i]\',\'textarea[placeholder*="запрос" i]\',\'textarea[placeholder*="ключ" i]\',\n        \'textarea\',\'input[name*="text" i]\',\'input[name*="word" i]\',\'input[name*="query" i]\'\n    ])\n\ndef find_region_input(page):\n    loc=locator_first(page,[\n        \'select[name*="geo" i]\',\'select[name*="region" i]\',\n        \'input[name*="geo" i]\',\'input[name*="region" i]\',\'input[placeholder*="регион" i]\'\n    ])\n    if loc: return loc\n    try:\n        labels=page.get_by_text(re.compile(r\'Выберите\\s+регион\',re.I))\n        for i in range(min(labels.count(),20)):\n            el=labels.nth(i)\n            for xp in (\'xpath=..\',\'xpath=../..\',\'xpath=../../..\',\'xpath=../../../..\'):\n                try:\n                    parent=el.locator(xp)\n                    inp=parent.locator(\'input:not([type="hidden"]),select\').first\n                    if inp.count()>0: return inp\n                except Exception: pass\n    except Exception: pass\n    try:\n        inputs=page.locator(\'input:not([type="hidden"])\')\n        for i in range(min(inputs.count(),100)):\n            el=inputs.nth(i)\n            meta=el.evaluate("""e=>({\n                ph:e.placeholder||\'\',name:e.name||\'\',id:e.id||\'\',\n                aria:e.getAttribute(\'aria-label\')||\'\',\n                parent:e.parentElement?e.parentElement.innerText:\'\',\n                grand:e.parentElement&&e.parentElement.parentElement?e.parentElement.parentElement.innerText:\'\'\n            })""")\n            blob=\' \'.join(str(meta.get(k,\'\')) for k in meta)\n            if re.search(r\'Выберите\\s+регион|мои\\s+регионы\',blob,re.I): return el\n    except Exception: pass\n    return None\n\ndef set_region(page, region):\n    ri=find_region_input(page)\n    if not ri: return False\n    try: tag=(ri.evaluate(\'(e)=>e.tagName\') or \'\').upper()\n    except Exception: tag=\'\'\n    rid=str(region or \'\').strip()\n    values=[rid] + ([\'Москва\'] if rid==\'213\' else [])\n    if tag==\'SELECT\':\n        try:\n            ri.select_option(value=rid); return True\n        except Exception:\n            try:\n                opts=ri.locator(\'option\')\n                for i in range(min(opts.count(),500)):\n                    op=opts.nth(i); val=str(op.get_attribute(\'value\') or \'\').strip(); lab=str(op.inner_text() or \'\').strip()\n                    if rid and (val==rid or rid in lab):\n                        ri.select_option(value=val); return True\n            except Exception: pass\n        return False\n    for value in values:\n        try:\n            ri.click(); ri.fill(value); page.wait_for_timeout(700)\n            for selector in [\'[role="option"]:visible\',\'.ui-autocomplete li:visible\',\'.ui-menu-item:visible\',\'.select2-results__option:visible\',\'.dropdown-menu li:visible\',\'li:visible\']:\n                try:\n                    opts=page.locator(selector)\n                    for i in range(min(opts.count(),100)):\n                        op=opts.nth(i); s=(op.inner_text() or \'\').strip()\n                        if s and (value.lower() in s.lower() or (rid==\'213\' and \'моск\' in s.lower())):\n                            op.click(timeout=3000); page.wait_for_timeout(300); return True\n                except Exception: pass\n            try: ri.press(\'Enter\'); page.wait_for_timeout(300)\n            except Exception: pass\n            cur=str(ri.input_value() or \'\').strip()\n            if cur and cur.lower()!=value.lower(): return True\n            if rid==\'213\' and \'моск\' in cur.lower(): return True\n        except Exception: pass\n    return False\n\ndef region_error_visible(page):\n    try: return bool(re.search(r\'Необходимо\\s+выбрать\\s+регион\',txt(page.locator(\'body\')),re.I))\n    except Exception: return False\n\ndef find_create_button(page):\n    return click_text(page,[r\'создать\\s+задани\',r\'запустить\',r\'создать\\s+задач\',r\'собрать\\s+топ\'])\n\ndef normalize(rows):\n    out=[]\n    for r in rows or []:\n        rr={str(k).strip():v for k,v in dict(r).items()}\n        def pick(names):\n            for n in names:\n                for k,v in rr.items():\n                    if str(k).strip().lower()==n.lower(): return str(v or \'\').strip()\n            for n in names:\n                for k,v in rr.items():\n                    if n.lower() in str(k).strip().lower(): return str(v or \'\').strip()\n            return \'\'\n        url=pick([\'url\',\'ссылка\',\'страница\'])\n        if not url: continue\n        out.append({\'keyword\':pick([\'keyword\',\'запрос\',\'фраза\',\'query\',\'ключ\']),\n                    \'position\':pick([\'position\',\'позиция\',\'pos\',\'поз\']),\n                    \'domain\':pick([\'domain\',\'домен\']),\n                    \'url\':url,\'title\':pick([\'title\',\'заголовок\',\'h1\']),\n                    \'snippet\':pick([\'snippet\',\'сниппет\',\'description\'])})\n    return out\n\ndef parse_csv_file(path):\n    raw=Path(path).read_bytes()\n    for enc in (\'utf-8-sig\',\'utf-8\',\'cp1251\'):\n        try:\n            text=raw.decode(enc)\n            for sep in (\',\',\';\',\'\\t\'):\n                rows=list(csv.DictReader(text.splitlines(),delimiter=sep))\n                if rows and len(rows[0])>=2: return normalize(rows)\n        except Exception: pass\n    return []\n\ndef main():\n    request=Path(sys.argv[1]); result=Path(sys.argv[2]); progress_file=Path(sys.argv[3])\n    data=json.loads(request.read_text(encoding=\'utf-8\'))\n    login=str(data.get(\'login\',\'\')); password=str(data.get(\'password\',\'\')); region=str(data.get(\'region\',\'213\'))\n    queries=[]\n    for q in data.get(\'queries\',[]):\n        q=str(q or \'\').strip()\n        if q and q not in queries: queries.append(q)\n    profile=Path(data[\'profile\']); timeout=int(data.get(\'timeout\',60000)); task_timeout=int(data.get(\'task_timeout\',3600000))\n    progress_file.parent.mkdir(parents=True,exist_ok=True)\n    def progress(s):\n        with progress_file.open(\'a\',encoding=\'utf-8\') as f: f.write(str(s)+\'\\n\')\n    try:\n        from playwright.sync_api import sync_playwright\n    except Exception as e:\n        raise RuntimeError(\'Python 3.14 не видит Playwright: \'+repr(e))\n    progress(\'Playwright: запуск через Python 3.14.\')\n    progress(\'Открываю браузерный профиль WordKeeper...\')\n    profile.mkdir(parents=True,exist_ok=True); captured=[]; result_rows=[]\n    with sync_playwright() as pw:\n        browser=pw.chromium.launch_persistent_context(str(profile),headless=False,viewport={\'width\':1400,\'height\':900},accept_downloads=True)\n        page=browser.pages[0] if browser.pages else browser.new_page(); page.set_default_timeout(timeout)\n        responses=[]\n        page.on(\'response\', lambda r: responses.append(r) if \'word-keeper.ru\' in r.url else None)\n        try:\n            page.goto(\'https://word-keeper.ru/login\',wait_until=\'domcontentloaded\',timeout=timeout); page.wait_for_timeout(1200)\n            if \'/login\' in page.url:\n                li=locator_first(page,[\'input[name="login"]\',\'input[type="email"]\',\'input[name*="mail" i]\',\'input[placeholder*="почт" i]\'])\n                pi=locator_first(page,[\'input[name="password"]\',\'input[type="password"]\'])\n                if not li or not pi: raise RuntimeError(\'Не удалось найти поля авторизации WordKeeper.\')\n                li.fill(login); pi.fill(password)\n                if not click_text(page,[r\'войти\',r\'авторизац\']): pi.press(\'Enter\')\n                page.wait_for_timeout(2500)\n                if \'/login\' in page.url: raise RuntimeError(\'Авторизация WordKeeper в браузере не удалась.\')\n            page.goto(\'https://word-keeper.ru/core/parse_top\',wait_until=\'domcontentloaded\',timeout=timeout); page.wait_for_timeout(1200)\n            if page.url.rstrip(\'/\').endswith(\'/login\'):\n                raise RuntimeError(\'WordKeeper вернул страницу авторизации вместо /core/parse_top. Проверьте авторизацию.\')\n            qi=find_query_input(page)\n            if not qi: raise RuntimeError(\'Инструмент TOP-10 открылся, но поле списка фраз не найдено. Страница: \'+page.url)\n            tag=(qi.evaluate(\'(e)=>e.tagName\') or \'\').upper()\n            region_ok=set_region(page,region)\n            progress(\'TOP-10: выбор региона %s: %s.\' % (region, \'OK\' if region_ok else \'не найден автоматический выбор\'))\n            if region_error_visible(page):\n                if str(region).strip()==\'213\':\n                    try:\n                        ri=find_region_input(page)\n                        if ri:\n                            ri.click(); ri.fill(\'Москва\'); page.wait_for_timeout(700)\n                            opts=page.locator(\'[role="option"]:visible,.ui-autocomplete li:visible,.ui-menu-item:visible,li:visible\')\n                            for i in range(min(opts.count(),100)):\n                                op=opts.nth(i); s=(op.inner_text() or \'\').strip()\n                                if \'моск\' in s.lower():\n                                    op.click(timeout=3000); page.wait_for_timeout(300); break\n                            try: ri.press(\'Enter\')\n                            except Exception: pass\n                    except Exception: pass\n                if region_error_visible(page):\n                    raise RuntimeError(\'WordKeeper не принял регион %s. В поле «Выберите регион» регион не выбран.\' % region)\n            if tag!=\'TEXTAREA\': raise RuntimeError(\'TOP-10 сейчас не даёт пакетное поле (найден \'+tag+\'). Нужна адаптация интерфейса.\')\n            qi.fill(\'\\n\'.join(queries)); before=len(responses)\n            if not find_create_button(page): raise RuntimeError(\'Не найдена кнопка запуска TOP-10.\')\n            progress(\'Задание отправлено: \'+str(len(queries))+\' запросов.\')\n            deadline=time.time()+task_timeout/1000; downloaded=None\n            while time.time()<deadline:\n                page.wait_for_timeout(3000); links=page.locator(\'a,button,[role="button"]\')\n                for i in range(min(links.count(),500)):\n                    el=links.nth(i); blob=\' \'.join([txt(el),attr(el,\'href\'),attr(el,\'title\'),attr(el,\'aria-label\')])\n                    if re.search(r\'csv|выгруз|скач|export|download\',blob,re.I):\n                        try:\n                            with page.expect_download(timeout=3000) as di: el.click(timeout=3000)\n                            downloaded=di.value; break\n                        except Exception: pass\n                if downloaded: break\n                for resp in responses[before:]:\n                    if re.search(r\'(csv|json|download|export|top)\',resp.url,re.I):\n                        try:\n                            body=resp.text()\n                            if \'http\' in body and (\'url\' in body.lower() or \'domain\' in body.lower()): captured.append(body)\n                        except Exception: pass\n            if downloaded:\n                target=profile/\'last_top10_export.csv\'; downloaded.save_as(str(target)); result_rows=parse_csv_file(target)\n            if not result_rows:\n                for body in captured:\n                    for sep in (\',\',\';\',\'\\t\'):\n                        try:\n                            rows=list(csv.DictReader(body.splitlines(),delimiter=sep))\n                            if rows and len(rows[0])>=2: result_rows.extend(normalize(rows)); break\n                        except Exception: pass\n            if not result_rows:\n                diag=profile/\'top10_debug.html\'; diag.write_text(page.content(),encoding=\'utf-8\')\n                raise RuntimeError(\'TOP-10 отправлен, но экспорт результата не найден. Диагностика: \'+str(diag))\n            uniq={}\n            for r in result_rows:\n                k=(r.get(\'keyword\',\'\').strip(),r.get(\'url\',\'\').strip())\n                if k[0] and k[1]: uniq[k]=r\n            result.write_text(json.dumps({\'ok\':True,\'rows\':list(uniq.values())},ensure_ascii=False),encoding=\'utf-8\')\n            progress(\'Экспорт получен: \'+str(len(uniq))+\' уникальных строк.\')\n        finally:\n            try: browser.close()\n            except Exception: pass\n\nif __name__==\'__main__\':\n    try: main()\n    except Exception as e:\n        result=Path(sys.argv[2]); result.write_text(json.dumps({\'ok\':False,\'error\':str(e),\'traceback\':traceback.format_exc()},ensure_ascii=False),encoding=\'utf-8\')\n        raise\n'
 def _collect_wordkeeper_top10_external(login, password, region, queries, stop_event, progress):
     """Запускает браузерную часть через Python 3.14, где установлен Playwright."""
     helper_path = CFG.parent / "wordkeeper_top10_helper.py"
@@ -1308,19 +1439,36 @@ def collect_wordkeeper_top10_real_tool(login, password, region, queries, stop_ev
             if not qlist:
                 raise RuntimeError('Нет запросов для TOP-10.')
 
-            region_input=_pw_find_region_input(page)
-            if region_input:
-                try:
-                    tag=(region_input.evaluate('(e)=>e.tagName') or '').upper()
-                    if tag=='SELECT':
-                        try:
-                            region_input.select_option(str(region))
-                        except Exception:
-                            pass
-                    else:
-                        region_input.fill(str(region))
-                except Exception:
-                    pass
+            region_ok = _pw_set_region(page, region)
+            progress(f'TOP-10: выбор региона {region}: {"OK" if region_ok else "не найден автоматический выбор"}.')
+            if _pw_region_error_visible(page):
+                # Повторная попытка для 213 через человекочитаемое название.
+                if str(region).strip() == '213':
+                    try:
+                        ri = _pw_find_region_input(page)
+                        if ri:
+                            ri.click()
+                            ri.fill('Москва')
+                            page.wait_for_timeout(700)
+                            opts = page.locator('[role="option"]:visible, .ui-autocomplete li:visible, .ui-menu-item:visible, li:visible')
+                            for i in range(min(opts.count(), 100)):
+                                op = opts.nth(i)
+                                s = (op.inner_text() or '').strip()
+                                if 'моск' in s.lower():
+                                    op.click(timeout=3000)
+                                    page.wait_for_timeout(300)
+                                    break
+                            try:
+                                ri.press('Enter')
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
+                if _pw_region_error_visible(page):
+                    raise RuntimeError(
+                        f'WordKeeper не принял регион {region}. '
+                        'В поле «Выберите регион» регион не выбран.'
+                    )
 
             # Если есть textarea, сначала пробуем один пакет — это соответствует UI-инструменту.
             if is_textarea:
@@ -3917,7 +4065,7 @@ def migrate_legacy_file_for_section(src, dst, filename, res):
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("FE-RUS SEO Manager TOP10 v1.28.5")
+        self.title("FE-RUS SEO Manager TOP10 v1.28.6")
         self.geometry("1280x860")
         self.q = queue.Queue()
         self.res = None
