@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-FE-RUS SEO Manager TOP10 v1.28.0
+FE-RUS SEO Manager TOP10 v1.28.1
 
 Экспериментальная отдельная TOP-10 версия Windows-приложения через реальный веб-инструмент WordKeeper:
 1. Категория - получает category_id, OCFilter options и значения.
@@ -30,6 +30,9 @@ import webbrowser
 import types
 import traceback
 import csv
+import subprocess
+import shutil
+import sys
 from pathlib import Path
 from urllib.parse import urlparse, urljoin, unquote_plus
 from collections import Counter
@@ -1152,6 +1155,66 @@ def _pw_normalize_export_rows(rows):
     return out
 
 
+WK_TOP10_HELPER_SOURCE = '# -*- coding: utf-8 -*-\nimport sys, json, csv, re, time, traceback\nfrom pathlib import Path\n\ndef txt(el):\n    try: return (el.inner_text() or \'\').strip()\n    except Exception: return \'\'\n\ndef attr(el, name):\n    try: return str(el.get_attribute(name) or \'\').strip()\n    except Exception: return \'\'\n\ndef locator_first(page, selectors):\n    for selector in selectors:\n        try:\n            loc=page.locator(selector)\n            if loc.count()>0: return loc.first\n        except Exception: pass\n    return None\n\ndef click_text(page, patterns, exact=False):\n    for pattern in patterns:\n        try:\n            loc=page.get_by_text(re.compile(pattern, re.I), exact=exact)\n            if loc.count()>0:\n                loc.first.click(timeout=10000); return True\n        except Exception: pass\n        try:\n            loc=page.locator(\'button, a, input[type=button], input[type=submit]\')\n            for i in range(min(loc.count(), 500)):\n                el=loc.nth(i)\n                s=(txt(el) or attr(el,\'value\') or attr(el,\'aria-label\') or \'\').strip()\n                if s and re.search(pattern,s,re.I):\n                    el.click(timeout=10000); return True\n        except Exception: pass\n    return False\n\ndef find_query_input(page):\n    return locator_first(page,[\n        \'textarea[name*="text" i]\',\'textarea[name*="word" i]\',\'textarea[name*="query" i]\',\n        \'textarea[name*="phrase" i]\',\'textarea[name*="key" i]\',\n        \'textarea[placeholder*="фраз" i]\',\'textarea[placeholder*="запрос" i]\',\'textarea[placeholder*="ключ" i]\',\n        \'textarea\',\'input[name*="text" i]\',\'input[name*="word" i]\',\'input[name*="query" i]\'\n    ])\n\ndef find_region_input(page):\n    return locator_first(page,[\n        \'select[name*="geo" i]\',\'select[name*="region" i]\',\n        \'input[name*="geo" i]\',\'input[name*="region" i]\',\'input[placeholder*="регион" i]\'\n    ])\n\ndef find_create_button(page):\n    return click_text(page,[r\'создать\\s+задани\',r\'запустить\',r\'создать\\s+задач\',r\'собрать\\s+топ\'])\n\ndef normalize(rows):\n    out=[]\n    for r in rows or []:\n        rr={str(k).strip():v for k,v in dict(r).items()}\n        def pick(names):\n            for n in names:\n                for k,v in rr.items():\n                    if str(k).strip().lower()==n.lower(): return str(v or \'\').strip()\n            for n in names:\n                for k,v in rr.items():\n                    if n.lower() in str(k).strip().lower(): return str(v or \'\').strip()\n            return \'\'\n        url=pick([\'url\',\'ссылка\',\'страница\'])\n        if not url: continue\n        out.append({\'keyword\':pick([\'keyword\',\'запрос\',\'фраза\',\'query\',\'ключ\']),\n                    \'position\':pick([\'position\',\'позиция\',\'pos\',\'поз\']),\n                    \'domain\':pick([\'domain\',\'домен\']),\n                    \'url\':url,\'title\':pick([\'title\',\'заголовок\',\'h1\']),\n                    \'snippet\':pick([\'snippet\',\'сниппет\',\'description\'])})\n    return out\n\ndef parse_csv_file(path):\n    raw=Path(path).read_bytes()\n    for enc in (\'utf-8-sig\',\'utf-8\',\'cp1251\'):\n        try:\n            text=raw.decode(enc)\n            for sep in (\',\',\';\',\'\\t\'):\n                rows=list(csv.DictReader(text.splitlines(),delimiter=sep))\n                if rows and len(rows[0])>=2: return normalize(rows)\n        except Exception: pass\n    return []\n\ndef main():\n    request=Path(sys.argv[1]); result=Path(sys.argv[2]); progress_file=Path(sys.argv[3])\n    data=json.loads(request.read_text(encoding=\'utf-8\'))\n    login=str(data.get(\'login\',\'\')); password=str(data.get(\'password\',\'\')); region=str(data.get(\'region\',\'213\'))\n    queries=[]\n    for q in data.get(\'queries\',[]):\n        q=str(q or \'\').strip()\n        if q and q not in queries: queries.append(q)\n    profile=Path(data[\'profile\']); timeout=int(data.get(\'timeout\',60000)); task_timeout=int(data.get(\'task_timeout\',3600000))\n    progress_file.parent.mkdir(parents=True,exist_ok=True)\n    def progress(s):\n        with progress_file.open(\'a\',encoding=\'utf-8\') as f: f.write(str(s)+\'\\n\')\n    try:\n        from playwright.sync_api import sync_playwright\n    except Exception as e:\n        raise RuntimeError(\'Python 3.14 не видит Playwright: \'+repr(e))\n    progress(\'Playwright: запуск через Python 3.14.\')\n    progress(\'Открываю браузерный профиль WordKeeper...\')\n    profile.mkdir(parents=True,exist_ok=True); captured=[]; result_rows=[]\n    with sync_playwright() as pw:\n        browser=pw.chromium.launch_persistent_context(str(profile),headless=False,viewport={\'width\':1400,\'height\':900},accept_downloads=True)\n        page=browser.pages[0] if browser.pages else browser.new_page(); page.set_default_timeout(timeout)\n        responses=[]\n        page.on(\'response\', lambda r: responses.append(r) if \'word-keeper.ru\' in r.url else None)\n        try:\n            page.goto(\'https://word-keeper.ru/dashboard\',wait_until=\'domcontentloaded\',timeout=timeout); page.wait_for_timeout(1500)\n            if \'/login\' in page.url:\n                li=locator_first(page,[\'input[name="login"]\',\'input[type="email"]\',\'input[name*="mail" i]\',\'input[placeholder*="почт" i]\'])\n                pi=locator_first(page,[\'input[name="password"]\',\'input[type="password"]\'])\n                if not li or not pi: raise RuntimeError(\'Не удалось найти поля авторизации WordKeeper.\')\n                li.fill(login); pi.fill(password)\n                if not click_text(page,[r\'войти\',r\'авторизац\']): pi.press(\'Enter\')\n                page.wait_for_timeout(2500)\n                if \'/login\' in page.url: raise RuntimeError(\'Авторизация WordKeeper в браузере не удалась.\')\n            if not click_text(page,[r\'выдача\\s+топ\\s*10\',r\'сбор\\s+топ\\s*10\']):\n                links=page.locator(\'a,button,[role="button"]\'); found=False\n                for i in range(min(links.count(),500)):\n                    el=links.nth(i); blob=\' \'.join([txt(el),attr(el,\'href\'),attr(el,\'title\'),attr(el,\'aria-label\')])\n                    if re.search(r\'(выдач|сбор).*топ\\s*10|топ\\s*10\',blob,re.I):\n                        try: el.click(timeout=10000); found=True; break\n                        except Exception: pass\n                if not found: raise RuntimeError(\'Не удалось открыть отдельный инструмент «Выдача ТОП 10». Страница: \'+page.url)\n            page.wait_for_timeout(1200); qi=find_query_input(page)\n            if not qi: raise RuntimeError(\'Инструмент TOP-10 открылся, но поле списка фраз не найдено. Страница: \'+page.url)\n            tag=(qi.evaluate(\'(e)=>e.tagName\') or \'\').upper(); ri=find_region_input(page)\n            if ri:\n                try:\n                    if (ri.evaluate(\'(e)=>e.tagName\') or \'\').upper()==\'SELECT\': ri.select_option(region)\n                    else: ri.fill(region)\n                except Exception: pass\n            if tag!=\'TEXTAREA\': raise RuntimeError(\'TOP-10 сейчас не даёт пакетное поле (найден \'+tag+\'). Нужна адаптация интерфейса.\')\n            qi.fill(\'\\n\'.join(queries)); before=len(responses)\n            if not find_create_button(page): raise RuntimeError(\'Не найдена кнопка запуска TOP-10.\')\n            progress(\'Задание отправлено: \'+str(len(queries))+\' запросов.\')\n            deadline=time.time()+task_timeout/1000; downloaded=None\n            while time.time()<deadline:\n                page.wait_for_timeout(3000); links=page.locator(\'a,button,[role="button"]\')\n                for i in range(min(links.count(),500)):\n                    el=links.nth(i); blob=\' \'.join([txt(el),attr(el,\'href\'),attr(el,\'title\'),attr(el,\'aria-label\')])\n                    if re.search(r\'csv|выгруз|скач|export|download\',blob,re.I):\n                        try:\n                            with page.expect_download(timeout=3000) as di: el.click(timeout=3000)\n                            downloaded=di.value; break\n                        except Exception: pass\n                if downloaded: break\n                for resp in responses[before:]:\n                    if re.search(r\'(csv|json|download|export|top)\',resp.url,re.I):\n                        try:\n                            body=resp.text()\n                            if \'http\' in body and (\'url\' in body.lower() or \'domain\' in body.lower()): captured.append(body)\n                        except Exception: pass\n            if downloaded:\n                target=profile/\'last_top10_export.csv\'; downloaded.save_as(str(target)); result_rows=parse_csv_file(target)\n            if not result_rows:\n                for body in captured:\n                    for sep in (\',\',\';\',\'\\t\'):\n                        try:\n                            rows=list(csv.DictReader(body.splitlines(),delimiter=sep))\n                            if rows and len(rows[0])>=2: result_rows.extend(normalize(rows)); break\n                        except Exception: pass\n            if not result_rows:\n                diag=profile/\'top10_debug.html\'; diag.write_text(page.content(),encoding=\'utf-8\')\n                raise RuntimeError(\'TOP-10 отправлен, но экспорт результата не найден. Диагностика: \'+str(diag))\n            uniq={}\n            for r in result_rows:\n                k=(r.get(\'keyword\',\'\').strip(),r.get(\'url\',\'\').strip())\n                if k[0] and k[1]: uniq[k]=r\n            result.write_text(json.dumps({\'ok\':True,\'rows\':list(uniq.values())},ensure_ascii=False),encoding=\'utf-8\')\n            progress(\'Экспорт получен: \'+str(len(uniq))+\' уникальных строк.\')\n        finally:\n            try: browser.close()\n            except Exception: pass\n\nif __name__==\'__main__\':\n    try: main()\n    except Exception as e:\n        result=Path(sys.argv[2]); result.write_text(json.dumps({\'ok\':False,\'error\':str(e),\'traceback\':traceback.format_exc()},ensure_ascii=False),encoding=\'utf-8\')\n        raise\n'
+
+
+def _collect_wordkeeper_top10_external(login, password, region, queries, stop_event, progress):
+    """Запускает браузерную часть через Python 3.14, где установлен Playwright."""
+    helper_path = CFG.parent / "wordkeeper_top10_helper.py"
+    request_path = CFG.parent / "wordkeeper_top10_request.json"
+    result_path = CFG.parent / "wordkeeper_top10_result.json"
+    progress_path = CFG.parent / "wordkeeper_top10_helper.progress.log"
+    helper_path.parent.mkdir(parents=True, exist_ok=True)
+    helper_path.write_text(WK_TOP10_HELPER_SOURCE, encoding="utf-8")
+    for p in (result_path, progress_path):
+        try: p.unlink()
+        except Exception: pass
+    request = {"login": login, "password": password, "region": str(region), "queries": list(queries),
+               "profile": str(WK_TOP10_BROWSER_PROFILE), "timeout": WK_TOP10_BROWSER_TIMEOUT,
+               "task_timeout": WK_TOP10_TASK_TIMEOUT}
+    request_path.write_text(json.dumps(request, ensure_ascii=False), encoding="utf-8")
+    launcher = shutil.which("py") or shutil.which("py.exe")
+    if not launcher:
+        candidate = Path(os.environ.get("LOCALAPPDATA", "")) / "Programs/Python/Launcher/py.exe"
+        launcher = str(candidate) if candidate.exists() else ""
+    if not launcher or not Path(launcher).exists():
+        raise RuntimeError("Не найден Python Launcher py.exe. Установите/проверьте Python 3.14.")
+    cmd=[launcher, "-3.14", str(helper_path), str(request_path), str(result_path), str(progress_path)]
+    progress("Основное приложение не видит Playwright; запускаю браузерный помощник через Python 3.14.")
+    proc=subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                          creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    pos=0
+    try:
+        while proc.poll() is None:
+            if stop_event.is_set():
+                try: proc.terminate()
+                except Exception: pass
+                return [], "Остановлено пользователем"
+            if progress_path.exists():
+                try:
+                    lines=progress_path.read_text(encoding="utf-8").splitlines()
+                    for line in lines[pos:]:
+                        if line.strip(): progress(line.strip())
+                    pos=len(lines)
+                except Exception: pass
+            time.sleep(0.5)
+        if progress_path.exists():
+            try:
+                lines=progress_path.read_text(encoding="utf-8").splitlines()
+                for line in lines[pos:]:
+                    if line.strip(): progress(line.strip())
+            except Exception: pass
+        if not result_path.exists():
+            raise RuntimeError("Браузерный помощник TOP-10 завершился с кодом %s, но результат не создан." % proc.returncode)
+        data=json.loads(result_path.read_text(encoding="utf-8"))
+        if not data.get("ok"):
+            raise RuntimeError(str(data.get("error") or "Неизвестная ошибка браузерного помощника TOP-10"))
+        return list(data.get("rows") or []), "OK"
+    finally:
+        try: request_path.unlink()
+        except Exception: pass
+
+
 def collect_wordkeeper_top10_real_tool(login, password, region, queries, stop_event, progress):
     """Запускает именно UI-инструмент WordKeeper «Выдача ТОП 10».
 
@@ -1160,12 +1223,9 @@ def collect_wordkeeper_top10_real_tool(login, password, region, queries, stop_ev
     """
     try:
         from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
-    except Exception as e:
-        raise RuntimeError(
-            "Для реального инструмента WordKeeper TOP-10 нужен Playwright. "
-            "Установите: pip install playwright и затем: playwright install chromium.\n"
-            f"Детали: {e}"
-        )
+    except Exception:
+        # Программа может быть запущена другим Python. Playwright у пользователя установлен в Python 3.14.
+        return _collect_wordkeeper_top10_external(login, password, region, queries, stop_event, progress)
 
     WK_TOP10_BROWSER_PROFILE.mkdir(parents=True, exist_ok=True)
     result_rows=[]
@@ -3870,7 +3930,7 @@ def migrate_legacy_file_for_section(src, dst, filename, res):
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("FE-RUS SEO Manager TOP10 v1.28.0")
+        self.title("FE-RUS SEO Manager TOP10 v1.28.1")
         self.geometry("1280x860")
         self.q = queue.Queue()
         self.res = None
@@ -5050,7 +5110,7 @@ class App(tk.Tk):
             # факт полного браузерного задания. Если есть готовый CSV текущего раздела,
             # его можно загрузить кнопкой CSV и не запускать повторно.
             self.q.put(('wklog', f'WordKeeper TOP-10: реальный инструмент «Выдача ТОП 10». Запросов: {len(keywords)}'))
-            self.q.put(('wklog', 'TOP-10 не является обрезанным TOP-30: WordKeeper сам выполняет отдельный инструмент.'))
+            self.q.put(('wklog', 'TOP-10 — отдельный инструмент WordKeeper «Выдача ТОП 10», не обрезка TOP-30.'))
             self.q.put(('wklog', 'Открываю браузерный профиль WordKeeper...'))
 
             def prog(msg): self.q.put(('wklog', msg))
@@ -5067,7 +5127,7 @@ class App(tk.Tk):
                     'stopped': True,
                     'updated_at': time.strftime('%Y-%m-%d %H:%M:%S'),
                     'mode': 'REAL_WORDKEEPER_TOP10_BROWSER',
-                    'version': '1.28.0',
+                    'version': '1.28.1',
                 }
                 progress_path.write_text(json.dumps(progress_data,ensure_ascii=False,indent=2),encoding='utf-8')
                 self.q.put(('wkdone',out_path))
@@ -5083,7 +5143,7 @@ class App(tk.Tk):
                 'stopped': False,
                 'updated_at': time.strftime('%Y-%m-%d %H:%M:%S'),
                 'mode': 'REAL_WORDKEEPER_TOP10_BROWSER',
-                'version': '1.28.0',
+                'version': '1.28.1',
                 'rows': len(rows),
             }
             progress_path.write_text(json.dumps(progress_data,ensure_ascii=False,indent=2),encoding='utf-8')
@@ -6150,7 +6210,7 @@ class App(tk.Tk):
             "ready_pages": int(ready_count),
             "status": status,
             "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-            "app_version": "1.28.0 TOP10 REAL TOOL",
+            "app_version": "1.28.1 TOP10 REAL TOOL",
         }
 
     def _update_section_status_async(self, stage="", **kwargs):
