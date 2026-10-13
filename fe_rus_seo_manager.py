@@ -1,10 +1,10 @@
 # -*- coding: utf-8 -*-
 """
-FE-RUS SEO Manager TOP10 v1.28.10
+FE-RUS SEO Manager TOP10 v1.29.1
 
 Экспериментальная отдельная TOP-10 версия Windows-приложения через реальный веб-инструмент WordKeeper:
 1. Категория - получает category_id, OCFilter options и значения.
-2. WordKeeper - реальный инструмент «Выдача ТОП 10» через браузер, без подмены TOP-30.
+2. WordKeeper - прямой HTTP-сбор TOP-10 без браузера; используется внутренний endpoint инструмента «Выдача ТОП 10».
 3. Анализ - классификация CREATE / SKIP / EXISTS и конкуренты; подтвержденный СМЕШАННЫЙ сразу попадает в CREATE.
 4. Проверка URL - проверка ожидаемых OCFilter URL до создания.
 5. OCFilter - реальный direct POST в штатный addPage, без Playwright.
@@ -82,6 +82,14 @@ WK_DELAY = 0.5
 # CSV/checkpoint сохраняются пакетно, чтобы не переписывать весь накопительный
 # файл после каждого запроса. При остановке/ошибке пакет принудительно сохраняется.
 WK_SAVE_EVERY = 10
+
+# WordKeeper HTTP TOP-10: документация сервиса указывает 3-4 одновременных
+# потока для позапросных API-методов. Для прямого HTTP endpoint инструмента
+# используем консервативные 4 потока.
+WK_HTTP_WORKERS = 4
+WK_HTTP_TIMEOUT = 120
+WK_HTTP_LOGIN_TIMEOUT = 30
+WK_HTTP_DELAY = 0.15
 
 
 def norm(x):
@@ -597,7 +605,7 @@ def wordkeeper_ajax_post(ajax_session, query, region, cookie_header=""):
         "Accept-Language": "ru-RU,ru;q=0.9",
         "Accept": "text/html, */*; q=0.01",
         "X-Requested-With": "XMLHttpRequest",
-        "Referer": "https://word-keeper.ru/core",
+        "Referer": TOP10_WK_PAGE,
     }
     if cookie_header:
         headers["Cookie"] = cookie_header
@@ -1013,6 +1021,296 @@ def parse_top10(html, keyword):
             break
     return rows
 
+
+
+# -----------------------------------------------------------------------------
+# WORDKEEPER TOP-10 DIRECT HTTP (NO BROWSER)
+# -----------------------------------------------------------------------------
+
+def _wk_login_http(login, password, progress=None):
+    """Авторизует requests.Session в WordKeeper без браузера.
+
+    Мы не храним cookies отдельно: они живут только внутри Session во время
+    текущего сбора. Форма определяется по HTML, поэтому изменения порядка
+    полей на странице не должны ломать авторизацию.
+    """
+    s = requests.Session()
+    s.headers.update({
+        "User-Agent": UA,
+        "Accept-Language": "ru-RU,ru;q=0.9",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    })
+    r = s.get(LOGIN_WK, timeout=WK_HTTP_LOGIN_TIMEOUT, allow_redirects=True)
+    r.raise_for_status()
+    soup = BeautifulSoup(r.text, "html.parser")
+    form = soup.find("form")
+    if not form:
+        raise RuntimeError("WordKeeper: на странице входа не найдена форма авторизации.")
+
+    action = urljoin(r.url, form.get("action") or "/login")
+    method = str(form.get("method") or "post").lower()
+    data = {}
+    for inp in form.find_all("input"):
+        name = str(inp.get("name") or "").strip()
+        if not name:
+            continue
+        typ = str(inp.get("type") or "text").lower()
+        if typ in {"submit", "button", "image", "file"}:
+            continue
+        data[name] = str(inp.get("value") or "")
+
+    inputs = form.find_all("input")
+    password_name = ""
+    user_name = ""
+    for inp in inputs:
+        name = str(inp.get("name") or "").strip()
+        typ = str(inp.get("type") or "text").lower()
+        blob = " ".join([
+            name,
+            str(inp.get("id") or ""),
+            str(inp.get("placeholder") or ""),
+            str(inp.get("autocomplete") or ""),
+        ]).lower()
+        if typ == "password" and not password_name:
+            password_name = name
+        if not user_name and (
+            typ == "email"
+            or re.search(r"login|email|mail|user|username|логин|почт", blob, re.I)
+        ):
+            user_name = name
+
+    if not user_name:
+        # На старых версиях формы логин мог быть обычным text без name-маркера.
+        for inp in inputs:
+            name = str(inp.get("name") or "").strip()
+            typ = str(inp.get("type") or "text").lower()
+            if name and typ in {"text", "email"} and name != password_name:
+                user_name = name
+                break
+
+    if not user_name or not password_name:
+        raise RuntimeError(
+            "WordKeeper: не удалось определить поля логина/пароля в форме входа."
+        )
+
+    data[user_name] = str(login)
+    data[password_name] = str(password)
+
+    if progress:
+        progress(f"TOP-10 HTTP: отправляем авторизацию WordKeeper ({action}).")
+
+    if method == "get":
+        auth = s.get(action, params=data, timeout=WK_HTTP_LOGIN_TIMEOUT, allow_redirects=True)
+    else:
+        auth = s.post(action, data=data, timeout=WK_HTTP_LOGIN_TIMEOUT, allow_redirects=True)
+    auth.raise_for_status()
+
+    # Проверяем именно рабочую страницу, а не просто отсутствие HTTP-ошибки.
+    check = s.get(TOP10_WK_PAGE, timeout=WK_HTTP_LOGIN_TIMEOUT, allow_redirects=True)
+    check.raise_for_status()
+    if "/login" in check.url:
+        raise RuntimeError(
+            "WordKeeper: HTTP-авторизация не прошла — /core/parse_top снова отправил на /login."
+        )
+    if "/core/parse_top" not in check.url:
+        raise RuntimeError(
+            f"WordKeeper: после HTTP-авторизации получен неожиданный URL: {check.url}"
+        )
+    if progress:
+        progress("TOP-10 HTTP: авторизация подтверждена, браузер не используется.")
+    return s
+
+
+def _wk_response_html_or_rows(response, keyword):
+    """Разбирает ответ internal TOP-10 endpoint в наши строки."""
+    raw = http_response_text(response).strip()
+    if not raw:
+        return []
+
+    # Иногда AJAX endpoint может вернуть JSON-обертку над HTML/данными.
+    try:
+        obj = response.json()
+    except Exception:
+        obj = None
+
+    if isinstance(obj, dict):
+        # Если внутри уже есть массив результатов.
+        candidates = []
+        for key in ("results", "rows", "data", "items", "result"):
+            val = obj.get(key)
+            if isinstance(val, list):
+                candidates.extend(val)
+            elif isinstance(val, dict):
+                candidates.append(val)
+            elif isinstance(val, str):
+                candidates.append(val)
+        normalized = []
+        for val in candidates:
+            if isinstance(val, dict):
+                url = str(val.get("url") or val.get("link") or val.get("href") or "").strip()
+                if url.startswith("http"):
+                    normalized.append({
+                        "keyword": str(val.get("keyword") or val.get("query") or keyword),
+                        "position": val.get("position") or val.get("pos") or "",
+                        "domain": val.get("domain") or "",
+                        "url": url,
+                        "title": val.get("title") or "",
+                        "snippet": val.get("snippet") or val.get("description") or "",
+                    })
+            elif isinstance(val, str) and "http" in val:
+                parsed = parse_top10(val, keyword)
+                if parsed:
+                    normalized.extend(parsed)
+        if normalized:
+            # Переиндексируем позиции после дедупликации.
+            out = []
+            seen = set()
+            for row in normalized:
+                u = str(row.get("url") or "").strip().rstrip("/")
+                if not u or u in seen:
+                    continue
+                seen.add(u)
+                row = dict(row)
+                row["keyword"] = keyword
+                row["position"] = len(out) + 1
+                if not row.get("domain"):
+                    try:
+                        d = urlparse(u).netloc.lower().split(":")[0]
+                        row["domain"] = d[4:] if d.startswith("www.") else d
+                    except Exception:
+                        row["domain"] = ""
+                out.append(row)
+                if len(out) >= 10:
+                    break
+            if out:
+                return out
+
+        # Ищем HTML среди строк JSON.
+        def walk(x):
+            if isinstance(x, str):
+                yield x
+            elif isinstance(x, dict):
+                for v in x.values():
+                    yield from walk(v)
+            elif isinstance(x, list):
+                for v in x:
+                    yield from walk(v)
+        for val in walk(obj):
+            if "http" in val and ("<a" in val.lower() or "href=" in val.lower()):
+                parsed = parse_top10(val, keyword)
+                if parsed:
+                    return parsed
+
+    # Обычный HTML-ответ AJAX endpoint.
+    rows = parse_top10(raw, keyword)
+    if rows:
+        return rows
+
+    # Диагностика для нештатного ответа: не показываем пароль/cookie.
+    if response.status_code in (401, 403):
+        raise RuntimeError(
+            f"WordKeeper TOP-10: HTTP {response.status_code} — сессия не авторизована или доступ запрещён."
+        )
+    if response.status_code >= 400:
+        raise RuntimeError(
+            f"WordKeeper TOP-10: HTTP {response.status_code}; ответ: {raw[:300]}"
+        )
+    return []
+
+
+def collect_wordkeeper_top10_http(login, password, region, queries, stop_event, progress):
+    """Собирает TOP-10 напрямую HTTP-запросами, без Chrome/Playwright.
+
+    Используется endpoint /core/ajax_top10, который уже является HTTP-запросом
+    самого веб-инструмента WordKeeper. Для авторизации создаётся обычная
+    requests.Session. Запросы идут максимум в 4 потока.
+    """
+    queries = [str(q or "").strip() for q in queries or []]
+    queries = list(dict.fromkeys(q for q in queries if q))
+    if not queries:
+        raise RuntimeError("Нет запросов для TOP-10.")
+
+    session = _wk_login_http(login, password, progress)
+    # Подтверждаем, что cookie-сессия имеет доступ к AJAX endpoint.
+    try:
+        landing = session.get(TOP10_WK_PAGE, timeout=WK_HTTP_LOGIN_TIMEOUT, allow_redirects=True)
+        if "/login" in landing.url:
+            raise RuntimeError("WordKeeper: сессия после входа потеряна.")
+    except requests.RequestException as e:
+        raise RuntimeError(f"WordKeeper: не удалось проверить авторизованную сессию: {e}")
+
+    rows = []
+    errors = []
+    # requests.Session не гарантирует потокобезопасность. Каждый worker
+    # получает собственную Session с теми же cookies авторизации.
+    auth_cookies = requests.utils.dict_from_cookiejar(session.cookies)
+    base_headers = dict(session.headers)
+
+    def make_worker_session():
+        s = requests.Session()
+        s.headers.update(base_headers)
+        s.cookies.update(auth_cookies)
+        return s
+
+    def one(idx, q):
+        if stop_event.is_set():
+            return idx, q, [], "STOP"
+        if WK_HTTP_DELAY:
+            time.sleep(WK_HTTP_DELAY)
+        try:
+            worker_session = make_worker_session()
+            r = wordkeeper_ajax_post(worker_session, q, region)
+            parsed = _wk_response_html_or_rows(r, q)
+            if not parsed:
+                raise RuntimeError(
+                    f"пустой/не распознанный ответ HTTP {r.status_code}: {http_response_text(r)[:250]}"
+                )
+            return idx, q, parsed, ""
+        except Exception as e:
+            return idx, q, [], str(e)
+
+    total = len(queries)
+    done = 0
+    progress(f"TOP-10 HTTP: запросов {total}; потоков {WK_HTTP_WORKERS}; браузер не запускается.")
+
+    # Батчи позволяют быстро реагировать на кнопку «Остановить» и не создавать
+    # сотни одновременных futures.
+    for start in range(0, total, WK_HTTP_WORKERS):
+        if stop_event.is_set():
+            break
+        batch = queries[start:start + WK_HTTP_WORKERS]
+        with ThreadPoolExecutor(max_workers=WK_HTTP_WORKERS) as ex:
+            futures = [ex.submit(one, start + i + 1, q) for i, q in enumerate(batch)]
+            for fut in as_completed(futures):
+                idx, q, parsed, err = fut.result()
+                if err == "STOP":
+                    continue
+                done += 1
+                if err:
+                    errors.append((q, err))
+                    progress(f"TOP-10 HTTP [{idx}/{total}] ОШИБКА: {q} | {err}")
+                else:
+                    rows.extend(parsed)
+                    progress(f"TOP-10 HTTP [{idx}/{total}] {q} | результатов: {len(parsed)}")
+                if done % WK_SAVE_EVERY == 0:
+                    progress(f"TOP-10 HTTP: обработано {done}/{total} запросов.")
+
+    if errors and not rows:
+        details = "\n".join(f"- {q}: {e}" for q, e in errors[:5])
+        raise RuntimeError(f"TOP-10 HTTP: все запросы завершились ошибкой.\n{details}")
+
+    if errors:
+        progress(f"TOP-10 HTTP: ошибок {len(errors)} из {total}; успешные результаты сохранены.")
+
+    uniq = {}
+    for row in rows:
+        k = (str(row.get("keyword") or "").strip(), str(row.get("url") or "").strip().rstrip("/"))
+        if k[0] and k[1]:
+            uniq[k] = row
+
+    status = "Остановлено пользователем" if stop_event.is_set() else "OK"
+    progress(f"TOP-10 HTTP: получено {len(uniq)} уникальных строк. Статус: {status}.")
+    return list(uniq.values()), status
 
 
 # -----------------------------------------------------------------------------
@@ -1466,8 +1764,9 @@ def _collect_wordkeeper_top10_external(login, password, region, queries, stop_ev
 def collect_wordkeeper_top10_real_tool(login, password, region, queries, stop_event, progress):
     """Запускает именно UI-инструмент WordKeeper «Выдача ТОП 10».
 
-    Первый запуск использует браузер и сохраняет профиль. Мы намеренно НЕ
-    обращаемся к /core/ajax_top30 и НЕ подменяем TOP-30 обрезкой до 10.
+    LEGACY/FALLBACK: основной сбор v1.29.0 больше не использует эту функцию.
+    Она оставлена только для совместимости старых диагностик. Основной путь —
+    collect_wordkeeper_top10_http(), без Chrome/Playwright.
     """
     try:
         from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
@@ -4268,7 +4567,7 @@ class App(tk.Tk):
         ttk.Label(row,text="Регион:").pack(side="left")
         self.region=tk.IntVar(value=int(self.cfg.get("region",213) or 213))
         ttk.Spinbox(row,from_=0,to=9999,textvariable=self.region,width=7).pack(side="left",padx=8)
-        self.wk_start_btn=ttk.Button(row,text="ПОЛУЧИТЬ TOP-10 WORDKEEPER (РЕАЛЬНЫЙ ИНСТРУМЕНТ)",command=self.start_wordkeeper)
+        self.wk_start_btn=ttk.Button(row,text="ПОЛУЧИТЬ TOP-10 WORDKEEPER (БЕЗ БРАУЗЕРА)",command=self.start_wordkeeper)
         self.wk_start_btn.pack(side="left")
         self.wk_stop_btn=ttk.Button(row,text="ОСТАНОВИТЬ АНАЛИЗ",command=self.stop_wordkeeper,state="disabled")
         self.wk_stop_btn.pack(side="left",padx=8)
@@ -4286,7 +4585,7 @@ class App(tk.Tk):
         self.wk_rebuild_btn.pack(side="left")
         ttk.Label(
             rebuild_row,
-            text="Удаляет TOP-10 текущего раздела и заново запускает реальный инструмент WordKeeper",
+            text="Удаляет TOP-10 текущего раздела и заново запускает WordKeeper без браузера",
         ).pack(side="left",padx=10)
 
         migrate_row=ttk.Frame(f); migrate_row.pack(fill="x",padx=10,pady=(0,6))
@@ -5377,25 +5676,68 @@ class App(tk.Tk):
             # В отличие от старого direct-AJAX режима здесь checkpoint хранит только
             # факт полного браузерного задания. Если есть готовый CSV текущего раздела,
             # его можно загрузить кнопкой CSV и не запускать повторно.
-            self.q.put(('wklog', f'WordKeeper TOP-10: реальный инструмент «Выдача ТОП 10». Запросов: {len(keywords)}'))
+            # Возобновление: уже имеющиеся строки текущего раздела не запрашиваем повторно.
+            # Старые browser-checkpoint намеренно не считаем надёжными.
+            completed = set()
+            try:
+                if out_path.exists() and out_path.stat().st_size:
+                    old_df = pd.read_csv(out_path, encoding='utf-8-sig', dtype=str).fillna('')
+                    if 'keyword' in old_df.columns:
+                        completed.update(norm(x) for x in old_df['keyword'].tolist() if str(x).strip())
+            except Exception as e:
+                self.q.put(('wklog', f'TOP-10 HTTP: не удалось прочитать старый CSV для resume: {e}'))
+            try:
+                if progress_path.exists() and progress_path.stat().st_size:
+                    old_progress = json.loads(progress_path.read_text(encoding='utf-8'))
+                    if str(old_progress.get('mode','')) == 'REAL_WORDKEEPER_TOP10_HTTP' and str(old_progress.get('version','')) >= '1.29.0':
+                        completed.update(norm(x) for x in (old_progress.get('done_keywords') or []) if str(x).strip())
+            except Exception:
+                pass
+
+            pending_keywords = [q for q in keywords if norm(q) not in completed]
+            self.q.put(('wklog', f'WordKeeper TOP-10: прямой HTTP-сбор без браузера. Всего запросов: {len(keywords)}'))
+            self.q.put(('wklog', f'TOP-10 HTTP: уже обработано: {len(keywords)-len(pending_keywords)} | осталось: {len(pending_keywords)}'))
             self.q.put(('wklog', 'TOP-10 — отдельный инструмент WordKeeper «Выдача ТОП 10», не обрезка TOP-30.'))
-            self.q.put(('wklog', 'Открываю браузерный профиль WordKeeper...'))
+            self.q.put(('wklog', 'Chrome/Playwright не запускается. Авторизация и запросы идут через requests.Session.'))
+
+            if not pending_keywords:
+                self.q.put(('wklog', 'TOP-10 HTTP: текущий раздел уже полностью есть в накопительном CSV — повторно не запрашиваем.'))
+                self.q.put(('wkdone', out_path))
+                return
 
             def prog(msg): self.q.put(('wklog', msg))
-            rows, status=collect_wordkeeper_top10_real_tool(
-                login, password, region, keywords, self.wk_stop_event, prog
+            rows, status=collect_wordkeeper_top10_http(
+                login, password, region, pending_keywords, self.wk_stop_event, prog
             )
+            # Объединяем новый пакет с уже накопленным CSV текущего раздела.
+            def merge_rows_into_csv(new_rows):
+                existing = []
+                try:
+                    if out_path.exists() and out_path.stat().st_size:
+                        existing = pd.read_csv(out_path, encoding='utf-8-sig', dtype=str).fillna('').to_dict('records')
+                except Exception:
+                    existing = []
+                merged = existing + list(new_rows or [])
+                uniq = {}
+                for r in merged:
+                    k = (str(r.get('keyword','')).strip(), str(r.get('url','')).strip().rstrip('/'))
+                    if k[0] and k[1]:
+                        uniq[k] = r
+                if uniq:
+                    pd.DataFrame(list(uniq.values())).to_csv(out_path,index=False,encoding='utf-8-sig')
+                return list(uniq.values())
+
+            all_rows = merge_rows_into_csv(rows)
+            successful_keywords = {str(r.get('keyword','')).strip() for r in all_rows if str(r.get('keyword','')).strip()}
             if self.wk_stop_event.is_set():
-                # Сохраняем то, что успели получить.
-                if rows:
-                    pd.DataFrame(rows).to_csv(out_path,index=False,encoding='utf-8-sig')
+                # В checkpoint отмечаем только реально имеющиеся результаты.
                 progress_data={
-                    'done_keywords': keywords,
-                    'done_queries': keywords,
+                    'done_keywords': sorted(successful_keywords, key=str.casefold),
+                    'done_queries': sorted(successful_keywords, key=str.casefold),
                     'stopped': True,
                     'updated_at': time.strftime('%Y-%m-%d %H:%M:%S'),
-                    'mode': 'REAL_WORDKEEPER_TOP10_BROWSER',
-                    'version': '1.28.1',
+                    'mode': 'REAL_WORDKEEPER_TOP10_HTTP',
+                    'version': '1.29.0',
                 }
                 progress_path.write_text(json.dumps(progress_data,ensure_ascii=False,indent=2),encoding='utf-8')
                 self.q.put(('wkdone',out_path))
@@ -5404,18 +5746,17 @@ class App(tk.Tk):
             if not rows:
                 raise RuntimeError('WordKeeper TOP-10 не вернул строк.')
 
-            pd.DataFrame(rows).to_csv(out_path,index=False,encoding='utf-8-sig')
             progress_data={
-                'done_keywords': keywords,
-                'done_queries': keywords,
+                'done_keywords': sorted(successful_keywords, key=str.casefold),
+                'done_queries': sorted(successful_keywords, key=str.casefold),
                 'stopped': False,
                 'updated_at': time.strftime('%Y-%m-%d %H:%M:%S'),
-                'mode': 'REAL_WORDKEEPER_TOP10_BROWSER',
-                'version': '1.28.1',
-                'rows': len(rows),
+                'mode': 'REAL_WORDKEEPER_TOP10_HTTP',
+                'version': '1.29.0',
+                'rows': len(all_rows),
             }
             progress_path.write_text(json.dumps(progress_data,ensure_ascii=False,indent=2),encoding='utf-8')
-            self.q.put(('wklog', f'Реальный TOP-10 получен: {len(rows)} строк.'))
+            self.q.put(('wklog', f'Реальный TOP-10 получен/обновлён: {len(all_rows)} строк в CSV текущего раздела.'))
             self.q.put(('wkdone',out_path))
         except Exception as e:
             self.q.put(('wkerr',str(e)))
