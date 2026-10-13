@@ -1,14 +1,14 @@
 # -*- coding: utf-8 -*-
 """
-FE-RUS SEO Manager TOP10 v1.29.2
+FE-RUS SEO Manager v1.25.1
 
-Экспериментальная отдельная TOP-10 версия Windows-приложения через реальный веб-инструмент WordKeeper:
+Единое Windows-приложение:
 1. Категория - получает category_id, OCFilter options и значения.
-2. WordKeeper - прямой HTTP-сбор TOP-10 без браузера; используется внутренний endpoint инструмента «Выдача ТОП 10».
+2. WordKeeper - авторизация, получение TOP-30 с продолжением после перезапуска.
 3. Анализ - классификация CREATE / SKIP / EXISTS и конкуренты; подтвержденный СМЕШАННЫЙ сразу попадает в CREATE.
 4. Проверка URL - проверка ожидаемых OCFilter URL до создания.
 5. OCFilter - реальный direct POST в штатный addPage, без Playwright.
-6. Экспорт - XLSX/CSV, единый накопительный CSV и общий реестр разделов в Google Sheets.
+6. Экспорт - XLSX/CSV и единый накопительный CSV в Google Drive.
 
 Важно:
 - "Показывать в ТОП меню" всегда отправляется как menu_status=0.
@@ -29,10 +29,6 @@ import queue
 import webbrowser
 import types
 import traceback
-import csv
-import subprocess
-import shutil
-import sys
 from pathlib import Path
 from urllib.parse import urlparse, urljoin, unquote_plus
 from collections import Counter
@@ -49,26 +45,23 @@ from openpyxl.styles import Font
 APP = "FE-RUS SEO Manager"
 BASE = "https://fe-rus.ru"
 GOOGLE_SHEET_ID = "1NbEr9ZDR5dmFa_8zayfSQtQ5VL1dLn2jSN0nNT1fkD8"
-GOOGLE_STATUS_SHEET_NAME = "РАЗДЕЛЫ TOP10"
 # Единый облачный CSV в Google Drive. ID не меняется при обновлении содержимого файла.
 CLOUD_READY_FILE_ID = "1YcEPhor7Up_5Wt2wCni86irElRqqkc0Y"
 CLOUD_READY_FILE_URL = "https://drive.google.com/file/d/1YcEPhor7Up_5Wt2wCni86irElRqqkc0Y/view"
 CLOUD_ROOT_FOLDER_ID = "1uyJ9YqbX7v1wYT2FX4hmO3GIWk0u-YYs"
 CLOUD_ROOT_FOLDER_URL = "https://drive.google.com/drive/folders/1uyJ9YqbX7v1wYT2FX4hmO3GIWk0u-YYs"
 CLOUD_SECTION_FILES = (
-    "seo_top10_result.csv",
-    "seo_top10_progress.json",
-    "seo_top10_serp_page_classification.csv",
-    "seo_top10_url_check_audit.csv",
-    "seo_top10_ocfilter_check_audit.json",
-    "wordkeeper_top10_error.log",
+    "seo_top30_result.csv",
+    "seo_top30_progress.json",
+    "seo_serp_page_classification.csv",
+    "seo_url_check_audit.csv",
+    "seo_ocfilter_check_audit.json",
+    "wordkeeper_error.log",
 )
 # URL веб-приложения Google Apps Script задаётся пользователем при первом нажатии.
 ADMIN = BASE + "/admin/"
 LOGIN_WK = "https://word-keeper.ru/login"
-TOP10_WK = "https://word-keeper.ru/core/ajax_top10"
-# Точная страница реального инструмента «Сбор ТОП 10 / Выдача ТОП 10».
-TOP10_WK_PAGE = "https://word-keeper.ru/core/parse_top"
+TOP30_WK = "https://word-keeper.ru/core/ajax_top30"
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/152 Safari/537.36"
 CFG = Path(os.environ.get("APPDATA", Path.home())) / APP / "config.json"
 
@@ -76,20 +69,12 @@ CREATE_ROUTE = "extension/module/ocfilter/addPage"
 PAGE_ROUTE = "extension/module/ocfilter/page"
 MENU_STATUS = "0"  # ВСЕГДА отключено
 
-# Ускорение TOP-10 WordKeeper.
+# Ускорение TOP-30 WordKeeper.
 # 0.5 сек между запросами вместо прежних 2 сек.
 WK_DELAY = 0.5
 # CSV/checkpoint сохраняются пакетно, чтобы не переписывать весь накопительный
 # файл после каждого запроса. При остановке/ошибке пакет принудительно сохраняется.
 WK_SAVE_EVERY = 10
-
-# WordKeeper HTTP TOP-10: документация сервиса указывает 3-4 одновременных
-# потока для позапросных API-методов. Для прямого HTTP endpoint инструмента
-# используем консервативные 4 потока.
-WK_HTTP_WORKERS = 4
-WK_HTTP_TIMEOUT = 120
-WK_HTTP_LOGIN_TIMEOUT = 30
-WK_HTTP_DELAY = 0.15
 
 
 def norm(x):
@@ -591,12 +576,12 @@ def safe_sorted_strings(values):
 
 
 def wordkeeper_ajax_post(ajax_session, query, region, cookie_header=""):
-    """Выполняет AJAX TOP-10 через постоянную HTTP-сессию.
+    """Выполняет AJAX TOP-30 через постоянную HTTP-сессию.
 
     Авторизационные cookies передаются как готовая строка Cookie, поэтому мы
     не используем проблемный cookie-jar авторизационной сессии WordKeeper.
     При этом отдельная ajax-сессия переиспользует TCP/TLS-соединение между
-    запросами, что заметно ускоряет большой пакет TOP-10.
+    запросами, что заметно ускоряет большой пакет TOP-30.
     """
     query = str(query or "").strip()
     region = str(region or "").strip()
@@ -605,13 +590,13 @@ def wordkeeper_ajax_post(ajax_session, query, region, cookie_header=""):
         "Accept-Language": "ru-RU,ru;q=0.9",
         "Accept": "text/html, */*; q=0.01",
         "X-Requested-With": "XMLHttpRequest",
-        "Referer": TOP10_WK_PAGE,
+        "Referer": "https://word-keeper.ru/core",
     }
     if cookie_header:
         headers["Cookie"] = cookie_header
 
     return ajax_session.post(
-        TOP10_WK,
+        TOP30_WK,
         data={"word": query, "region": region},
         headers=headers,
         timeout=120,
@@ -754,7 +739,7 @@ def _jsonld_types(soup):
 
 
 def _classify_serp_page(session, url, title="", snippet="", keyword="", value=""):
-    """Определяет тип результата TOP-10.
+    """Определяет тип результата TOP-30.
 
     Возвращает PRODUCT / SEO_PAGE / ARTICLE / OTHER / UNKNOWN.
     Сначала используются URL-сигналы, затем HTML для неоднозначных страниц.
@@ -985,8 +970,7 @@ def save_serp_classification_cache(cache, path):
     df[cols].to_csv(path, sep=";", index=False, encoding="utf-8-sig", lineterminator="\n")
 
 
-def parse_top10(html, keyword):
-    """Берёт только первые 10 уникальных внешних результатов WordKeeper."""
+def parse_top30(html, keyword):
     soup = BeautifulSoup(html, "html.parser")
     excluded = {"word-keeper.ru", "yandex.ru", "yandexwebcache.net", "xtool.ru"}
     rows = []
@@ -1017,1017 +1001,10 @@ def parse_top10(html, keyword):
             "title": a.get_text(" ", strip=True),
             "snippet": "",
         })
-        if pos >= 10:
+        if pos >= 30:
             break
     return rows
 
-
-
-# -----------------------------------------------------------------------------
-# WORDKEEPER TOP-10 DIRECT HTTP (NO BROWSER)
-# -----------------------------------------------------------------------------
-
-def _wk_login_http(login, password, progress=None):
-    """Авторизация WordKeeper через обычный HTTP-сеанс, без браузера.
-
-    ВАЖНО: у формы WordKeeper есть скрытый csrf_token и submit-поле auth.
-    Предыдущая версия правильно собирала hidden-поля, но выбрасывала submit,
-    из-за чего сервер принимал POST как обычный запрос и не создавал
-    авторизованную сессию. Старый рабочий TOP-30-код проекта передавал
-    auth=Войти и csrf_token явно — повторяем это поведение здесь.
-    """
-    s = requests.Session()
-    s.headers.update({
-        "User-Agent": UA,
-        "Accept-Language": "ru-RU,ru;q=0.9",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Referer": LOGIN_WK,
-    })
-
-    r = s.get(LOGIN_WK, timeout=WK_HTTP_LOGIN_TIMEOUT, allow_redirects=True)
-    r.raise_for_status()
-    soup = BeautifulSoup(r.text, "html.parser")
-    form = soup.find("form")
-    if not form:
-        raise RuntimeError("WordKeeper: на странице входа не найдена форма авторизации.")
-
-    action = urljoin(r.url, form.get("action") or "/login")
-    method = str(form.get("method") or "post").lower()
-    data = {}
-    submit_added = False
-    for inp in form.find_all("input"):
-        name = str(inp.get("name") or "").strip()
-        if not name:
-            continue
-        typ = str(inp.get("type") or "text").lower()
-        if typ in {"button", "image", "file"}:
-            continue
-        if typ == "submit":
-            # WordKeeper historically ожидает auth=Войти. Если у кнопки
-            # есть собственное name/value, передаём и его.
-            data[name] = str(inp.get("value") or "Войти")
-            submit_added = True
-            continue
-        data[name] = str(inp.get("value") or "")
-
-    # Совместимость с текущей/старой формой WordKeeper.
-    data.setdefault("auth", "Войти")
-
-    inputs = form.find_all("input")
-    password_name = ""
-    user_name = ""
-    for inp in inputs:
-        name = str(inp.get("name") or "").strip()
-        typ = str(inp.get("type") or "text").lower()
-        blob = " ".join([
-            name,
-            str(inp.get("id") or ""),
-            str(inp.get("placeholder") or ""),
-            str(inp.get("autocomplete") or ""),
-        ]).lower()
-        if typ == "password" and not password_name:
-            password_name = name
-        if not user_name and (
-            typ == "email"
-            or re.search(r"login|email|mail|user|username|логин|почт", blob, re.I)
-        ):
-            user_name = name
-
-    if not user_name:
-        for inp in inputs:
-            name = str(inp.get("name") or "").strip()
-            typ = str(inp.get("type") or "text").lower()
-            if name and typ in {"text", "email"} and name != password_name:
-                user_name = name
-                break
-
-    if not user_name or not password_name:
-        raise RuntimeError(
-            "WordKeeper: не удалось определить поля логина/пароля в форме входа."
-        )
-
-    data[user_name] = str(login)
-    data[password_name] = str(password)
-
-    if progress:
-        csrf_present = bool(str(data.get("csrf_token") or "").strip())
-        progress(
-            f"TOP-10 HTTP: авторизация WordKeeper ({action}); "
-            f"csrf={'OK' if csrf_present else 'НЕТ'}; auth={'OK' if 'auth' in data else 'НЕТ'}."
-        )
-
-    if method == "get":
-        auth = s.get(action, params=data, timeout=WK_HTTP_LOGIN_TIMEOUT, allow_redirects=True)
-    else:
-        auth = s.post(
-            action,
-            data=data,
-            headers={"Origin": "https://word-keeper.ru", "Referer": LOGIN_WK},
-            timeout=WK_HTTP_LOGIN_TIMEOUT,
-            allow_redirects=True,
-        )
-    auth.raise_for_status()
-
-    if progress:
-        progress(f"TOP-10 HTTP: после входа сервер открыл {auth.url} (HTTP {auth.status_code}).")
-
-    # Не требуем конкретно /dashboard: в текущем WordKeeper пользователь может
-    # попасть в личный кабинет. Нам важно, что рабочая страница не редиректит
-    # обратно на /login.
-    check = s.get(TOP10_WK_PAGE, timeout=WK_HTTP_LOGIN_TIMEOUT, allow_redirects=True)
-    check.raise_for_status()
-    if "/login" in check.url:
-        body = re.sub(r"\s+", " ", BeautifulSoup(check.text, "html.parser").get_text(" ", strip=True))
-        hint = body[:220] if body else ""
-        raise RuntimeError(
-            "WordKeeper: HTTP-авторизация не прошла — /core/parse_top снова отправил на /login. "
-            + (f" Ответ: {hint}" if hint else "")
-        )
-    if "/core/parse_top" not in check.url:
-        raise RuntimeError(
-            f"WordKeeper: сессия создана, но /core/parse_top открылся как {check.url}."
-        )
-    if progress:
-        progress("TOP-10 HTTP: авторизация подтверждена, браузер не используется.")
-    return s
-
-
-def _wk_response_html_or_rows(response, keyword):
-    """Разбирает ответ internal TOP-10 endpoint в наши строки."""
-    raw = http_response_text(response).strip()
-    if not raw:
-        return []
-
-    # Иногда AJAX endpoint может вернуть JSON-обертку над HTML/данными.
-    try:
-        obj = response.json()
-    except Exception:
-        obj = None
-
-    if isinstance(obj, dict):
-        # Если внутри уже есть массив результатов.
-        candidates = []
-        for key in ("results", "rows", "data", "items", "result"):
-            val = obj.get(key)
-            if isinstance(val, list):
-                candidates.extend(val)
-            elif isinstance(val, dict):
-                candidates.append(val)
-            elif isinstance(val, str):
-                candidates.append(val)
-        normalized = []
-        for val in candidates:
-            if isinstance(val, dict):
-                url = str(val.get("url") or val.get("link") or val.get("href") or "").strip()
-                if url.startswith("http"):
-                    normalized.append({
-                        "keyword": str(val.get("keyword") or val.get("query") or keyword),
-                        "position": val.get("position") or val.get("pos") or "",
-                        "domain": val.get("domain") or "",
-                        "url": url,
-                        "title": val.get("title") or "",
-                        "snippet": val.get("snippet") or val.get("description") or "",
-                    })
-            elif isinstance(val, str) and "http" in val:
-                parsed = parse_top10(val, keyword)
-                if parsed:
-                    normalized.extend(parsed)
-        if normalized:
-            # Переиндексируем позиции после дедупликации.
-            out = []
-            seen = set()
-            for row in normalized:
-                u = str(row.get("url") or "").strip().rstrip("/")
-                if not u or u in seen:
-                    continue
-                seen.add(u)
-                row = dict(row)
-                row["keyword"] = keyword
-                row["position"] = len(out) + 1
-                if not row.get("domain"):
-                    try:
-                        d = urlparse(u).netloc.lower().split(":")[0]
-                        row["domain"] = d[4:] if d.startswith("www.") else d
-                    except Exception:
-                        row["domain"] = ""
-                out.append(row)
-                if len(out) >= 10:
-                    break
-            if out:
-                return out
-
-        # Ищем HTML среди строк JSON.
-        def walk(x):
-            if isinstance(x, str):
-                yield x
-            elif isinstance(x, dict):
-                for v in x.values():
-                    yield from walk(v)
-            elif isinstance(x, list):
-                for v in x:
-                    yield from walk(v)
-        for val in walk(obj):
-            if "http" in val and ("<a" in val.lower() or "href=" in val.lower()):
-                parsed = parse_top10(val, keyword)
-                if parsed:
-                    return parsed
-
-    # Обычный HTML-ответ AJAX endpoint.
-    rows = parse_top10(raw, keyword)
-    if rows:
-        return rows
-
-    # Диагностика для нештатного ответа: не показываем пароль/cookie.
-    if response.status_code in (401, 403):
-        raise RuntimeError(
-            f"WordKeeper TOP-10: HTTP {response.status_code} — сессия не авторизована или доступ запрещён."
-        )
-    if response.status_code >= 400:
-        raise RuntimeError(
-            f"WordKeeper TOP-10: HTTP {response.status_code}; ответ: {raw[:300]}"
-        )
-    return []
-
-
-def collect_wordkeeper_top10_http(login, password, region, queries, stop_event, progress):
-    """Собирает TOP-10 напрямую HTTP-запросами, без Chrome/Playwright.
-
-    Используется HTTP endpoint рабочего инструмента /core/ajax_top10 без запуска браузера.
-    Это не публичный /api/* метод: сессия создаётся обычным HTTP-входом, после чего
-    requests.Session. Запросы идут максимум в 4 потока.
-    """
-    queries = [str(q or "").strip() for q in queries or []]
-    queries = list(dict.fromkeys(q for q in queries if q))
-    if not queries:
-        raise RuntimeError("Нет запросов для TOP-10.")
-
-    session = _wk_login_http(login, password, progress)
-    # Подтверждаем, что cookie-сессия имеет доступ к AJAX endpoint.
-    try:
-        landing = session.get(TOP10_WK_PAGE, timeout=WK_HTTP_LOGIN_TIMEOUT, allow_redirects=True)
-        if "/login" in landing.url:
-            raise RuntimeError("WordKeeper: сессия после входа потеряна.")
-    except requests.RequestException as e:
-        raise RuntimeError(f"WordKeeper: не удалось проверить авторизованную сессию: {e}")
-
-    rows = []
-    errors = []
-    # requests.Session не гарантирует потокобезопасность. Каждый worker
-    # получает собственную Session с теми же cookies авторизации.
-    auth_cookies = requests.utils.dict_from_cookiejar(session.cookies)
-    base_headers = dict(session.headers)
-
-    def make_worker_session():
-        s = requests.Session()
-        s.headers.update(base_headers)
-        s.cookies.update(auth_cookies)
-        return s
-
-    def one(idx, q):
-        if stop_event.is_set():
-            return idx, q, [], "STOP"
-        if WK_HTTP_DELAY:
-            time.sleep(WK_HTTP_DELAY)
-        try:
-            worker_session = make_worker_session()
-            r = wordkeeper_ajax_post(worker_session, q, region)
-            parsed = _wk_response_html_or_rows(r, q)
-            if not parsed:
-                raise RuntimeError(
-                    f"пустой/не распознанный ответ HTTP {r.status_code}: {http_response_text(r)[:250]}"
-                )
-            return idx, q, parsed, ""
-        except Exception as e:
-            return idx, q, [], str(e)
-
-    total = len(queries)
-    done = 0
-    progress(f"TOP-10 HTTP: запросов {total}; потоков {WK_HTTP_WORKERS}; браузер не запускается.")
-
-    # Батчи позволяют быстро реагировать на кнопку «Остановить» и не создавать
-    # сотни одновременных futures.
-    for start in range(0, total, WK_HTTP_WORKERS):
-        if stop_event.is_set():
-            break
-        batch = queries[start:start + WK_HTTP_WORKERS]
-        with ThreadPoolExecutor(max_workers=WK_HTTP_WORKERS) as ex:
-            futures = [ex.submit(one, start + i + 1, q) for i, q in enumerate(batch)]
-            for fut in as_completed(futures):
-                idx, q, parsed, err = fut.result()
-                if err == "STOP":
-                    continue
-                done += 1
-                if err:
-                    errors.append((q, err))
-                    progress(f"TOP-10 HTTP [{idx}/{total}] ОШИБКА: {q} | {err}")
-                else:
-                    rows.extend(parsed)
-                    progress(f"TOP-10 HTTP [{idx}/{total}] {q} | результатов: {len(parsed)}")
-                if done % WK_SAVE_EVERY == 0:
-                    progress(f"TOP-10 HTTP: обработано {done}/{total} запросов.")
-
-    if errors and not rows:
-        details = "\n".join(f"- {q}: {e}" for q, e in errors[:5])
-        raise RuntimeError(f"TOP-10 HTTP: все запросы завершились ошибкой.\n{details}")
-
-    if errors:
-        progress(f"TOP-10 HTTP: ошибок {len(errors)} из {total}; успешные результаты сохранены.")
-
-    uniq = {}
-    for row in rows:
-        k = (str(row.get("keyword") or "").strip(), str(row.get("url") or "").strip().rstrip("/"))
-        if k[0] and k[1]:
-            uniq[k] = row
-
-    status = "Остановлено пользователем" if stop_event.is_set() else "OK"
-    progress(f"TOP-10 HTTP: получено {len(uniq)} уникальных строк. Статус: {status}.")
-    return list(uniq.values()), status
-
-
-# -----------------------------------------------------------------------------
-# WORDKEEPER REAL TOP-10 WEB TOOL (PLAYWRIGHT)
-# -----------------------------------------------------------------------------
-
-WK_TOP10_BROWSER_PROFILE = CFG.parent / "wordkeeper_top10_browser"
-WK_TOP10_BROWSER_TIMEOUT = 60_000
-WK_TOP10_TASK_TIMEOUT = 60 * 60 * 1000
-
-
-def _pw_text(el):
-    try:
-        return (el.inner_text() or "").strip()
-    except Exception:
-        return ""
-
-
-def _pw_attr(el, name):
-    try:
-        return str(el.get_attribute(name) or "").strip()
-    except Exception:
-        return ""
-
-
-def _pw_locator_first(page, selectors):
-    for selector in selectors:
-        try:
-            loc = page.locator(selector)
-            if loc.count() > 0:
-                return loc.first
-        except Exception:
-            pass
-    return None
-
-
-def _pw_click_text(page, patterns, exact=False):
-    import re as _re
-    for pattern in patterns:
-        try:
-            loc = page.get_by_text(_re.compile(pattern, _re.I), exact=exact)
-            if loc.count() > 0:
-                loc.first.click(timeout=10_000)
-                return True
-        except Exception:
-            pass
-        try:
-            loc = page.locator("button, a, input[type=button], input[type=submit]")
-            n = loc.count()
-            for i in range(min(n, 300)):
-                el = loc.nth(i)
-                txt = (_pw_text(el) or _pw_attr(el, "value") or _pw_attr(el, "aria-label") or "").strip()
-                if txt and _re.search(pattern, txt, _re.I):
-                    el.click(timeout=10_000)
-                    return True
-        except Exception:
-            pass
-    return False
-
-
-def _pw_find_query_input(page):
-    candidates = [
-        'textarea[name*="text" i]',
-        'textarea[name*="word" i]',
-        'textarea[name*="query" i]',
-        'textarea[name*="phrase" i]',
-        'textarea[name*="key" i]',
-        'textarea[placeholder*="фраз" i]',
-        'textarea[placeholder*="запрос" i]',
-        'textarea[placeholder*="ключ" i]',
-        'textarea',
-        'input[name*="text" i]',
-        'input[name*="word" i]',
-        'input[name*="query" i]',
-    ]
-    return _pw_locator_first(page, candidates)
-
-
-def _pw_set_query_text(page, value):
-    """Вставляет список фраз в реальный редактор WordKeeper TOP-10."""
-    value = str(value or '')
-
-    # WordKeeper /core/parse_top использует CodeMirror: видимый редактор
-    # и скрытый textarea — fill() по textarea визуально ничего не меняет.
-    try:
-        result = page.evaluate("""value => {
-            const root = document.querySelector('.CodeMirror');
-            if (root && root.CodeMirror) {
-                root.CodeMirror.setValue(value);
-                root.CodeMirror.refresh();
-                root.CodeMirror.focus();
-                return {ok: true, type: 'CodeMirror'};
-            }
-            return {ok: false};
-        }""", value)
-        if result and result.get('ok'):
-            return True, result.get('type')
-    except Exception:
-        pass
-
-    # ACE editor fallback.
-    try:
-        result = page.evaluate("""value => {
-            const root = document.querySelector('.ace_editor');
-            if (root && root.env && root.env.editor) {
-                root.env.editor.setValue(value, -1);
-                root.env.editor.focus();
-                return {ok: true, type: 'ACE'};
-            }
-            return {ok: false};
-        }""", value)
-        if result and result.get('ok'):
-            return True, result.get('type')
-    except Exception:
-        pass
-
-    # contenteditable fallback.
-    try:
-        ce = page.locator('[contenteditable="true"]:visible').first
-        if ce.count() > 0:
-            ce.click()
-            page.keyboard.press('Control+A')
-            page.keyboard.insert_text(value)
-            return True, 'contenteditable'
-    except Exception:
-        pass
-
-    # Обычный видимый textarea/input.
-    try:
-        loc = _pw_find_query_input(page)
-        if loc:
-            loc.click()
-            loc.fill(value)
-            return True, 'native'
-    except Exception:
-        pass
-
-    return False, None
-
-
-def _pw_find_region_input(page):
-    """Find the visible region control on the real WordKeeper TOP-10 page."""
-    try:
-        label = page.get_by_text(re.compile(r'Выберите\s+регион', re.I)).first
-        if label.count() > 0:
-            box = label.bounding_box()
-            if box:
-                candidates = page.locator(
-                    'input:visible, select:visible, [role="combobox"]:visible, '
-                    '.select2-selection:visible, [class*="region"]:visible'
-                )
-                best = None
-                best_dist = 10**9
-                for i in range(min(candidates.count(), 300)):
-                    el = candidates.nth(i)
-                    try:
-                        eb = el.bounding_box()
-                        if not eb:
-                            continue
-                        cx = eb['x'] + eb['width'] / 2
-                        cy = eb['y'] + eb['height'] / 2
-                        if cx < box['x'] + box['width'] * 0.5:
-                            continue
-                        if cy < box['y'] - 10 or cy > box['y'] + 150:
-                            continue
-                        dist = abs(cy - (box['y'] + box['height'] + 25))
-                        if dist < best_dist:
-                            best = el
-                            best_dist = dist
-                    except Exception:
-                        pass
-                if best:
-                    try:
-                        if 'select2-selection' in (best.get_attribute('class') or ''):
-                            inp = best.locator('xpath=..').locator('input:visible').first
-                            if inp.count() > 0:
-                                return inp
-                    except Exception:
-                        pass
-                    return best
-    except Exception:
-        pass
-
-    loc = _pw_locator_first(page, [
-        'select[name*="geo" i]:visible',
-        'select[name*="region" i]:visible',
-        'input[name*="geo" i]:visible',
-        'input[name*="region" i]:visible',
-        'input[placeholder*="регион" i]:visible',
-        '[role="combobox"]:visible',
-        '.select2-selection:visible',
-    ])
-    if loc:
-        try:
-            if 'select2-selection' in (loc.get_attribute('class') or ''):
-                inp = loc.locator('xpath=..').locator('input:visible').first
-                if inp.count() > 0:
-                    return inp
-        except Exception:
-            pass
-        return loc
-    return None
-
-
-def _pw_choose_region_popup(page, region_id):
-    rid = str(region_id or '').strip()
-    wanted = ['Москва', '213'] if rid == '213' else [rid]
-    selectors = [
-        '[role="option"]:visible',
-        '.ui-autocomplete li:visible',
-        '.ui-menu-item:visible',
-        '.select2-results__option:visible',
-        '.dropdown-menu li:visible',
-        '.chosen-results li:visible',
-        '.autocomplete-suggestion:visible',
-        '.suggestions li:visible',
-    ]
-    for _ in range(4):
-        for selector in selectors:
-            try:
-                opts = page.locator(selector)
-                for i in range(min(opts.count(), 200)):
-                    op = opts.nth(i)
-                    s = (op.inner_text() or '').strip()
-                    if s and any(w.lower() in s.lower() for w in wanted if w):
-                        op.click(timeout=3000)
-                        page.wait_for_timeout(500)
-                        return True
-            except Exception:
-                pass
-        page.wait_for_timeout(250)
-    return False
-
-
-def _pw_set_region(page, region):
-    ri = _pw_find_region_input(page)
-    if not ri:
-        return False
-
-    rid = str(region or '').strip()
-    values = [rid] + (['Москва'] if rid == '213' else [])
-
-    try:
-        tag = (ri.evaluate('(e)=>e.tagName') or '').upper()
-    except Exception:
-        tag = ''
-
-    if tag == 'SELECT':
-        try:
-            opts = ri.locator('option')
-            for i in range(min(opts.count(), 1000)):
-                op = opts.nth(i)
-                val = str(op.get_attribute('value') or '').strip()
-                lab = str(op.inner_text() or '').strip()
-                if val == rid or (rid == '213' and 'моск' in lab.lower()):
-                    ri.select_option(value=val)
-                    try:
-                        ri.dispatch_event('change')
-                    except Exception:
-                        pass
-                    page.wait_for_timeout(600)
-                    if not _pw_region_error_visible(page):
-                        return True
-        except Exception:
-            pass
-
-    for value in values:
-        try:
-            ri.click()
-            try:
-                ri.press('Control+A')
-            except Exception:
-                pass
-            try:
-                ri.fill(value)
-            except Exception:
-                inp = ri.locator('input:visible').first
-                if inp.count() == 0:
-                    raise
-                ri = inp
-                ri.click()
-                ri.press('Control+A')
-                ri.fill(value)
-            page.wait_for_timeout(1000)
-
-            if _pw_choose_region_popup(page, rid):
-                page.wait_for_timeout(500)
-                if not _pw_region_error_visible(page):
-                    return True
-
-            for _ in range(3):
-                try:
-                    ri.press('ArrowDown')
-                    page.wait_for_timeout(150)
-                    ri.press('Enter')
-                    page.wait_for_timeout(500)
-                except Exception:
-                    break
-                if not _pw_region_error_visible(page):
-                    return True
-
-            try:
-                ri.press('Tab')
-                page.wait_for_timeout(500)
-            except Exception:
-                pass
-
-            if not _pw_region_error_visible(page):
-                return True
-        except Exception:
-            pass
-
-    try:
-        link = page.get_by_text(re.compile(r'мои\s+регионы', re.I)).first
-        if link.count() > 0:
-            link.click(timeout=5000)
-            page.wait_for_timeout(700)
-            if _pw_choose_region_popup(page, rid):
-                return not _pw_region_error_visible(page)
-            moscow = page.get_by_text(re.compile(r'^Москва(?:\s|$)', re.I))
-            if moscow.count() > 0:
-                moscow.last.click(timeout=5000)
-                page.wait_for_timeout(500)
-                return not _pw_region_error_visible(page)
-    except Exception:
-        pass
-
-    return False
-
-def _pw_region_error_visible(page):
-    try:
-        body = _pw_text(page.locator('body'))
-        return bool(re.search(r'Необходимо\s+выбрать\s+регион', body, re.I))
-    except Exception:
-        return False
-
-
-def _pw_find_create_button(page):
-    return _pw_click_text(page, [r'создать\s+задани', r'запустить', r'создать\s+задач', r'собрать\s+топ'])
-
-
-def _pw_extract_csv_text(text):
-    """Пробует прочитать CSV из текста, если WordKeeper отдаст его как response."""
-    text = str(text or "")
-    if not text.strip():
-        return []
-    for sep in [',',';','\t']:
-        try:
-            rows=list(csv.DictReader(text.splitlines(), delimiter=sep))
-            if rows and len(rows[0]) >= 2:
-                return rows
-        except Exception:
-            pass
-    return []
-
-
-def _pw_normalize_export_rows(rows):
-    """Приводит экспорт реального TOP-10 WordKeeper к нашим колонкам."""
-    if not rows:
-        return []
-    out=[]
-    for r in rows:
-        rr={str(k).strip(): v for k,v in dict(r).items()}
-        def pick(names):
-            for n in names:
-                for k,v in rr.items():
-                    if str(k).strip().lower()==n.lower():
-                        return str(v or '').strip()
-            for n in names:
-                for k,v in rr.items():
-                    if n.lower() in str(k).strip().lower():
-                        return str(v or '').strip()
-            return ''
-        keyword=pick(['keyword','запрос','фраза','query','ключ'])
-        pos=pick(['position','позиция','pos','поз'])
-        domain=pick(['domain','домен'])
-        url=pick(['url','ссылка','страница'])
-        title=pick(['title','заголовок','h1'])
-        snippet=pick(['snippet','сниппет','description'])
-        if not url:
-            continue
-        out.append({
-            'keyword': keyword,
-            'position': pos,
-            'domain': domain,
-            'url': url,
-            'title': title,
-            'snippet': snippet,
-        })
-    return out
-
-
-WK_TOP10_HELPER_SOURCE = '# -*- coding: utf-8 -*-\nimport sys, json, csv, re, time, traceback\nfrom pathlib import Path\n\ndef txt(el):\n    try: return (el.inner_text() or \'\').strip()\n    except Exception: return \'\'\n\ndef attr(el, name):\n    try: return str(el.get_attribute(name) or \'\').strip()\n    except Exception: return \'\'\n\ndef locator_first(page, selectors):\n    for selector in selectors:\n        try:\n            loc=page.locator(selector)\n            if loc.count()>0: return loc.first\n        except Exception: pass\n    return None\n\ndef click_text(page, patterns, exact=False):\n    for pattern in patterns:\n        try:\n            loc=page.get_by_text(re.compile(pattern, re.I), exact=exact)\n            if loc.count()>0:\n                loc.first.click(timeout=10000); return True\n        except Exception: pass\n        try:\n            loc=page.locator(\'button, a, input[type=button], input[type=submit]\')\n            for i in range(min(loc.count(), 500)):\n                el=loc.nth(i)\n                s=(txt(el) or attr(el,\'value\') or attr(el,\'aria-label\') or \'\').strip()\n                if s and re.search(pattern,s,re.I):\n                    el.click(timeout=10000); return True\n        except Exception: pass\n    return False\n\ndef find_query_input(page):\n    return locator_first(page,[\n        \'textarea[name*="text" i]\',\'textarea[name*="word" i]\',\'textarea[name*="query" i]\',\n        \'textarea[name*="phrase" i]\',\'textarea[name*="key" i]\',\n        \'textarea[placeholder*="фраз" i]\',\'textarea[placeholder*="запрос" i]\',\'textarea[placeholder*="ключ" i]\',\n        \'textarea\',\'input[name*="text" i]\',\'input[name*="word" i]\',\'input[name*="query" i]\'\n    ])\n\ndef set_query_text(page,value):\n    value=str(value or \'\')\n    try:\n        r=page.evaluate("""value=>{\n            const root=document.querySelector(\'.CodeMirror\');\n            if(root&&root.CodeMirror){\n                root.CodeMirror.setValue(value);\n                root.CodeMirror.refresh();\n                root.CodeMirror.focus();\n                return {ok:true,type:\'CodeMirror\'};\n            }\n            return {ok:false};\n        }""",value)\n        if r and r.get(\'ok\'): return True,r.get(\'type\')\n    except Exception: pass\n    try:\n        r=page.evaluate("""value=>{\n            const root=document.querySelector(\'.ace_editor\');\n            if(root&&root.env&&root.env.editor){\n                root.env.editor.setValue(value,-1);\n                root.env.editor.focus();\n                return {ok:true,type:\'ACE\'};\n            }\n            return {ok:false};\n        }""",value)\n        if r and r.get(\'ok\'): return True,r.get(\'type\')\n    except Exception: pass\n    try:\n        ce=page.locator(\'[contenteditable="true"]:visible\').first\n        if ce.count()>0:\n            ce.click()\n            page.keyboard.press(\'Control+A\')\n            page.keyboard.insert_text(value)\n            return True,\'contenteditable\'\n    except Exception: pass\n    try:\n        loc=find_query_input(page)\n        if loc:\n            loc.click()\n            loc.fill(value)\n            return True,\'native\'\n    except Exception: pass\n    return False,None\n\ndef find_region_input(page):\n    try:\n        label=page.get_by_text(re.compile(r\'Выберите\\s+регион\',re.I)).first\n        if label.count()>0:\n            box=label.bounding_box()\n            if box:\n                candidates=page.locator(\'input:visible,select:visible,[role="combobox"]:visible,.select2-selection:visible,[class*="region"]:visible\')\n                best=None; best_dist=10**9\n                for i in range(min(candidates.count(),300)):\n                    el=candidates.nth(i)\n                    try:\n                        eb=el.bounding_box()\n                        if not eb: continue\n                        cx=eb[\'x\']+eb[\'width\']/2; cy=eb[\'y\']+eb[\'height\']/2\n                        if cx < box[\'x\']+box[\'width\']*0.5: continue\n                        if cy < box[\'y\']-10 or cy > box[\'y\']+150: continue\n                        dist=abs(cy-(box[\'y\']+box[\'height\']+25))\n                        if dist<best_dist: best=el; best_dist=dist\n                    except Exception: pass\n                if best:\n                    try:\n                        if \'select2-selection\' in (best.get_attribute(\'class\') or \'\'):\n                            inp=best.locator(\'xpath=..\').locator(\'input:visible\').first\n                            if inp.count()>0: return inp\n                    except Exception: pass\n                    return best\n    except Exception: pass\n    loc=locator_first(page,[\n        \'select[name*="geo" i]:visible\',\'select[name*="region" i]:visible\',\n        \'input[name*="geo" i]:visible\',\'input[name*="region" i]:visible\',\n        \'input[placeholder*="регион" i]:visible\',\'[role="combobox"]:visible\',\'.select2-selection:visible\'\n    ])\n    if loc:\n        try:\n            if \'select2-selection\' in (loc.get_attribute(\'class\') or \'\'):\n                inp=loc.locator(\'xpath=..\').locator(\'input:visible\').first\n                if inp.count()>0: return inp\n        except Exception: pass\n        return loc\n    return None\n\ndef choose_region_popup(page,rid):\n    wanted=[\'Москва\',\'213\'] if str(rid).strip()==\'213\' else [str(rid).strip()]\n    selectors=[\'[role="option"]:visible\',\'.ui-autocomplete li:visible\',\'.ui-menu-item:visible\',\'.select2-results__option:visible\',\'.dropdown-menu li:visible\',\'.chosen-results li:visible\',\'.autocomplete-suggestion:visible\',\'.suggestions li:visible\']\n    for _ in range(4):\n        for selector in selectors:\n            try:\n                opts=page.locator(selector)\n                for i in range(min(opts.count(),200)):\n                    op=opts.nth(i); s=(op.inner_text() or \'\').strip()\n                    if s and any(w.lower() in s.lower() for w in wanted if w):\n                        op.click(timeout=3000); page.wait_for_timeout(500); return True\n            except Exception: pass\n        page.wait_for_timeout(250)\n    return False\n\ndef set_region(page,region):\n    ri=find_region_input(page)\n    if not ri: return False\n    rid=str(region or \'\').strip()\n    values=[rid]+([\'Москва\'] if rid==\'213\' else [])\n    try: tag=(ri.evaluate(\'(e)=>e.tagName\') or \'\').upper()\n    except Exception: tag=\'\'\n    if tag==\'SELECT\':\n        try:\n            opts=ri.locator(\'option\')\n            for i in range(min(opts.count(),1000)):\n                op=opts.nth(i); val=str(op.get_attribute(\'value\') or \'\').strip(); lab=str(op.inner_text() or \'\').strip()\n                if val==rid or (rid==\'213\' and \'моск\' in lab.lower()):\n                    ri.select_option(value=val)\n                    try: ri.dispatch_event(\'change\')\n                    except Exception: pass\n                    page.wait_for_timeout(600)\n                    if not region_error_visible(page): return True\n        except Exception: pass\n    for value in values:\n        try:\n            ri.click()\n            try: ri.press(\'Control+A\')\n            except Exception: pass\n            try: ri.fill(value)\n            except Exception:\n                inp=ri.locator(\'input:visible\').first\n                if inp.count()==0: raise\n                ri=inp; ri.click(); ri.press(\'Control+A\'); ri.fill(value)\n            page.wait_for_timeout(1000)\n            if choose_region_popup(page,rid):\n                page.wait_for_timeout(500)\n                if not region_error_visible(page): return True\n            for _ in range(3):\n                try:\n                    ri.press(\'ArrowDown\'); page.wait_for_timeout(150); ri.press(\'Enter\'); page.wait_for_timeout(500)\n                except Exception: break\n                if not region_error_visible(page): return True\n            try: ri.press(\'Tab\'); page.wait_for_timeout(500)\n            except Exception: pass\n            if not region_error_visible(page): return True\n        except Exception: pass\n    try:\n        link=page.get_by_text(re.compile(r\'мои\\s+регионы\',re.I)).first\n        if link.count()>0:\n            link.click(timeout=5000); page.wait_for_timeout(700)\n            if choose_region_popup(page,rid): return not region_error_visible(page)\n            moscow=page.get_by_text(re.compile(r\'^Москва(?:\\s|$)\',re.I))\n            if moscow.count()>0:\n                moscow.last.click(timeout=5000); page.wait_for_timeout(500)\n                return not region_error_visible(page)\n    except Exception: pass\n    return False\n\ndef region_error_visible(page):\n    try: return bool(re.search(r\'Необходимо\\s+выбрать\\s+регион\',txt(page.locator(\'body\')),re.I))\n    except Exception: return False\n\ndef find_create_button(page):\n    return click_text(page,[r\'создать\\s+задани\',r\'запустить\',r\'создать\\s+задач\',r\'собрать\\s+топ\'])\n\ndef normalize(rows):\n    out=[]\n    for r in rows or []:\n        rr={str(k).strip():v for k,v in dict(r).items()}\n        def pick(names):\n            for n in names:\n                for k,v in rr.items():\n                    if str(k).strip().lower()==n.lower(): return str(v or \'\').strip()\n            for n in names:\n                for k,v in rr.items():\n                    if n.lower() in str(k).strip().lower(): return str(v or \'\').strip()\n            return \'\'\n        url=pick([\'url\',\'ссылка\',\'страница\'])\n        if not url: continue\n        out.append({\'keyword\':pick([\'keyword\',\'запрос\',\'фраза\',\'query\',\'ключ\']),\n                    \'position\':pick([\'position\',\'позиция\',\'pos\',\'поз\']),\n                    \'domain\':pick([\'domain\',\'домен\']),\n                    \'url\':url,\'title\':pick([\'title\',\'заголовок\',\'h1\']),\n                    \'snippet\':pick([\'snippet\',\'сниппет\',\'description\'])})\n    return out\n\ndef parse_csv_file(path):\n    raw=Path(path).read_bytes()\n    for enc in (\'utf-8-sig\',\'utf-8\',\'cp1251\'):\n        try:\n            text=raw.decode(enc)\n            for sep in (\',\',\';\',\'\\t\'):\n                rows=list(csv.DictReader(text.splitlines(),delimiter=sep))\n                if rows and len(rows[0])>=2: return normalize(rows)\n        except Exception: pass\n    return []\n\ndef main():\n    request=Path(sys.argv[1]); result=Path(sys.argv[2]); progress_file=Path(sys.argv[3])\n    data=json.loads(request.read_text(encoding=\'utf-8\'))\n    login=str(data.get(\'login\',\'\')); password=str(data.get(\'password\',\'\')); region=str(data.get(\'region\',\'213\'))\n    queries=[]\n    for q in data.get(\'queries\',[]):\n        q=str(q or \'\').strip()\n        if q and q not in queries: queries.append(q)\n    profile=Path(data[\'profile\']); timeout=int(data.get(\'timeout\',60000)); task_timeout=int(data.get(\'task_timeout\',3600000))\n    progress_file.parent.mkdir(parents=True,exist_ok=True)\n    def progress(s):\n        with progress_file.open(\'a\',encoding=\'utf-8\') as f: f.write(str(s)+\'\\n\')\n    try:\n        from playwright.sync_api import sync_playwright\n    except Exception as e:\n        raise RuntimeError(\'Python 3.14 не видит Playwright: \'+repr(e))\n    progress(\'Playwright: запуск через Python 3.14.\')\n    progress(\'Открываю браузерный профиль WordKeeper...\')\n    profile.mkdir(parents=True,exist_ok=True); captured=[]; result_rows=[]\n    with sync_playwright() as pw:\n        browser=pw.chromium.launch_persistent_context(str(profile),headless=False,viewport={\'width\':1400,\'height\':900},accept_downloads=True)\n        page=browser.pages[0] if browser.pages else browser.new_page(); page.set_default_timeout(timeout)\n        responses=[]\n        page.on(\'response\', lambda r: responses.append(r) if \'word-keeper.ru\' in r.url else None)\n        try:\n            page.goto(\'https://word-keeper.ru/login\',wait_until=\'domcontentloaded\',timeout=timeout); page.wait_for_timeout(1200)\n            if \'/login\' in page.url:\n                li=locator_first(page,[\'input[name="login"]\',\'input[type="email"]\',\'input[name*="mail" i]\',\'input[placeholder*="почт" i]\'])\n                pi=locator_first(page,[\'input[name="password"]\',\'input[type="password"]\'])\n                if not li or not pi: raise RuntimeError(\'Не удалось найти поля авторизации WordKeeper.\')\n                li.fill(login); pi.fill(password)\n                if not click_text(page,[r\'войти\',r\'авторизац\']): pi.press(\'Enter\')\n                page.wait_for_timeout(2500)\n                if \'/login\' in page.url: raise RuntimeError(\'Авторизация WordKeeper в браузере не удалась.\')\n            page.goto(\'https://word-keeper.ru/core/parse_top\',wait_until=\'domcontentloaded\',timeout=timeout); page.wait_for_timeout(1200)\n            if page.url.rstrip(\'/\').endswith(\'/login\'):\n                raise RuntimeError(\'WordKeeper вернул страницу авторизации вместо /core/parse_top. Проверьте авторизацию.\')\n            qi=find_query_input(page)\n            if not qi: raise RuntimeError(\'Инструмент TOP-10 открылся, но поле списка фраз не найдено. Страница: \'+page.url)\n            tag=(qi.evaluate(\'(e)=>e.tagName\') or \'\').upper()\n            region_ok=set_region(page,region)\n            progress(\'TOP-10: выбор региона %s: %s.\' % (region, \'OK\' if region_ok else \'не найден автоматический выбор\'))\n            if region_error_visible(page):\n                if str(region).strip()==\'213\':\n                    try:\n                        ri=find_region_input(page)\n                        if ri:\n                            ri.click(); ri.fill(\'Москва\'); page.wait_for_timeout(700)\n                            opts=page.locator(\'[role="option"]:visible,.ui-autocomplete li:visible,.ui-menu-item:visible,li:visible\')\n                            for i in range(min(opts.count(),100)):\n                                op=opts.nth(i); s=(op.inner_text() or \'\').strip()\n                                if \'моск\' in s.lower():\n                                    op.click(timeout=3000); page.wait_for_timeout(300); break\n                            try: ri.press(\'Enter\')\n                            except Exception: pass\n                    except Exception: pass\n                if region_error_visible(page):\n                    raise RuntimeError(\'WordKeeper не принял регион %s. В поле «Выберите регион» регион не выбран.\' % region)\n            if tag!=\'TEXTAREA\': raise RuntimeError(\'TOP-10 сейчас не даёт пакетное поле (найден \'+tag+\'). Нужна адаптация интерфейса.\')\n            ok,editor_type=set_query_text(page,\'\\n\'.join(queries))\n            progress(\'TOP-10: вставка %s фраз в редактор: %s.\' % (len(queries), (\'OK (\'+str(editor_type)+\')\') if ok else \'ОШИБКА\'))\n            if not ok: raise RuntimeError(\'Не удалось вставить список фраз в редактор WordKeeper TOP-10.\')\n            before=len(responses)\n            if not find_create_button(page): raise RuntimeError(\'Не найдена кнопка запуска TOP-10.\')\n            progress(\'Задание отправлено: \'+str(len(queries))+\' запросов.\')\n            deadline=time.time()+task_timeout/1000; downloaded=None\n            while time.time()<deadline:\n                page.wait_for_timeout(3000); links=page.locator(\'a,button,[role="button"]\')\n                for i in range(min(links.count(),500)):\n                    el=links.nth(i); blob=\' \'.join([txt(el),attr(el,\'href\'),attr(el,\'title\'),attr(el,\'aria-label\')])\n                    if re.search(r\'csv|выгруз|скач|export|download\',blob,re.I):\n                        try:\n                            with page.expect_download(timeout=3000) as di: el.click(timeout=3000)\n                            downloaded=di.value; break\n                        except Exception: pass\n                if downloaded: break\n                for resp in responses[before:]:\n                    if re.search(r\'(csv|json|download|export|top)\',resp.url,re.I):\n                        try:\n                            body=resp.text()\n                            if \'http\' in body and (\'url\' in body.lower() or \'domain\' in body.lower()): captured.append(body)\n                        except Exception: pass\n            if downloaded:\n                target=profile/\'last_top10_export.csv\'; downloaded.save_as(str(target)); result_rows=parse_csv_file(target)\n            if not result_rows:\n                for body in captured:\n                    for sep in (\',\',\';\',\'\\t\'):\n                        try:\n                            rows=list(csv.DictReader(body.splitlines(),delimiter=sep))\n                            if rows and len(rows[0])>=2: result_rows.extend(normalize(rows)); break\n                        except Exception: pass\n            if not result_rows:\n                diag=profile/\'top10_debug.html\'; diag.write_text(page.content(),encoding=\'utf-8\')\n                raise RuntimeError(\'TOP-10 отправлен, но экспорт результата не найден. Диагностика: \'+str(diag))\n            uniq={}\n            for r in result_rows:\n                k=(r.get(\'keyword\',\'\').strip(),r.get(\'url\',\'\').strip())\n                if k[0] and k[1]: uniq[k]=r\n            result.write_text(json.dumps({\'ok\':True,\'rows\':list(uniq.values())},ensure_ascii=False),encoding=\'utf-8\')\n            progress(\'Экспорт получен: \'+str(len(uniq))+\' уникальных строк.\')\n        finally:\n            try: browser.close()\n            except Exception: pass\n\nif __name__==\'__main__\':\n    try: main()\n    except Exception as e:\n        result=Path(sys.argv[2]); result.write_text(json.dumps({\'ok\':False,\'error\':str(e),\'traceback\':traceback.format_exc()},ensure_ascii=False),encoding=\'utf-8\')\n        raise\n'
-def _collect_wordkeeper_top10_external(login, password, region, queries, stop_event, progress):
-    """Запускает браузерную часть через Python 3.14, где установлен Playwright."""
-    helper_path = CFG.parent / "wordkeeper_top10_helper.py"
-    request_path = CFG.parent / "wordkeeper_top10_request.json"
-    result_path = CFG.parent / "wordkeeper_top10_result.json"
-    progress_path = CFG.parent / "wordkeeper_top10_helper.progress.log"
-    helper_path.parent.mkdir(parents=True, exist_ok=True)
-    helper_path.write_text(WK_TOP10_HELPER_SOURCE, encoding="utf-8")
-    for p in (result_path, progress_path):
-        try: p.unlink()
-        except Exception: pass
-    request = {"login": login, "password": password, "region": str(region), "queries": list(queries),
-               "profile": str(WK_TOP10_BROWSER_PROFILE), "timeout": WK_TOP10_BROWSER_TIMEOUT,
-               "task_timeout": WK_TOP10_TASK_TIMEOUT}
-    request_path.write_text(json.dumps(request, ensure_ascii=False), encoding="utf-8")
-    launcher = shutil.which("py") or shutil.which("py.exe")
-    if not launcher:
-        candidate = Path(os.environ.get("LOCALAPPDATA", "")) / "Programs/Python/Launcher/py.exe"
-        launcher = str(candidate) if candidate.exists() else ""
-    if not launcher or not Path(launcher).exists():
-        raise RuntimeError("Не найден Python Launcher py.exe. Установите/проверьте Python 3.14.")
-    cmd=[launcher, "-3.14", str(helper_path), str(request_path), str(result_path), str(progress_path)]
-    progress("Основное приложение не видит Playwright; запускаю браузерный помощник через Python 3.14.")
-    proc=subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                          creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-    pos=0
-    try:
-        while proc.poll() is None:
-            if stop_event.is_set():
-                try: proc.terminate()
-                except Exception: pass
-                return [], "Остановлено пользователем"
-            if progress_path.exists():
-                try:
-                    lines=progress_path.read_text(encoding="utf-8").splitlines()
-                    for line in lines[pos:]:
-                        if line.strip(): progress(line.strip())
-                    pos=len(lines)
-                except Exception: pass
-            time.sleep(0.5)
-        if progress_path.exists():
-            try:
-                lines=progress_path.read_text(encoding="utf-8").splitlines()
-                for line in lines[pos:]:
-                    if line.strip(): progress(line.strip())
-            except Exception: pass
-        if not result_path.exists():
-            raise RuntimeError("Браузерный помощник TOP-10 завершился с кодом %s, но результат не создан." % proc.returncode)
-        data=json.loads(result_path.read_text(encoding="utf-8"))
-        if not data.get("ok"):
-            raise RuntimeError(str(data.get("error") or "Неизвестная ошибка браузерного помощника TOP-10"))
-        return list(data.get("rows") or []), "OK"
-    finally:
-        try: request_path.unlink()
-        except Exception: pass
-
-
-def collect_wordkeeper_top10_real_tool(login, password, region, queries, stop_event, progress):
-    """Запускает именно UI-инструмент WordKeeper «Выдача ТОП 10».
-
-    LEGACY/FALLBACK: основной сбор v1.29.0 больше не использует эту функцию.
-    Она оставлена только для совместимости старых диагностик. Основной путь —
-    collect_wordkeeper_top10_http(), без Chrome/Playwright.
-    """
-    try:
-        from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
-    except Exception:
-        # Программа может быть запущена другим Python. Playwright у пользователя установлен в Python 3.14.
-        return _collect_wordkeeper_top10_external(login, password, region, queries, stop_event, progress)
-
-    WK_TOP10_BROWSER_PROFILE.mkdir(parents=True, exist_ok=True)
-    result_rows=[]
-    captured=[]
-
-    with sync_playwright() as pw:
-        browser = pw.chromium.launch_persistent_context(
-            str(WK_TOP10_BROWSER_PROFILE),
-            headless=False,
-            viewport={'width': 1400, 'height': 900},
-            accept_downloads=True,
-        )
-        page = browser.pages[0] if browser.pages else browser.new_page()
-        page.set_default_timeout(WK_TOP10_BROWSER_TIMEOUT)
-
-        responses=[]
-        def on_response(resp):
-            try:
-                if 'word-keeper.ru' in resp.url:
-                    responses.append(resp)
-            except Exception:
-                pass
-        page.on('response', on_response)
-
-        try:
-            # Сразу открываем реальный инструмент. Не заходим на /login заранее:
-            # у уже авторизованной persistent-сессии /login может отправить
-            # браузер в «Личный кабинет».
-            page.goto(TOP10_WK_PAGE, wait_until='domcontentloaded', timeout=WK_TOP10_BROWSER_TIMEOUT)
-            page.wait_for_timeout(1500)
-            progress(f'TOP-10: открыта страница {page.url}')
-
-            # Если именно инструмент потребовал авторизацию — авторизуемся.
-            if '/login' in page.url:
-                login_input = _pw_locator_first(page, [
-                    'input[name="login"]', 'input[type="email"]', 'input[name*="mail" i]',
-                    'input[placeholder*="почт" i]'
-                ])
-                pass_input = _pw_locator_first(page, [
-                    'input[name="password"]', 'input[type="password"]'
-                ])
-                if not login_input or not pass_input:
-                    raise RuntimeError('Не удалось найти поля авторизации WordKeeper в браузере.')
-                login_input.fill(str(login))
-                pass_input.fill(str(password))
-                if not _pw_click_text(page, [r'войти', r'авторизац']):
-                    pass_input.press('Enter')
-                page.wait_for_timeout(2500)
-                progress(f'TOP-10: после авторизации открыта страница {page.url}')
-                if '/login' in page.url:
-                    raise RuntimeError('Авторизация WordKeeper в браузере не удалась.')
-
-                # После логина снова явно открываем нужный инструмент.
-                page.goto(TOP10_WK_PAGE, wait_until='domcontentloaded', timeout=WK_TOP10_BROWSER_TIMEOUT)
-                page.wait_for_timeout(1500)
-                progress(f'TOP-10: повторно открыта страница инструмента {page.url}')
-
-            if '/login' in page.url:
-                raise RuntimeError(
-                    'WordKeeper вернул страницу авторизации вместо /core/parse_top. '
-                    'Проверьте логин/пароль и браузерный профиль.'
-                )
-            if '/core/parse_top' not in page.url:
-                raise RuntimeError(
-                    f'WordKeeper открыл не инструмент TOP-10, а {page.url}. '
-                    'Это похоже на редирект сессии в «Личный кабинет».'
-                )
-
-            query_input=_pw_find_query_input(page)
-            if not query_input:
-                raise RuntimeError(
-                    f'Инструмент «Выдача ТОП 10» открылся ({page.url}), но поле списка фраз не найдено.'
-                )
-
-            # Проверяем, что инструмент принимает список строк. Если textarea есть —
-            # подаём пакет целиком. Если это input, берём по одной задаче.
-            is_textarea = False
-            try:
-                is_textarea = (query_input.evaluate('(e)=>e.tagName') or '').upper() == 'TEXTAREA'
-            except Exception:
-                pass
-
-            # Берём только уникальные реальные запросы.
-            qlist=[]
-            for q in queries:
-                q=str(q or '').strip()
-                if q and q not in qlist:
-                    qlist.append(q)
-            if not qlist:
-                raise RuntimeError('Нет запросов для TOP-10.')
-
-            region_ok = _pw_set_region(page, region)
-            progress(f'TOP-10: выбор региона {region}: {"OK" if region_ok else "не найден автоматический выбор"}.')
-            if _pw_region_error_visible(page):
-                # Повторная попытка для 213 через человекочитаемое название.
-                if str(region).strip() == '213':
-                    try:
-                        ri = _pw_find_region_input(page)
-                        if ri:
-                            ri.click()
-                            ri.fill('Москва')
-                            page.wait_for_timeout(700)
-                            opts = page.locator('[role="option"]:visible, .ui-autocomplete li:visible, .ui-menu-item:visible, li:visible')
-                            for i in range(min(opts.count(), 100)):
-                                op = opts.nth(i)
-                                s = (op.inner_text() or '').strip()
-                                if 'моск' in s.lower():
-                                    op.click(timeout=3000)
-                                    page.wait_for_timeout(300)
-                                    break
-                            try:
-                                ri.press('Enter')
-                            except Exception:
-                                pass
-                    except Exception:
-                        pass
-                if _pw_region_error_visible(page):
-                    raise RuntimeError(
-                        f'WordKeeper не принял регион {region}. '
-                        'В поле «Выберите регион» регион не выбран.'
-                    )
-
-            # Если есть textarea, сначала пробуем один пакет — это соответствует UI-инструменту.
-            if is_textarea:
-                query_text = '\n'.join(qlist)
-                set_ok, editor_type = _pw_set_query_text(page, query_text)
-                progress(
-                    f'TOP-10: вставка {len(qlist)} фраз в редактор: '
-                    f'{"OK (" + str(editor_type) + ")" if set_ok else "ОШИБКА"}.'
-                )
-                if not set_ok:
-                    raise RuntimeError('Не удалось вставить список фраз в редактор WordKeeper TOP-10.')
-                before=len(responses)
-                if not _pw_find_create_button(page):
-                    raise RuntimeError('Не найдена кнопка «Создать задание/Запустить» в инструменте TOP-10.')
-                progress('TOP-10: задание отправлено через отдельный инструмент WordKeeper «Выдача ТОП 10».')
-
-                # Ждём появления результата/кнопки выгрузки. Параллельно ловим CSV/JSON ответы.
-                deadline=time.time()+WK_TOP10_TASK_TIMEOUT/1000
-                downloaded=None
-                while time.time()<deadline and not stop_event.is_set():
-                    page.wait_for_timeout(3000)
-                    # Прямые ссылки на CSV/XLSX.
-                    links=page.locator('a, button, [role="button"]')
-                    for i in range(min(links.count(), 500)):
-                        el=links.nth(i)
-                        txt=' '.join([_pw_text(el),_pw_attr(el,'href'),_pw_attr(el,'title'),_pw_attr(el,'aria-label')])
-                        if re.search(r'csv|выгруз|скач|export|download',txt,re.I):
-                            try:
-                                with page.expect_download(timeout=3000) as di:
-                                    el.click(timeout=3000)
-                                downloaded=di.value
-                                break
-                            except Exception:
-                                pass
-                    if downloaded:
-                        break
-                    # Пробуем сетевые ответы, содержащие CSV/JSON с результатами.
-                    for resp in responses[before:]:
-                        ctype=_pw_attr(resp,'content-type') if False else ''
-                        if re.search(r'(csv|json|download|export|top)',resp.url,re.I):
-                            try:
-                                body=resp.text()
-                                if ('http' in body and ('url' in body.lower() or 'domain' in body.lower())):
-                                    captured.append(body)
-                            except Exception:
-                                pass
-                    # Текст страницы может содержать статус завершения.
-                    bodytxt=_pw_text(page.locator('body'))
-                    if re.search(r'готов|заверш|обработан',bodytxt,re.I) and re.search(r'топ\s*10',bodytxt,re.I):
-                        # ещё один проход кнопок выгрузки
-                        pass
-
-                if stop_event.is_set():
-                    return result_rows, 'Остановлено пользователем'
-                if downloaded:
-                    target=WK_TOP10_BROWSER_PROFILE/'last_top10_export'
-                    downloaded.save_as(str(target))
-                    # Попробуем несколько кодировок.
-                    for enc in ['utf-8-sig','utf-8','cp1251']:
-                        try:
-                            df=pd.read_csv(target,encoding=enc)
-                            result_rows=_pw_normalize_export_rows(df.to_dict('records'))
-                            if result_rows: break
-                        except Exception:
-                            pass
-                if not result_rows:
-                    for body in captured:
-                        parsed=_pw_extract_csv_text(body)
-                        result_rows.extend(_pw_normalize_export_rows(parsed))
-
-                if not result_rows:
-                    # Последняя попытка: сохранить HTML для диагностики.
-                    diag=WK_TOP10_BROWSER_PROFILE/'top10_debug.html'
-                    diag.write_text(page.content(),encoding='utf-8')
-                    raise RuntimeError(
-                        'Задание TOP-10 отправлено, но экспорт результата автоматически не найден. '
-                        f'Для диагностики сохранена страница: {diag}'
-                    )
-            else:
-                # Если UI допускает только один input, отправляем запросы по одному.
-                for idx,q in enumerate(qlist,1):
-                    if stop_event.is_set(): break
-                    query_input=_pw_find_query_input(page)
-                    if not query_input: raise RuntimeError('Поле запроса исчезло после первого задания.')
-                    query_input.fill(q)
-                    if not _pw_find_create_button(page):
-                        raise RuntimeError('Не найдена кнопка запуска TOP-10.')
-                    progress(f'TOP-10: {idx}/{len(qlist)} отправлено через реальный инструмент WordKeeper.')
-                    page.wait_for_timeout(1500)
-                raise RuntimeError(
-                    'Инструмент TOP-10 принимает по одному запросу, но автоматический экспорт результата '
-                    'для пакетного режима ещё не определён. Сохранён browser-профиль для доработки.'
-                )
-
-            # Дедупликация.
-            uniq={}
-            for r in result_rows:
-                key=(str(r.get('keyword','')).strip(),str(r.get('url','')).strip())
-                if key[0] and key[1]: uniq[key]=r
-            return list(uniq.values()), 'OK'
-        finally:
-            try: browser.close()
-            except Exception: pass
 
 # -----------------------------------------------------------------------------
 # OCFILTER DIRECT POST
@@ -3003,14 +1980,14 @@ def promotion_type_for_counts(product_domains, seo_domains, article_domains, unk
 
 
 # -----------------------------------------------------------------------------
-# SEO CANDIDATE SELECTION v1.27 TOP10
+# SEO CANDIDATE SELECTION v1.25
 # -----------------------------------------------------------------------------
 
-SEO_SELECTION_VERSION = "1.27.0-TOP10"
-SEO_CREATE_MIN_SCORE = 5
-SEO_MIN_FILTER_DOMAINS_TEXT = 3
-SEO_MIN_FILTER_DOMAINS_NUMERIC = 4
-SEO_MIN_FILTER_DOMAINS_SMALL = 2
+SEO_SELECTION_VERSION = "1.25.0"
+SEO_CREATE_MIN_SCORE = 6
+SEO_MIN_FILTER_DOMAINS_TEXT = 5
+SEO_MIN_FILTER_DOMAINS_NUMERIC = 7
+SEO_MIN_FILTER_DOMAINS_SMALL = 3
 SEO_CREATE_CAP_NUMERIC = 25
 SEO_CREATE_CAP_TEXT = 20
 
@@ -3049,9 +2026,9 @@ def _is_numeric_filter(filter_name, values):
 def _seo_candidate_score(row):
     """Оценивает силу SEO-кандидата без новых сетевых запросов.
 
-    Скоринг использует только уже собранные данные TOP-10 и классификации:
+    Скоринг использует только уже собранные данные TOP-30 и классификации:
     точные filter-конкуренты, разнообразие доменов, SEO/product-интент,
-    положение конкурентов в TOP-10, качество URL и размер сетки характеристики.
+    положение конкурентов в TOP-30, качество URL и размер сетки характеристики.
     """
     fd = int(row.get("filter_domains_count") or 0)
     sd = int(row.get("seo_domains_count") or 0)
@@ -3108,7 +2085,7 @@ def _seo_candidate_score(row):
 
 
 def _apply_seo_candidate_selection(res, progress=None):
-    """Финальный отбор CREATE-кандидатов v1.27 TOP10.
+    """Финальный отбор CREATE-кандидатов v1.25.
 
     Важный принцип: базовая классификация собирает доказательства, а эта функция
     уже решает, сколько реальных SEO-посадочных страниц стоит создавать.
@@ -3147,7 +2124,6 @@ def _apply_seo_candidate_selection(res, progress=None):
             min_domains = SEO_MIN_FILTER_DOMAINS_TEXT
 
         r["seo_selection_version"] = SEO_SELECTION_VERSION
-        r["evidence_depth"] = "TOP10"
         r["filter_value_count"] = value_count
         r["seo_numeric_filter"] = "1" if numeric else "0"
         r["seo_create_min_domains"] = min_domains
@@ -3161,13 +2137,13 @@ def _apply_seo_candidate_selection(res, progress=None):
         if fd < min_domains:
             r["status"] = "SKIP"
             r["reason"] = (
-                f"SEO-отбор v1.27 TOP10: недостаточно независимых filter-конкурентов "
+                f"SEO-отбор v1.25: недостаточно независимых filter-конкурентов "
                 f"({fd}/{min_domains}); значений характеристики={value_count}"
             )
         elif score < SEO_CREATE_MIN_SCORE:
             r["status"] = "SKIP"
             r["reason"] = (
-                f"SEO-отбор v1.27 TOP10: низкий SEO Score={score}/{SEO_CREATE_MIN_SCORE}; "
+                f"SEO-отбор v1.25: низкий SEO Score={score}/{SEO_CREATE_MIN_SCORE}; "
                 f"filter-конкурентов={fd}, SEO-доменов={r.get('seo_domains_count',0)}, "
                 f"PRODUCT-доменов={r.get('product_domains_count',0)}"
             )
@@ -3202,7 +2178,7 @@ def _apply_seo_candidate_selection(res, progress=None):
                 continue
             r["status"] = "SKIP"
             r["reason"] = (
-                f"SEO-отбор v1.27 TOP10: дубликат target URL; приоритет у "
+                f"SEO-отбор v1.25: дубликат target URL; приоритет у "
                 f"«{winner.get('filter')} = {winner.get('value')}» "
                 f"(Score={winner.get('seo_selection_score')})"
             )
@@ -3234,7 +2210,7 @@ def _apply_seo_candidate_selection(res, progress=None):
         for r in candidates[cap:]:
             r["status"] = "SKIP"
             r["reason"] = (
-                f"SEO-отбор v1.27 TOP10: превышен лимит характеристики "
+                f"SEO-отбор v1.25: превышен лимит характеристики "
                 f"{cap} страниц; кандидат исключён как менее сильный "
                 f"(Score={r.get('seo_selection_score')})"
             )
@@ -3243,7 +2219,7 @@ def _apply_seo_candidate_selection(res, progress=None):
     final_create = sum(1 for r in rows if r.get("status") == "CREATE")
     if progress:
         progress(
-            f"SEO-отбор v1.27 TOP10: CREATE={final_create} | "
+            f"SEO-отбор v1.25: CREATE={final_create} | "
             f"дубликатов URL убрано={duplicate_removed} | "
             f"лишних по лимитам характеристик={capped}"
         )
@@ -3316,7 +2292,7 @@ class Pipeline:
                     "alias": alias,
                     "target_url": expected_url(r.url, alias),
                     "status": "UNVERIFIED",
-                    "reason": "требует TOP-10 + проверки OCFilter",
+                    "reason": "требует TOP-30 + проверки OCFilter",
                     "competitor_1": "", "competitor_2": "", "competitor_3": "", "competitor_4": "", "competitor_5": "",
                 })
         self.log(f"Категория: {cat}")
@@ -3328,15 +2304,15 @@ class Pipeline:
         return {"url": r.url, "category": search_category, "category_slug": urlparse(r.url).path.rstrip("/").split("/")[-1], "search_category": search_category, "category_id": cid, "options": opts, "rows": rows}
 
     def merge_analysis(self, res, topdf, progress=None, stop_event=None, cache_path=None):
-        """Сопоставляет TOP-10 с OCFilter и определяет тип продвижения.
+        """Сопоставляет TOP-30 с OCFilter и определяет тип продвижения.
 
-        Для каждого URL TOP-10 определяется тип страницы:
+        Для каждого URL TOP-30 определяется тип страницы:
         PRODUCT / SEO_PAGE / ARTICLE / OTHER.
         Затем по независимым доменам определяется promotion_type:
         ТОВАР / SEO-СТРАНИЦА / СМЕШАННЫЙ / ИНФОРМАЦИОННАЯ / НЕДОСТАТОЧНО ДАННЫХ.
 
         Базовый слой собирает доказательства filter-интента. Финальный CREATE
-        определяется отдельным SEO-отбором v1.27 TOP10: требуется больше независимых
+        определяется отдельным SEO-отбором v1.25: требуется больше независимых
         конкурентов (5 для обычных и 7 для числовых характеристик), считается
         SEO Score, удаляются дубли target URL и ограничивается число страниц
         для широких характеристик. Явно ТОВАРНЫЙ интент не переводится в CREATE.
@@ -3345,7 +2321,7 @@ class Pipeline:
             for x in res["rows"]:
                 x["promotion_type"] = "НЕДОСТАТОЧНО ДАННЫХ"
                 x["status"] = "SKIP"
-                x["reason"] = "TOP-10 не загружен"
+                x["reason"] = "TOP-30 не загружен"
             return res
 
         kc = find_col(topdf, ["keyword", "query", "запрос"])
@@ -3391,7 +2367,7 @@ class Pipeline:
 
         # Загружаем постоянный кэш классификации URL.
         if cache_path is None:
-            cache_path = Path(self.folder.get() or os.getcwd()) / "seo_top10_serp_page_classification.csv"
+            cache_path = Path(self.folder.get() or os.getcwd()) / "seo_serp_page_classification.csv"
         cache = load_serp_classification_cache(cache_path)
         session = http_session()
         page_map = {}
@@ -3435,7 +2411,7 @@ class Pipeline:
                 relevant = pd.concat([relevant, extra], ignore_index=False).drop_duplicates()
 
         if progress:
-            progress(f"TOP-10: найдено строк текущей категории/вариантов запроса: {len(relevant)}")
+            progress(f"TOP-30: найдено строк текущей категории/вариантов запроса: {len(relevant)}")
 
         unique_urls = []
         seen_urls = set()
@@ -3466,7 +2442,7 @@ class Pipeline:
 
         if progress:
             progress(
-                f"Классификация TOP-10: уникальных URL {total_urls} | "
+                f"Классификация TOP-30: уникальных URL {total_urls} | "
                 f"кэшировано {total_urls - len(pending_urls)} | "
                 f"новых {len(pending_urls)} | потоков {SERP_CLASSIFY_WORKERS} | "
                 f"сохранение кэша каждые {SERP_CLASSIFY_CACHE_EVERY}"
@@ -3522,7 +2498,7 @@ class Pipeline:
 
         save_serp_classification_cache(cache, cache_path)
 
-        # Добавляем классификацию к исходному TOP-10 DataFrame для полного XLSX.
+        # Добавляем классификацию к исходному TOP-30 DataFrame для полного XLSX.
         classification_cols = ["page_type","page_confidence","page_signals","page_http_status","page_fetched","page_h1","page_breadcrumbs"]
 
         # Pandas 2.x может прочитать уже существующие колонки как StringDtype.
@@ -3719,9 +2695,9 @@ class Pipeline:
 
             if fe_filter:
                 x["status"] = "EXISTS"
-                x["reason"] = "FE-RUS уже имеет filter URL для этого значения в TOP-10"
+                x["reason"] = "FE-RUS уже имеет filter URL для этого значения в TOP-30"
             elif promotion == "ТОВАР":
-                # Явно товарный TOP-10 не переводим в CREATE только из-за
+                # Явно товарный TOP-30 не переводим в CREATE только из-за
                 # наличия отдельных filter URL у конкурентов.
                 x["status"] = "SKIP"
                 x["reason"] = f"Товарный интент: PRODUCT-доменов={len(product_domains)}, SEO-доменов={len(seo_domains)}"
@@ -3732,7 +2708,7 @@ class Pipeline:
                 # Базовый слой только собирает кандидата. Финальное решение
                 # принимает _apply_seo_candidate_selection ниже.
                 x["status"] = "CREATE"
-                x["reason"] = f"Базовый кандидат: {len(filter_domains)} независимых конкурента с точным filter URL; TOP-10={promotion.lower()}"
+                x["reason"] = f"Базовый кандидат: {len(filter_domains)} независимых конкурента с точным filter URL; TOP-30={promotion.lower()}"
             elif promotion == "СМЕШАННЫЙ":
                 x["status"] = "SKIP"
                 x["reason"] = f"Смешанный интент, но точных filter-конкурентов недостаточно: {len(filter_domains)}"
@@ -3754,7 +2730,7 @@ class Pipeline:
 
         _apply_seo_candidate_selection(res, progress=progress)
         if progress:
-            progress("Классификация TOP-10 завершена.")
+            progress("Классификация TOP-30 завершена.")
         return res
 
     def check_urls(self, res):
@@ -3949,7 +2925,7 @@ def generator_rows(res):
         if x.get("status") != "CREATE":
             continue
         # СМЕШАННЫЙ также допускается, если кандидат прошёл новый
-        # SEO-отбор v1.27 TOP10 и все последующие проверки.
+        # SEO-отбор v1.25 и все последующие проверки.
         if not is_filter_creation_intent(x):
             continue
         if x.get("url_status") not in ("READY_FOR_OCFILTER", "HTTP_404"):
@@ -4046,38 +3022,6 @@ def append_ready_links_google_sheet(res, endpoint, token, timeout=30):
     if not data.get("ok"):
         raise RuntimeError(str(data.get("error") or "Google Sheets: неизвестная ошибка"))
     return int(data.get("added", 0)), int(data.get("total", 0)), data
-
-def update_section_status_google_sheet(status_row, endpoint, token, timeout=30):
-    """Создаёт/обновляет одну строку статуса родительского раздела в листе РАЗДЕЛЫ."""
-    endpoint = str(endpoint or "").strip()
-    token = str(token or "").strip()
-    if not endpoint:
-        raise RuntimeError("Не задан URL Google Apps Script Web App для Google Sheets.")
-    if not token:
-        raise RuntimeError("Не задан токен Google Sheets.")
-
-    payload = {
-        "action": "upsert_section_status",
-        "sheet_id": GOOGLE_SHEET_ID,
-        "sheet_name": GOOGLE_STATUS_SHEET_NAME,
-        "token": token,
-        "row": dict(status_row or {}),
-    }
-    try:
-        r = requests.post(endpoint, json=payload, timeout=timeout)
-    except Exception as e:
-        raise RuntimeError(f"Не удалось обновить статус раздела в Google Sheets: {e}")
-
-    if r.status_code != 200:
-        raise RuntimeError(f"Google Sheets вернул HTTP {r.status_code}: {r.text[:500]}")
-    try:
-        data = r.json()
-    except Exception:
-        raise RuntimeError(f"Google Apps Script вернул не-JSON ответ: {r.text[:500]}")
-    if not data.get("ok"):
-        raise RuntimeError(str(data.get("error") or "Google Sheets: неизвестная ошибка"))
-    return data
-
 
 def sync_ready_links_cloud(csv_path, endpoint, token, timeout=60):
     """Синхронизирует локальный накопительный CSV с единым CSV в Google Drive.
@@ -4271,7 +3215,7 @@ def export_excel(res, path, topdf=None):
         for v in o.get("values", []):
             ws.append([o.get("name"),o.get("keyword"),o.get("option_id"),v.get("name"),v.get("value_id"),v.get("keyword"),v.get("params"),value_alias(o,v)])
     if topdf is not None and not topdf.empty:
-        ws = wb.create_sheet("WORDKEEPER_TOP10")
+        ws = wb.create_sheet("WORDKEEPER_TOP30")
         for j,cname in enumerate(topdf.columns,1): ws.cell(1,j,cname)
         for i,row in enumerate(topdf.itertuples(index=False),2):
             for j,val in enumerate(row,1): ws.cell(i,j,str(val) if pd.notna(val) else "")
@@ -4379,7 +3323,7 @@ def cloud_download_section_file(endpoint, token, section_name, file_name, local_
     local_path = Path(local_path)
     local_path.parent.mkdir(parents=True, exist_ok=True)
 
-    # Пустой облачный файл не должен затирать уже собранный локальный TOP-10.
+    # Пустой облачный файл не должен затирать уже собранный локальный TOP-30.
     # Такое возможно, если прошлый upload не успел завершиться.
     if not raw:
         if local_path.exists() and local_path.stat().st_size > 0:
@@ -4482,7 +3426,7 @@ def migrate_legacy_file_for_section(src, dst, filename, res):
             current_variants.update(norm(q) for q in variants if str(q).strip())
         variant_keys = {norm(q) for q in current_variants}
 
-        if filename == "seo_top10_result.csv":
+        if filename == "seo_top30_result.csv":
             df = pd.read_csv(src, encoding="utf-8-sig", dtype=str).fillna("")
             if "source_query" in df.columns or "keyword" in df.columns:
                 mask = pd.Series(False, index=df.index)
@@ -4493,7 +3437,7 @@ def migrate_legacy_file_for_section(src, dst, filename, res):
                 df.loc[mask].to_csv(dst, index=False, encoding="utf-8-sig")
             return dst.exists()
 
-        if filename == "seo_top10_progress.json":
+        if filename == "seo_top30_progress.json":
             data = json.loads(src.read_text(encoding="utf-8"))
             if isinstance(data, dict):
                 data["done_keywords"]=[x for x in data.get("done_keywords",[]) if str(x).strip() in current_keywords]
@@ -4501,14 +3445,14 @@ def migrate_legacy_file_for_section(src, dst, filename, res):
                 dst.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
                 return True
 
-        if filename == "seo_top10_url_check_audit.csv":
+        if filename == "seo_url_check_audit.csv":
             df=pd.read_csv(src, sep=";", encoding="utf-8-sig", dtype=str).fillna("")
             if "category_url" in df.columns:
                 df=df[df["category_url"].astype(str).str.strip()==category_url]
             df.to_csv(dst, sep=";", index=False, encoding="utf-8-sig", lineterminator="\n")
             return True
 
-        if filename == "seo_top10_ocfilter_check_audit.json":
+        if filename == "seo_ocfilter_check_audit.json":
             data=json.loads(src.read_text(encoding="utf-8"))
             if isinstance(data,dict):
                 data={k:v for k,v in data.items() if not category_url or str(v.get("category_url","")).strip()==category_url}
@@ -4528,7 +3472,7 @@ def migrate_legacy_file_for_section(src, dst, filename, res):
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("FE-RUS SEO Manager TOP10 v1.28.10")
+        self.title("FE-RUS SEO Manager v1.25.1")
         self.geometry("1280x860")
         self.q = queue.Queue()
         self.res = None
@@ -4593,42 +3537,42 @@ class App(tk.Tk):
             ttk.Label(box,text=n+":").grid(row=r,column=c,padx=8,pady=6,sticky="w")
             e=ttk.Entry(box,show="*" if sec else ""); e.grid(row=r,column=c+1,sticky="ew",padx=8); self.wk[n]=e
         box.columnconfigure(1,weight=1); box.columnconfigure(3,weight=1)
-        # Основное управление сбором TOP-10.
+        # Основное управление сбором TOP-30.
         row=ttk.Frame(f); row.pack(fill="x",padx=10,pady=(6,2))
         ttk.Label(row,text="Регион:").pack(side="left")
         self.region=tk.IntVar(value=int(self.cfg.get("region",213) or 213))
         ttk.Spinbox(row,from_=0,to=9999,textvariable=self.region,width=7).pack(side="left",padx=8)
-        self.wk_start_btn=ttk.Button(row,text="ПОЛУЧИТЬ TOP-10 WORDKEEPER (БЕЗ БРАУЗЕРА)",command=self.start_wordkeeper)
+        self.wk_start_btn=ttk.Button(row,text="ПОЛУЧИТЬ TOP-30 WORDKEEPER",command=self.start_wordkeeper)
         self.wk_start_btn.pack(side="left")
         self.wk_stop_btn=ttk.Button(row,text="ОСТАНОВИТЬ АНАЛИЗ",command=self.stop_wordkeeper,state="disabled")
         self.wk_stop_btn.pack(side="left",padx=8)
         ttk.Button(row,text="ЗАГРУЗИТЬ CSV (ЛОКАЛЬНО)",command=self.load_wk_csv).pack(side="left",padx=8)
-        self.wkstatus=ttk.Label(row,text="TOP-10 ещё не загружен"); self.wkstatus.pack(side="left",padx=8)
+        self.wkstatus=ttk.Label(row,text="TOP-30 ещё не загружен"); self.wkstatus.pack(side="left",padx=8)
 
         # Пересборка вынесена в отдельную строку, чтобы кнопка не исчезала
         # за пределами окна при небольшой ширине интерфейса.
         rebuild_row=ttk.Frame(f); rebuild_row.pack(fill="x",padx=10,pady=(2,6))
         self.wk_rebuild_btn=ttk.Button(
             rebuild_row,
-            text="ПЕРЕСОБРАТЬ TOP-10 ТЕКУЩЕГО РАЗДЕЛА",
+            text="ПЕРЕСОБРАТЬ TOP-30 ТЕКУЩЕГО РАЗДЕЛА",
             command=self.rebuild_wordkeeper_current_section,
         )
         self.wk_rebuild_btn.pack(side="left")
         ttk.Label(
             rebuild_row,
-            text="Удаляет TOP-10 текущего раздела и заново запускает WordKeeper без браузера",
+            text="Удаляет только TOP-30 текущего раздела и запускает его заново",
         ).pack(side="left",padx=10)
 
         migrate_row=ttk.Frame(f); migrate_row.pack(fill="x",padx=10,pady=(0,6))
         self.wk_migrate_btn=ttk.Button(
             migrate_row,
-            text="РАЗЛОЖИТЬ СТАРЫЙ TOP-10 ПО ОБЛАЧНЫМ РАЗДЕЛАМ",
-            command=self.migrate_old_top10_to_cloud,
+            text="РАЗЛОЖИТЬ СТАРЫЙ TOP-30 ПО ОБЛАЧНЫМ РАЗДЕЛАМ",
+            command=self.migrate_old_top30_to_cloud,
         )
         self.wk_migrate_btn.pack(side="left")
         ttk.Label(
             migrate_row,
-            text="Берёт старый seo_top10_result.csv и раскладывает строки по уже созданным папкам разделов Google Drive",
+            text="Берёт старый seo_top30_result.csv и раскладывает строки по уже созданным папкам разделов Google Drive",
         ).pack(side="left",padx=10)
 
         self.wklog=tk.Text(f,font=("Consolas",10)); self.wklog.pack(fill="both",expand=True,padx=10,pady=8)
@@ -4679,7 +3623,6 @@ class App(tk.Tk):
         ttk.Button(f,text="СОХРАНИТЬ CSV ДЛЯ ГЕНЕРАТОРА",command=self.export_generator).pack(anchor="w",padx=10,pady=4)
         ttk.Button(f,text="ЗАПИСАТЬ ДАННЫЕ В ФАЙЛ + ОБЛАКО",command=self.append_ready_links).pack(anchor="w",padx=10,pady=4)
         ttk.Button(f,text="НАСТРОИТЬ ОБЛАКО",command=self.configure_cloud).pack(anchor="w",padx=10,pady=4)
-        ttk.Button(f,text="ОБНОВИТЬ СТАТУС РАЗДЕЛА В GOOGLE SHEETS",command=self.update_section_status_now).pack(anchor="w",padx=10,pady=4)
         ttk.Button(f,text="ОТКРЫТЬ ОБЛАЧНЫЙ ФАЙЛ",command=self.open_cloud_file).pack(anchor="w",padx=10,pady=4)
         ttk.Label(f,text="Кнопка сохраняет накопительный CSV на компьютере и автоматически синхронизирует его с единым CSV в Google Drive.").pack(anchor="w",padx=10,pady=2)
         ttk.Button(f,text="ЭКСПОРТИРОВАТЬ ПОЛНЫЙ XLSX",command=self.export).pack(anchor="w",padx=10,pady=4)
@@ -5016,7 +3959,7 @@ class App(tk.Tk):
                     "value_keyword":v.get("keyword",""),"alias":alias,
                     "filter_result_url":filter_result_url(base_url, o.get("keyword",""), v.get("keyword",""), v.get("name","")),
                     "target_url":expected_url(base_url,alias),"status":"UNVERIFIED",
-                    "reason":"требует TOP-10 + проверки OCFilter",
+                    "reason":"требует TOP-30 + проверки OCFilter",
                     "competitor_1":"","competitor_2":"","competitor_3":"","competitor_4":"","competitor_5":"",
                 })
         self.res["options"]=opts
@@ -5288,12 +4231,12 @@ class App(tk.Tk):
         self.wklog.see("end")
 
     def rebuild_wordkeeper_current_section(self):
-        """Удаляет накопленные TOP-10 только для текущего раздела и запускает его заново."""
+        """Удаляет накопленные TOP-30 только для текущего раздела и запускает его заново."""
         if not self.res or not self.res.get("rows"):
-            messagebox.showwarning("TOP-10", "Сначала получите категорию и фильтры текущего раздела.")
+            messagebox.showwarning("TOP-30", "Сначала получите категорию и фильтры текущего раздела.")
             return
         if self.wk_running:
-            messagebox.showwarning("TOP-10", "Сначала дождитесь завершения или остановите текущий сбор TOP-10.")
+            messagebox.showwarning("TOP-30", "Сначала дождитесь завершения или остановите текущий сбор TOP-30.")
             return
 
         category = str(self.res.get("category") or self.res.get("search_category") or "").strip()
@@ -5314,12 +4257,12 @@ class App(tk.Tk):
             current_variants.update(norm(q) for q in variants if str(q).strip())
 
         if not current_keywords:
-            messagebox.showwarning("TOP-10", "У текущего раздела нет запросов для пересборки.")
+            messagebox.showwarning("TOP-30", "У текущего раздела нет запросов для пересборки.")
             return
 
         ok = messagebox.askyesno(
-            "Пересобрать TOP-10",
-            f"Пересобрать TOP-10 заново только для текущего раздела?\n\n"
+            "Пересобрать TOP-30",
+            f"Пересобрать TOP-30 заново только для текущего раздела?\n\n"
             f"Раздел: {category or 'текущий'}\n"
             f"Значений/запросов: {len(current_keywords)}\n\n"
             "Старые результаты этого раздела будут удалены из накопительного CSV и checkpoint. "
@@ -5329,8 +4272,8 @@ class App(tk.Tk):
             return
 
         folder = Path(self.folder.get() or os.getcwd())
-        out_path = folder / "seo_top10_result.csv"
-        progress_path = folder / "seo_top10_progress.json"
+        out_path = folder / "seo_top30_result.csv"
+        progress_path = folder / "seo_top30_progress.json"
         removed_rows = 0
         removed_queries = 0
 
@@ -5348,10 +4291,10 @@ class App(tk.Tk):
                     old = old.loc[~mask].copy()
                     old.to_csv(out_path, index=False, encoding="utf-8-sig")
             except pd.errors.EmptyDataError:
-                # Пустой CSV считаем отсутствующим накопленным TOP-10.
+                # Пустой CSV считаем отсутствующим накопленным TOP-30.
                 removed_rows = 0
             except Exception as e:
-                messagebox.showerror("TOP-10", f"Не удалось очистить текущий раздел из CSV:\n{e}")
+                messagebox.showerror("TOP-30", f"Не удалось очистить текущий раздел из CSV:\n{e}")
                 return
 
         # Из checkpoint удаляем только текущие canonical keywords и их варианты.
@@ -5368,22 +4311,22 @@ class App(tk.Tk):
                 progress["updated_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
                 progress_path.write_text(json.dumps(progress, ensure_ascii=False, indent=2), encoding="utf-8")
             except Exception as e:
-                messagebox.showerror("TOP-10", f"Не удалось обновить checkpoint:\n{e}")
+                messagebox.showerror("TOP-30", f"Не удалось обновить checkpoint:\n{e}")
                 return
 
         self.topdf = pd.DataFrame()
-        self.wkstatus.config(text="Старый TOP-10 текущего раздела сброшен")
+        self.wkstatus.config(text="Старый TOP-30 текущего раздела сброшен")
         self.wklog.delete("1.0", "end")
         self.wklog.insert("end", f"Пересборка текущего раздела: {category or 'текущий раздел'}\n")
-        self.wklog.insert("end", f"Удалено старых строк TOP-10: {removed_rows}\n")
+        self.wklog.insert("end", f"Удалено старых строк TOP-30: {removed_rows}\n")
         self.wklog.insert("end", f"Сброшено checkpoint-запросов: {removed_queries}\n")
-        self.wklog.insert("end", "Запускаем новый сбор TOP-10...\n")
+        self.wklog.insert("end", "Запускаем новый сбор TOP-30...\n")
         self.wklog.see("end")
         self.save_settings()
         self.start_wordkeeper()
 
-    def migrate_old_top10_to_cloud(self):
-        """Запускает безопасный перенос старого накопительного TOP-10 по уже созданным облачным разделам."""
+    def migrate_old_top30_to_cloud(self):
+        """Запускает безопасный перенос старого накопительного TOP-30 по уже созданным облачным разделам."""
         cfg=load_cfg()
         endpoint=str(cfg.get("cloud_csv_webapp_url","") or "").strip()
         token=str(cfg.get("cloud_csv_token","") or "").strip()
@@ -5392,19 +4335,19 @@ class App(tk.Tk):
                 return
 
         chosen=filedialog.askopenfilename(
-            title="Выберите старый seo_top10_result.csv",
-            filetypes=[("TOP-10 CSV","seo_top10_result.csv"),("CSV","*.csv"),("Все файлы","*.*")]
+            title="Выберите старый seo_top30_result.csv",
+            filetypes=[("TOP-30 CSV","seo_top30_result.csv"),("CSV","*.csv"),("Все файлы","*.*")]
         )
         if not chosen:
             return
 
         self.wk_migrate_btn.config(state="disabled")
         self.wklog.delete("1.0","end")
-        self.wklog.insert("end",f"Миграция старого TOP-10:\n{chosen}\n")
+        self.wklog.insert("end",f"Миграция старого TOP-30:\n{chosen}\n")
         self.wklog.insert("end","Получаю список уже созданных разделов Google Drive...\n")
         self.wklog.see("end")
         threading.Thread(
-            target=self.worker_migrate_old_top10,
+            target=self.worker_migrate_old_top30,
             args=(Path(chosen),),
             daemon=True
         ).start()
@@ -5422,7 +4365,7 @@ class App(tk.Tk):
         return re.sub(r"\s+", " ", s).strip()
 
     def _migration_phrase(self, value):
-        """Нормализует фразу для миграции TOP-10 -> раздел."""
+        """Нормализует фразу для миграции TOP-30 -> раздел."""
         s=str(value or "").replace("\u00a0", " ").lower().replace("ё", "е")
         # Для названий разделов/запросов дефисы, подчёркивания и слэши
         # считаем разделителями слов, а не частью токена.
@@ -5451,7 +4394,7 @@ class App(tk.Tk):
         if q == s:
             return 100000000 + len(s)*100 + len(s.split())
 
-        # Основной сценарий старого TOP-10:
+        # Основной сценарий старого TOP-30:
         # "Лист нержавеющий гладкий AISI 304" ->
         # "Лист нержавеющий гладкий".
         if q.startswith(s + " "):
@@ -5472,7 +4415,7 @@ class App(tk.Tk):
 
         return 0
 
-    def _read_legacy_top10(self, path):
+    def _read_legacy_top30(self, path):
         last=None
         for enc in ("utf-8-sig","utf-8","cp1251"):
             try:
@@ -5484,14 +4427,7 @@ class App(tk.Tk):
                 last=e
         raise RuntimeError(f"Не удалось прочитать CSV: {last}")
 
-    def worker_migrate_old_top10(self, old_path):
-        """Быстрая миграция старого TOP-10 по уже созданным облачным разделам.
-
-        В v1.27 TOP10.1 сопоставление делалось Python-циклом по каждой строке и каждому
-        разделу. Для большого файла (200k+ строк) это могло занимать десятки минут
-        без единого сообщения в UI. Здесь нормализация и основные проверки делаются
-        векторно через pandas, а в лог выводится прогресс.
-        """
+    def worker_migrate_old_top30(self, old_path):
         try:
             cfg=load_cfg()
             endpoint=str(cfg.get("cloud_csv_webapp_url","") or "").strip()
@@ -5500,6 +4436,10 @@ class App(tk.Tk):
                 raise RuntimeError("Не настроен Google Drive Web App.")
 
             raw_sections=cloud_list_sections(endpoint,token,timeout=180)
+
+            # Web App обычно возвращает объекты {id,name,url}, но старые
+            # развертывания могли вернуть просто список имён. Поддерживаем оба
+            # формата, чтобы миграция не зависела от версии Apps Script.
             sections=[]
             for item in (raw_sections or []):
                 if isinstance(item,dict):
@@ -5511,10 +4451,14 @@ class App(tk.Tk):
                     name=str(item or "").strip()
                     url=""
                 clean=self._migration_section_clean_name(name)
+                # 00_ОБЩИЕ / ОБЩИЕ не участвует в миграции TOP-30.
                 if not clean or norm(clean)==norm("ОБЩИЕ"):
                     continue
                 sections.append({"id":sid,"name":name,"url":url})
 
+            # Диагностика: если список пуст, сразу показываем, что именно
+            # вернул Web App. Это намного полезнее, чем молча считать, что
+            # папок нет.
             self.q.put(("wkmigratelog",f"Ответ Web App: list_sections={len(raw_sections or [])}"))
             if raw_sections:
                 sample=[]
@@ -5532,6 +4476,10 @@ class App(tk.Tk):
                     "action=list_sections должен возвращать дочерние папки корня."
                 )
 
+            # Если старый Web App вернул только имена без ID, безопасно
+            # резолвим ID через ensure_structure. Для текущего Apps Script
+            # этот блок обычно не выполняется, но позволяет работать со
+            # старыми форматами ответа.
             resolved_sections=[]
             for item in sections:
                 sid=str(item.get("id") or "").strip()
@@ -5550,115 +4498,105 @@ class App(tk.Tk):
             if not sections:
                 raise RuntimeError("Не удалось получить ID облачных разделов из Google Web App.")
 
-            df=self._read_legacy_top10(old_path)
+            df=self._read_legacy_top30(old_path)
             total=len(df)
             if total==0:
-                raise RuntimeError("Старый seo_top10_result.csv пуст.")
-            self.q.put(("wkmigratelog",f"Строк в старом TOP-10: {total}"))
+                raise RuntimeError("Старый seo_top30_result.csv пуст.")
+
+            self.q.put(("wkmigratelog",f"Строк в старом TOP-30: {total}"))
             self.q.put(("wkmigratelog",f"Облачных разделов найдено: {len(sections)}"))
-            self.q.put(("wkmigratelog","Оптимизированное сопоставление 200k+ строк..."))
-
-            # Нормализуем source_query один раз. Если он пустой — используем keyword.
-            raw_q=df.get("source_query",pd.Series("",index=df.index)).fillna("").astype(str).str.strip()
-            raw_kw=df.get("keyword",pd.Series("",index=df.index)).fillna("").astype(str).str.strip()
-            raw_q=raw_q.where(raw_q.ne(""),raw_kw)
-            qnorm=raw_q.map(self._migration_phrase)
-
-            # Для каждого раздела строим только векторные маски. Это на порядки
-            # быстрее старого двойного Python-цикла.
-            best_score=pd.Series(0,index=df.index,dtype="int64")
-            best_sid=pd.Series("",index=df.index,dtype="object")
-            best_name=pd.Series("",index=df.index,dtype="object")
-            tie=pd.Series(False,index=df.index,dtype="bool")
-
-            prepared=[]
-            for item in sections:
-                sid=str(item.get("id") or "")
-                name=str(item.get("name") or "")
-                clean=self._migration_phrase(self._migration_section_clean_name(name))
-                if not clean:
-                    continue
-                tokens=[x for x in clean.split() if len(x)>=3]
-                prepared.append((sid,name,clean,tokens))
-
-            for si,(sid,name,s,tokens) in enumerate(prepared,1):
-                score=pd.Series(0,index=df.index,dtype="int64")
-                exact=qnorm.eq(s)
-                prefix=qnorm.str.startswith(s+" ")
-                # Фраза внутри запроса. qnorm уже нормализован, поэтому regex безопасен.
-                phrase=qnorm.str.contains(r"(?:^|\s)"+re.escape(s)+r"(?:$|\s)",regex=True,na=False)
-                score=score.mask(exact,100000000+len(s)*100+len(tokens))
-                score=score.mask(~exact & prefix,90000000+len(s)*100+len(tokens))
-                score=score.mask(~exact & ~prefix & phrase,80000000+len(s)*100+len(tokens))
-
-                # Fallback: все содержательные слова раздела присутствуют в запросе.
-                # Используем один regex с lookahead вместо Python-цикла по строкам.
-                if len(tokens)>=2:
-                    look="".join(r"(?=.*(?:^|\s)"+re.escape(t)+r"(?:$|\s))" for t in tokens)
-                    all_tokens=qnorm.str.contains("^"+look+".*$",regex=True,na=False)
-                    score=score.mask((score.eq(0)) & all_tokens,70000000+len(tokens)*100+len(s))
-
-                better=score.gt(best_score)
-                equal=score.gt(0) & score.eq(best_score)
-                tie=tie.mask(better,False)
-                tie=tie | equal
-                best_score=best_score.mask(better,score)
-                best_sid=best_sid.mask(better,sid)
-                best_name=best_name.mask(better,name)
-
-                if si==len(prepared) or si%5==0:
-                    self.q.put(("wkmigratelog",f"Сопоставление разделов: {si}/{len(prepared)}"))
-
-            # Собираем группы индексов и отчёт. В tie входят и строки, где два
-            # раздела имеют одинаковый максимальный score; такие строки не угадываем.
-            matched_mask=best_score.gt(0) & ~tie
-            ambiguous_mask=best_score.gt(0) & tie
-            no_match_mask=best_score.eq(0)
 
             groups={str(x.get("id")): [] for x in sections}
             section_meta={str(x.get("id")): x for x in sections}
-            for sid in groups:
-                idxs=df.index[matched_mask & best_sid.eq(sid)].tolist()
-                groups[sid]=idxs
+            unmatched=[]
+            ambiguous=[]
+
+            # Индекс названий разделов.
+            prepared=[]
+            for s in sections:
+                sid=str(s.get("id") or "")
+                name=str(s.get("name") or "")
+                prepared.append((sid,name))
+
+            for idx,row in df.iterrows():
+                query=str(row.get("source_query","") or "").strip()
+                # В старом CSV встречаются технические пустые строки в начале.
+                # Если source_query пустой, пробуем keyword как резервный источник.
+                if not query:
+                    query=str(row.get("keyword","") or "").strip()
+                if not query:
+                    unmatched.append(idx)
+                    continue
+                scores=[]
+                for sid,name in prepared:
+                    score=self._migration_score(name,query)
+                    if score>0:
+                        scores.append((score,sid,name))
+
+                if not scores:
+                    unmatched.append(idx)
+                    continue
+
+                scores.sort(reverse=True,key=lambda x:(x[0],len(self._migration_section_clean_name(x[2]))))
+                best=scores[0]
+
+                # Если два разных раздела получили одинаково сильное совпадение,
+                # не угадываем — отправляем строку в отчёт.
+                if len(scores)>1 and scores[1][0]==best[0]:
+                    ambiguous.append((idx,query,best[2],scores[1][2]))
+                    unmatched.append(idx)
+                    continue
+
+                groups[best[1]].append(idx)
 
             report_rows=[]
-            for idx in df.index[ambiguous_mask]:
-                q=str(raw_q.loc[idx] or "")
+            for idx,query,best,second in ambiguous:
                 report_rows.append({
-                    "row":int(df.index.get_loc(idx))+2,
-                    "source_query":q,
+                    "row":int(idx)+2,
+                    "source_query":query,
                     "reason":"AMBIGUOUS",
-                    "candidate_1":str(best_name.loc[idx] or ""),
-                    "candidate_2":"одинаковый максимальный score",
+                    "candidate_1":best,
+                    "candidate_2":second,
                 })
-            for idx in df.index[no_match_mask]:
-                report_rows.append({
-                    "row":int(df.index.get_loc(idx))+2,
-                    "source_query":str(raw_q.loc[idx] or ""),
-                    "reason":"NO_MATCH",
-                    "candidate_1":"",
-                    "candidate_2":"",
-                })
+            for idx in unmatched:
+                if not any(int(x["row"])-2==int(idx) for x in report_rows):
+                    report_rows.append({
+                        "row":int(idx)+2,
+                        "source_query":str(df.iloc[idx].get("source_query","") or ""),
+                        "reason":"NO_MATCH",
+                        "candidate_1":"",
+                        "candidate_2":"",
+                    })
 
             uploaded=0
             uploaded_rows=0
-            nonempty=[(sid,meta,groups.get(sid,[])) for sid,meta in section_meta.items() if groups.get(sid)]
-            for n,(sid,meta,idxs) in enumerate(nonempty,start=1):
+
+            for n,(sid,meta) in enumerate(section_meta.items(),start=1):
+                idxs=groups.get(sid,[])
+                if not idxs:
+                    continue
+
                 section_name=str(meta.get("name") or "").strip()
-                self.q.put(("wkmigratelog",f"[{n}/{len(nonempty)}] {section_name}: найдено строк {len(idxs)}"))
+                self.q.put(("wkmigratelog",f"[{n}/{len(section_meta)}] {section_name}: найдено строк {len(idxs)}"))
+
+                # Для миграции старый master-CSV является источником истины.
+                # Не скачиваем существующий облачный TOP-30: большой файл может давать
+                # 404/таймаут на стороне Web App. Перед заменой Web App делает резервную копию.
                 local_dir=cloud_cache_dir(sid)
                 local_dir.mkdir(parents=True,exist_ok=True)
-                local_path=local_dir/"seo_top10_result.csv"
+                local_path=local_dir/"seo_top30_result.csv"
+
                 new_df=df.loc[idxs].copy()
                 new_df.to_csv(local_path,index=False,encoding="utf-8-sig")
                 cloud_upload_section_file(
-                    endpoint,token,section_name,"seo_top10_result.csv",
+                    endpoint,token,section_name,"seo_top30_result.csv",
                     local_path,timeout=600,backup=True
                 )
+
                 uploaded+=1
                 uploaded_rows+=len(idxs)
 
-            report_path=old_path.parent/"seo_top10_migration_report.csv"
+            report_path=old_path.parent/"seo_top30_migration_report.csv"
             if report_rows:
                 pd.DataFrame(report_rows).to_csv(report_path,index=False,encoding="utf-8-sig")
                 self.q.put(("wkmigratelog",f"Строк без однозначного раздела: {len(report_rows)}"))
@@ -5668,11 +4606,11 @@ class App(tk.Tk):
                     try: report_path.unlink()
                     except Exception: pass
 
-            matched=int(matched_mask.sum())
+            matched=total-len(unmatched)
             self.q.put(("wkmigratedone",{
                 "total":total,
                 "matched":matched,
-                "unmatched":int(no_match_mask.sum()+ambiguous_mask.sum()),
+                "unmatched":len(unmatched),
                 "sections":uploaded,
                 "uploaded_rows":uploaded_rows,
                 "report":str(report_path) if report_rows else "",
@@ -5686,111 +4624,264 @@ class App(tk.Tk):
         try:
             self.cloud_pull_current_section(update_ui=False)
             work_dir=cloud_cache_dir(self.cloud_section_id) if self.cloud_section_id else Path(self.folder.get() or os.getcwd())
-            out_path=work_dir/'seo_top10_result.csv'
-            progress_path=work_dir/'seo_top10_progress.json'
-            login=self.wk['Логин / email'].get().strip()
-            password=self.wk['Пароль'].get()
+            out_path=work_dir/"seo_top30_result.csv"
+            progress_path=work_dir/"seo_top30_progress.json"
+            login=self.wk["Логин / email"].get().strip()
+            password=self.wk["Пароль"].get()
             region=int(self.region.get())
             if not login or not password:
-                raise RuntimeError('Заполните логин и пароль WordKeeper.')
+                raise RuntimeError("Заполните логин и пароль WordKeeper.")
+            s=http_session()
+            self.q.put(("wklog","WordKeeper: открываем авторизацию..."))
+            r=s.get(LOGIN_WK,timeout=60); r.raise_for_status(); csrf=get_csrf(r.text)
+            if not csrf:
+                raise RuntimeError("CSRF-токен WordKeeper не найден.")
+            r=s.post(LOGIN_WK,data={"login":login,"password":password,"auth":"Войти","csrf_token":csrf},timeout=60,allow_redirects=True)
+            if "/dashboard" not in r.url:
+                raise RuntimeError("Авторизация WordKeeper не удалась.")
 
-            # Реальный инструмент WordKeeper «Выдача ТОП 10».
-            # Никакого /core/ajax_top30 и никакого искусственного обрезания TOP-30.
-            keywords=list(dict.fromkeys(
-                str(x.get('keyword','')).strip()
-                for x in self.res['rows']
-                if x.get('keyword') and str(x.get('keyword','')).strip()
-            ))
-            if not keywords:
-                raise RuntimeError('В текущей категории нет запросов для TOP-10.')
-
-            # В отличие от старого direct-AJAX режима здесь checkpoint хранит только
-            # факт полного браузерного задания. Если есть готовый CSV текущего раздела,
-            # его можно загрузить кнопкой CSV и не запускать повторно.
-            # Возобновление: уже имеющиеся строки текущего раздела не запрашиваем повторно.
-            # Старые browser-checkpoint намеренно не считаем надёжными.
-            completed = set()
-            try:
-                if out_path.exists() and out_path.stat().st_size:
-                    old_df = pd.read_csv(out_path, encoding='utf-8-sig', dtype=str).fillna('')
-                    if 'keyword' in old_df.columns:
-                        completed.update(norm(x) for x in old_df['keyword'].tolist() if str(x).strip())
-            except Exception as e:
-                self.q.put(('wklog', f'TOP-10 HTTP: не удалось прочитать старый CSV для resume: {e}'))
-            try:
-                if progress_path.exists() and progress_path.stat().st_size:
-                    old_progress = json.loads(progress_path.read_text(encoding='utf-8'))
-                    if str(old_progress.get('mode','')) == 'REAL_WORDKEEPER_TOP10_HTTP' and str(old_progress.get('version','')) >= '1.29.0':
-                        completed.update(norm(x) for x in (old_progress.get('done_keywords') or []) if str(x).strip())
-            except Exception:
-                pass
-
-            pending_keywords = [q for q in keywords if norm(q) not in completed]
-            self.q.put(('wklog', f'WordKeeper TOP-10: прямой HTTP-сбор без браузера. Всего запросов: {len(keywords)}'))
-            self.q.put(('wklog', f'TOP-10 HTTP: уже обработано: {len(keywords)-len(pending_keywords)} | осталось: {len(pending_keywords)}'))
-            self.q.put(('wklog', 'TOP-10 — отдельный инструмент WordKeeper «Выдача ТОП 10», не обрезка TOP-30.'))
-            self.q.put(('wklog', 'Chrome/Playwright не запускается. Авторизация и запросы идут через requests.Session.'))
-
-            if not pending_keywords:
-                self.q.put(('wklog', 'TOP-10 HTTP: текущий раздел уже полностью есть в накопительном CSV — повторно не запрашиваем.'))
-                self.q.put(('wkdone', out_path))
-                return
-
-            def prog(msg): self.q.put(('wklog', msg))
-            rows, status=collect_wordkeeper_top10_http(
-                login, password, region, pending_keywords, self.wk_stop_event, prog
+            # Отдельная постоянная сессия для AJAX: не трогаем cookie-jar
+            # авторизационной сессии, но переиспользуем HTTP-соединение между
+            # десятками/сотнями TOP-30 запросов.
+            ajax_session = requests.Session()
+            ajax_session.headers.update({"User-Agent": UA, "Accept-Language": "ru-RU,ru;q=0.9"})
+            cookie_header = "; ".join(
+                f"{str(c.name)}={str(c.value)}"
+                for c in s.cookies
+                if getattr(c, "name", None) is not None
             )
-            # Объединяем новый пакет с уже накопленным CSV текущего раздела.
-            def merge_rows_into_csv(new_rows):
-                existing = []
+
+            # Запросы именно ТЕКУЩЕЙ категории.
+            # CSV/checkpoint являются накопительным кэшем, но для текущей категории
+            # считаем только её канонические keywords. Один keyword может иметь
+            # несколько вариантов запроса WordKeeper.
+            keywords=list(dict.fromkeys(
+                str(x.get("keyword", "")).strip()
+                for x in self.res["rows"]
+                if x.get("keyword") and str(x.get("keyword", "")).strip()
+            ))
+            # Формируем карту АКТУАЛЬНЫХ запросов текущей категории до загрузки кэша.
+            # Старые seo_top30_result.csv / progress.json могут содержать результаты
+            # других категорий. Их нельзя считать выполненными только по факту наличия
+            # source_query: учитываем только запросы, которые реально относятся к
+            # текущей категории.
+            current_variants_by_keyword = {}
+            variant_to_canonical = {}
+            for row in self.res["rows"]:
+                canonical = str(row.get("keyword", "")).strip()
+                if not canonical:
+                    continue
+                variants = wordkeeper_query_variants(
+                    self.res.get("search_category") or self.res.get("category") or "",
+                    row.get("value", ""),
+                ) or [canonical]
+                current_variants_by_keyword[canonical] = variants
+                for q in variants:
+                    variant_to_canonical[norm(q)] = canonical
+
+            keywords = list(current_variants_by_keyword.keys())
+            current_keyword_set = set(keywords)
+            results=[]
+            done=set()
+            done_queries=set()
+            cached_result_query_keys=set()
+
+            if out_path.exists():
                 try:
-                    if out_path.exists() and out_path.stat().st_size:
-                        existing = pd.read_csv(out_path, encoding='utf-8-sig', dtype=str).fillna('').to_dict('records')
+                    old=pd.read_csv(out_path,encoding="utf-8-sig")
+                except pd.errors.EmptyDataError:
+                    old=pd.DataFrame()
+                if not old.empty:
+                    results=old.to_dict("records")
+                    # ВАЖНО: если старый CSV был создан предыдущей версией, его
+                    # canonical keyword мог быть транслитерированным. Перепривязываем
+                    # строки по source_query к текущему русскому canonical keyword.
+                    if "source_query" in old.columns:
+                        for rr in results:
+                            sq = str(rr.get("source_query", "")).strip()
+                            canonical = variant_to_canonical.get(norm(sq))
+                            if canonical:
+                                rr["keyword"] = canonical
+                                done_queries.add(sq)
+                                cached_result_query_keys.add(norm(sq))
+                    # Старые canonical keywords учитываем только если они относятся
+                    # к текущей категории.
+                    for rr in results:
+                        k = str(rr.get("keyword", "")).strip()
+                        if k in current_keyword_set:
+                            done.add(k)
+
+            if progress_path.exists():
+                try:
+                    progress=json.loads(progress_path.read_text(encoding="utf-8"))
+                    # done_keywords из старого checkpoint не переносим целиком:
+                    # оставляем только keywords текущей категории.
+                    done.update(
+                        str(x).strip() for x in progress.get("done_keywords",[])
+                        if str(x).strip() in current_keyword_set
+                    )
+                    # Аналогично done_queries: только актуальные варианты текущей
+                    # категории могут блокировать новый запрос.
+                    for x in progress.get("done_queries", []):
+                        q = str(x).strip()
+                        if q and norm(q) in variant_to_canonical:
+                            done_queries.add(q)
                 except Exception:
-                    existing = []
-                merged = existing + list(new_rows or [])
-                uniq = {}
-                for r in merged:
-                    k = (str(r.get('keyword','')).strip(), str(r.get('url','')).strip().rstrip('/'))
-                    if k[0] and k[1]:
-                        uniq[k] = r
-                if uniq:
-                    pd.DataFrame(list(uniq.values())).to_csv(out_path,index=False,encoding='utf-8-sig')
-                return list(uniq.values())
+                    pass
 
-            all_rows = merge_rows_into_csv(rows)
-            successful_keywords = {str(r.get('keyword','')).strip() for r in all_rows if str(r.get('keyword','')).strip()}
-            if self.wk_stop_event.is_set():
-                # В checkpoint отмечаем только реально имеющиеся результаты.
-                progress_data={
-                    'done_keywords': sorted(successful_keywords, key=str.casefold),
-                    'done_queries': sorted(successful_keywords, key=str.casefold),
-                    'stopped': True,
-                    'updated_at': time.strftime('%Y-%m-%d %H:%M:%S'),
-                    'mode': 'REAL_WORDKEEPER_TOP10_HTTP',
-                    'version': '1.29.0',
-                }
-                progress_path.write_text(json.dumps(progress_data,ensure_ascii=False,indent=2),encoding='utf-8')
-                self.q.put(('wkdone',out_path))
-                return
+            # Нормализованный набор уже выполненных запросов. Это устраняет ложные
+            # повторы из-за регистра/лишних пробелов.
+            done_query_keys = {norm(q) for q in done_queries if str(q).strip()}
 
-            if not rows:
-                raise RuntimeError('WordKeeper TOP-10 не вернул строк.')
-
-            progress_data={
-                'done_keywords': sorted(successful_keywords, key=str.casefold),
-                'done_queries': sorted(successful_keywords, key=str.casefold),
-                'stopped': False,
-                'updated_at': time.strftime('%Y-%m-%d %H:%M:%S'),
-                'mode': 'REAL_WORDKEEPER_TOP10_HTTP',
-                'version': '1.29.0',
-                'rows': len(all_rows),
+            # Если checkpoint говорит «запрос выполнен», но в накопительном CSV
+            # вообще нет ни одной строки с этим source_query, не доверяем старому
+            # checkpoint: такой запрос повторяем, иначе 0-результат/старый checkpoint
+            # может навсегда скрыть реальные TOP-30.
+            done_query_keys = {
+                qk for qk in done_query_keys
+                if qk in cached_result_query_keys
+            } | {
+                qk for qk in done_query_keys
+                if qk in cached_result_query_keys
             }
-            progress_path.write_text(json.dumps(progress_data,ensure_ascii=False,indent=2),encoding='utf-8')
-            self.q.put(('wklog', f'Реальный TOP-10 получен/обновлён: {len(all_rows)} строк в CSV текущего раздела.'))
-            self.q.put(('wkdone',out_path))
+
+            query_plan=[]
+            for canonical, variants in current_variants_by_keyword.items():
+                pending=[q for q in variants if norm(q) not in done_query_keys]
+                if pending:
+                    query_plan.append((canonical, pending))
+
+            current_done={
+                canonical for canonical, variants in current_variants_by_keyword.items()
+                if not any(norm(q) not in done_query_keys for q in variants)
+            }
+            pending_queries=sum(len(v) for _,v in query_plan)
+            self.q.put(("wklog",f"TOP-30 CSV: {out_path}"))
+            self.q.put(("wklog",f"Checkpoint: {progress_path}"))
+            self.q.put(("wklog",f"Всего значений текущей категории: {len(keywords)} | уже полностью обработано: {len(current_done)} | осталось значений: {len(keywords)-len(current_done)}"))
+            self.q.put(("wklog",f"Запросов WordKeeper к выполнению: {pending_queries} | кэшем подтверждено запросов текущей категории: {len(done_query_keys)}"))
+            self.q.put(("wklog",f"Строк TOP-30 в накопительном CSV: {len(results)} | source_query с результатами текущей категории: {len(cached_result_query_keys)}"))
+
+            # Один раз строим индекс уже сохранённых пар (source_query, URL).
+            # Раньше этот set пересобирался из всего CSV на каждом запросе,
+            # что давало лишнюю O(N^2) работу на больших накопительных файлах.
+            existing_keys = {
+                (str(rr.get("source_query", "")).strip(), str(rr.get("url", "")).strip())
+                for rr in results
+                if str(rr.get("source_query", "")).strip() and str(rr.get("url", "")).strip()
+            }
+
+            query_index=0
+            total_pending=pending_queries
+            for canonical, variants in query_plan:
+                if self.wk_stop_event.is_set():
+                    break
+                all_variants_done=True
+                for actual_query in variants:
+                    if self.wk_stop_event.is_set():
+                        all_variants_done=False
+                        break
+                    query_index += 1
+                    try:
+                        rr=wordkeeper_ajax_post(ajax_session, actual_query, region, cookie_header)
+                        rr_status=http_status_code(rr)
+                        rr_text=http_response_text(rr)
+                        if rr_status in (301,302,303,307,308):
+                            location = ""
+                            try:
+                                location = str(rr.headers.get("Location") or "")
+                            except Exception:
+                                pass
+                            if location and "/login" in location:
+                                raise RuntimeError("WordKeeper вернул редирект на /login: сессия авторизации потеряна")
+                        if not rr_text:
+                            raise RuntimeError(
+                                f"WordKeeper вернул пустой ответ (HTTP={rr_status}, тип={type(rr).__name__})"
+                            )
+                        rows=parse_top30(rr_text,canonical)
+                        for rrow in rows:
+                            rrow["source_query"]=actual_query
+                        done_queries.add(actual_query)
+                        done_query_keys.add(norm(actual_query))
+                        # Не дублируем одинаковый URL одного и того же source_query.
+                        for rr in rows:
+                            key = (str(rr.get("source_query", "")).strip(), str(rr.get("url", "")).strip())
+                            if key not in existing_keys:
+                                results.append(rr)
+                                existing_keys.add(key)
+                        # Не переписываем весь накопительный CSV после каждого
+                        # запроса. Сохраняем каждые WK_SAVE_EVERY запросов, а также
+                        # немедленно при остановке/последнем запросе.
+                        force_save = (
+                            query_index % WK_SAVE_EVERY == 0
+                            or self.wk_stop_event.is_set()
+                            or query_index == total_pending
+                        )
+                        if force_save:
+                            pd.DataFrame(results).to_csv(out_path,index=False,encoding="utf-8-sig")
+                            progress_path.write_text(json.dumps({
+                                "done_keywords":safe_sorted_strings(done),
+                                "done_queries":safe_sorted_strings(done_queries),
+                                "updated_at":time.strftime("%Y-%m-%d %H:%M:%S")
+                            },ensure_ascii=False,indent=2),encoding="utf-8")
+                            save_note = " | СОХРАНЕНО"
+                        else:
+                            save_note = ""
+                        self.q.put(("wklog",f"[{query_index}/{total_pending}] {canonical} | запрос: {actual_query} | HTTP {rr_status} | результатов: {len(rows)}{save_note}"))
+                        if self.wk_stop_event.is_set():
+                            all_variants_done=False
+                            break
+                        time.sleep(WK_DELAY)
+                    except Exception as e:
+                        all_variants_done=False
+                        pd.DataFrame(results).to_csv(out_path,index=False,encoding="utf-8-sig")
+                        progress_path.write_text(json.dumps({
+                            "done_keywords":safe_sorted_strings(done),
+                            "done_queries":safe_sorted_strings(done_queries),
+                            "updated_at":time.strftime("%Y-%m-%d %H:%M:%S")
+                        },ensure_ascii=False,indent=2),encoding="utf-8")
+                        error_log = work_dir / "wordkeeper_error.log"
+                        try:
+                            error_log.write_text(
+                                traceback.format_exc(),
+                                encoding="utf-8"
+                            )
+                        except Exception:
+                            pass
+                        self.q.put(("wklog",f"ОШИБКА {actual_query}: {e} | текущая категория: обработано {len(set(keywords) & done)} из {len(keywords)} | traceback: {error_log}"))
+                        break
+
+                if all_variants_done:
+                    done.add(canonical)
+                    # CSV/checkpoint сохраняются пакетно выше. Здесь только фиксируем
+                    # завершение canonical keyword в памяти, чтобы не переписывать
+                    # весь файл после каждого значения. Финальное сохранение выполняется
+                    # после цикла, а при ошибке/остановке — принудительно.
+                    self.q.put(("wklog",f"ЗАВЕРШЕНО ЗНАЧЕНИЕ: {canonical} | вариантов запроса: {len(variants)}"))
+
+            pd.DataFrame(results).to_csv(out_path,index=False,encoding="utf-8-sig")
+            progress_path.write_text(json.dumps({
+                "done_keywords":safe_sorted_strings(done),
+                "done_queries":safe_sorted_strings(done_queries),
+                "updated_at":time.strftime("%Y-%m-%d %H:%M:%S")
+            },ensure_ascii=False,indent=2),encoding="utf-8")
+            try:
+                self.cloud_push_current_files(["seo_top30_result.csv","seo_top30_progress.json","wordkeeper_error.log"])
+                cloud_sync_error = ""
+            except Exception as e:
+                cloud_sync_error = str(e)
+
+            if self.wk_stop_event.is_set():
+                payload={"path":out_path,"progress":progress_path,"done":len(set(keywords) & done),"total":len(keywords)}
+                if cloud_sync_error:
+                    payload["cloud_sync_error"]=cloud_sync_error
+                self.q.put(("wkstop",payload))
+            elif cloud_sync_error:
+                self.q.put(("wkdoneclouderror",{"path":out_path,"error":cloud_sync_error}))
+            else:
+                self.q.put(("wkdone",out_path))
         except Exception as e:
-            self.q.put(('wkerr',str(e)))
+            self.q.put(("wkerr",str(e)))
         finally:
             self.wk_running=False
 
@@ -5808,14 +4899,14 @@ class App(tk.Tk):
         except Exception:
             return
         if self.topdf is None or self.topdf.empty:
-            messagebox.showwarning("WordKeeper", "Сначала загрузите или получите TOP-10 WordKeeper.")
+            messagebox.showwarning("WordKeeper", "Сначала загрузите или получите TOP-30 WordKeeper.")
             return
         self.analysis_stop_event.clear()
         self.analysis_running=True
         self.compare_btn.config(state="disabled")
         self.analysis_stop_btn.config(state="normal")
         self.stats.delete("1.0","end")
-        self.stats.insert("end", "Запуск анализа TOP-10...\n\n")
+        self.stats.insert("end", "Запуск анализа TOP-30...\n\n")
         threading.Thread(target=self.worker_compare,daemon=True).start()
 
     def stop_analysis(self):
@@ -5828,7 +4919,7 @@ class App(tk.Tk):
         try:
             self.cloud_pull_current_section(update_ui=False)
             folder=cloud_cache_dir(self.cloud_section_id) if self.cloud_section_id else Path(os.getcwd())
-            cache_path=folder / "seo_top10_serp_page_classification.csv"
+            cache_path=folder / "seo_serp_page_classification.csv"
             res=Pipeline().merge_analysis(
                 self.res,
                 self.topdf,
@@ -5836,7 +4927,7 @@ class App(tk.Tk):
                 stop_event=self.analysis_stop_event,
                 cache_path=cache_path,
             )
-            self.cloud_push_current_files(["seo_top10_serp_page_classification.csv"])
+            self.cloud_push_current_files(["seo_serp_page_classification.csv"])
             self.q.put(("analysisdone", {"res":res, "cache":str(cache_path), "stopped":self.analysis_stop_event.is_set()}))
         except Exception as e:
             self.q.put(("analysiserr",str(e)))
@@ -5850,14 +4941,13 @@ class App(tk.Tk):
         p=Counter(x.get("promotion_type") for x in self.res["rows"])
         self.stats.delete("1.0","end")
         self.stats.insert("end",f"Категория: {self.res['category']}\nCategory ID: {self.res['category_id']}\nВариантов: {len(self.res['rows'])}\n\n")
-        self.stats.insert("end", "АНАЛИЗ: используются только позиции 1-10 каждого запроса WordKeeper. Конкуренты считаются по независимым доменам; решение CREATE/SKIP принимается только по этим TOP-10 данным.\n\n")
         self.stats.insert("end", "ТИП ПРОДВИЖЕНИЯ:\n")
         for k in ("SEO-СТРАНИЦА","ТОВАР","СМЕШАННЫЙ","ИНФОРМАЦИОННАЯ","НЕДОСТАТОЧНО ДАННЫХ"):
             self.stats.insert("end",f"{k}: {p[k]}\n")
         self.stats.insert("end", "\nСТАТУС SEO-СТРАНИЦ:\n")
         for k in ("CREATE","SKIP","EXISTS"):
             self.stats.insert("end",f"{k}: {c[k]}\n")
-        self.stats.insert("end", "\nCREATE = SEO-отбор v1.27 TOP10: минимум 3 независимых filter-конкурента (4 для числовых характеристик; 2 для характеристик до 5 значений) внутри TOP-10 + SEO Score. Порог Score=5. Дубли URL и слабые кандидаты идут в SKIP.\n")
+        self.stats.insert("end", "\nCREATE = SEO-отбор v1.25: минимум 5 независимых filter-конкурентов (7 для числовых характеристик; 3 для характеристик до 5 значений) + SEO Score. Дубли URL и слабые кандидаты идут в SKIP.\n")
         self.stats.insert("end", "ТОВАР = запрос преимущественно ведет на карточки товаров; отдельную SEO-посадочную не создаем.\n\n")
         self.stats.insert("end", "СПИСОК:\n")
         for x in self.res["rows"]:
@@ -5882,7 +4972,7 @@ class App(tk.Tk):
                 self.stats.insert("end",f"{x['keyword']} | {x['filter']} | {x['value']} | SCORE={x.get('seo_selection_score','')} | ТИП={x.get('promotion_type','')} | STATUS={x.get('status','')} | PRODUCT={x.get('product_domains_count',0)} | SEO={x.get('seo_domains_count',0)} | {x.get('reason','')}\n")
 
     def url_audit_path(self):
-        return (cloud_cache_dir(self.cloud_section_id) if self.cloud_section_id else Path(self.folder.get() or os.getcwd())) / "seo_top10_url_check_audit.csv"
+        return (cloud_cache_dir(self.cloud_section_id) if self.cloud_section_id else Path(self.folder.get() or os.getcwd())) / "seo_url_check_audit.csv"
 
     def _load_url_audit(self):
         path = self.url_audit_path()
@@ -6119,7 +5209,7 @@ class App(tk.Tk):
                 self.q.put(("urlstatus", f"Проверено: {min(reused+checked_new,total)} из {total}"))
 
             self._save_url_audit(audit)
-            self.cloud_push_current_files(["seo_top10_url_check_audit.csv"])
+            self.cloud_push_current_files(["seo_url_check_audit.csv"])
             stopped=self.url_check_stop_event.is_set()
             self.q.put(("urldone", {"checked": min(reused+checked_new,total), "total": total, "stopped": stopped, "reused": reused, "path": str(path)}))
         except Exception as e:
@@ -6129,7 +5219,7 @@ class App(tk.Tk):
 
 
     def ocfilter_audit_path(self):
-        return (cloud_cache_dir(self.cloud_section_id) if self.cloud_section_id else Path(self.folder.get() or os.getcwd())) / "seo_top10_ocfilter_check_audit.json"
+        return (cloud_cache_dir(self.cloud_section_id) if self.cloud_section_id else Path(self.folder.get() or os.getcwd())) / "seo_ocfilter_check_audit.json"
 
     def _save_ocfilter_audit(self, results):
         """Сохраняет результат DRY-RUN OCFilter, чтобы он не терялся между запусками."""
@@ -6444,7 +5534,7 @@ class App(tk.Tk):
                 self.q.put(("urlstatus", f"Проверено: {min(reused+checked_new,total)} из {total}"))
 
             self._save_url_audit(audit)
-            self.cloud_push_current_files(["seo_top10_url_check_audit.csv"])
+            self.cloud_push_current_files(["seo_url_check_audit.csv"])
             stopped=self.url_check_stop_event.is_set()
             self.q.put(("urldone", {"checked": min(reused+checked_new,total), "total": total, "stopped": stopped, "reused": reused, "path": str(path)}))
         except Exception as e:
@@ -6661,7 +5751,6 @@ class App(tk.Tk):
                 f"Облачный файл: {CLOUD_READY_FILE_URL}\n"
             )
             self.export_log.see("end")
-            self._update_section_status_async()
             messagebox.showinfo(
                 "Готово",
                 f"Локально добавлено: {added}\n"
@@ -6729,208 +5818,6 @@ class App(tk.Tk):
         except Exception as e:
             messagebox.showerror("Google Sheets", str(e))
 
-    def _build_section_status_row(
-        self,
-        stage="",
-        top10_values_done=None,
-        top10_values_total=None,
-        top10_queries_done=None,
-        top10_queries_total=None,
-        top10_rows=None,
-    ):
-        """Формирует одну строку для общего реестра РАЗДЕЛЫ."""
-        res = dict(self.res or {})
-        rows = list(res.get("rows") or [])
-        category_url = str(res.get("url", "") or "").strip()
-        category_name = str(
-            res.get("search_category")
-            or res.get("category")
-            or self.cloud_section_name
-            or ""
-        ).strip()
-        category_id = str(res.get("category_id", "") or "").strip()
-
-        # TOP-10.
-        if top10_rows is None:
-            try:
-                top10_rows = int(len(self.topdf)) if self.topdf is not None and not self.topdf.empty else 0
-            except Exception:
-                top10_rows = 0
-
-        unique_top10_urls = 0
-        try:
-            if self.topdf is not None and not self.topdf.empty:
-                uc = find_col(self.topdf, ["url", "link", "href"])
-                if uc:
-                    unique_top10_urls = int(
-                        self.topdf[uc].astype(str).str.strip().str.rstrip("/").replace("", pd.NA).dropna().nunique()
-                    )
-        except Exception:
-            unique_top10_urls = 0
-
-        # CREATE / SKIP / EXISTS после анализа.
-        create_count = sum(1 for x in rows if str(x.get("status", "")) == "CREATE")
-        skip_count = sum(1 for x in rows if str(x.get("status", "")) == "SKIP")
-        exists_count = sum(1 for x in rows if str(x.get("status", "")) == "EXISTS")
-
-        # URL audit.
-        url_checked = sum(
-            1 for x in rows
-            if str(x.get("verification_state", "")).strip() == "VERIFIED"
-        )
-        url_errors = sum(
-            1 for x in rows
-            if str(x.get("url_status", "")).strip() == "ERROR"
-            or str(x.get("verification_state", "")).strip() == "ERROR"
-        )
-        url_total = create_count
-
-        # OCFilter.
-        create_rows = [x for x in rows if str(x.get("status", "")) == "CREATE"]
-        oc_checked = sum(
-            1 for x in create_rows
-            if str(x.get("oc_status", "")).strip()
-        )
-        oc_errors = sum(
-            1 for x in create_rows
-            if str(x.get("oc_status", "")).strip().upper() == "ERROR"
-        )
-        oc_total = len(create_rows)
-
-        # Финальные уникальные страницы.
-        try:
-            ready_rows = generator_rows(res)
-            ready_urls = {
-                str(x.get("target_url", "") or "").strip().rstrip("/")
-                for x in ready_rows
-                if str(x.get("target_url", "") or "").strip()
-            }
-            ready_count = len(ready_urls)
-        except Exception:
-            ready_count = 0
-
-        # Если этап не передан явно, определяем его по текущим данным.
-        status = str(stage or "").strip()
-        if not status:
-            if ready_count:
-                status = "ГОТОВ"
-            elif oc_total and oc_checked >= oc_total:
-                status = "OCFILTER ПРОВЕРЕН"
-            elif url_total and url_checked >= url_total:
-                status = "URL ПРОВЕРЕН"
-            elif create_count or skip_count or exists_count:
-                status = "АНАЛИЗ ГОТОВ"
-            elif top10_values_total and top10_values_done is not None and top10_values_done >= top10_values_total:
-                status = "TOP-10 ГОТОВ"
-            elif top10_rows:
-                status = "TOP-10 ЗАГРУЖЕН"
-            else:
-                status = "КАТЕГОРИЯ ПОДКЛЮЧЕНА"
-
-        return {
-            "section_name": category_name,
-            "category_url": category_url,
-            "category_id": category_id,
-            "values_total": len(rows),
-            "top10_values_done": "" if top10_values_done is None else int(top10_values_done),
-            "top10_values_total": "" if top10_values_total is None else int(top10_values_total),
-            "top10_queries_done": "" if top10_queries_done is None else int(top10_queries_done),
-            "top10_queries_total": "" if top10_queries_total is None else int(top10_queries_total),
-            "top10_rows": int(top10_rows or 0),
-            "unique_top10_urls": int(unique_top10_urls or 0),
-            "analysis_create": int(create_count),
-            "analysis_skip": int(skip_count),
-            "analysis_exists": int(exists_count),
-            "url_checked": int(url_checked),
-            "url_total": int(url_total),
-            "url_errors": int(url_errors),
-            "ocfilter_checked": int(oc_checked),
-            "ocfilter_total": int(oc_total),
-            "ocfilter_errors": int(oc_errors),
-            "ready_pages": int(ready_count),
-            "status": status,
-            "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-            "app_version": "1.28.1 TOP10 REAL TOOL",
-        }
-
-    def _update_section_status_async(self, stage="", **kwargs):
-        """Обновляет общий реестр без блокировки интерфейса. Ошибка статуса не ломает основной процесс."""
-        try:
-            res_snapshot = self.res
-            topdf_snapshot = self.topdf
-            if not res_snapshot:
-                return
-            cfg = load_cfg()
-            endpoint = str(cfg.get("google_sheet_webapp_url", "") or "").strip()
-            token = str(cfg.get("google_sheet_token", "") or "").strip()
-            if not endpoint or not token:
-                return
-
-            # Снимки, чтобы фоновый поток не зависел от дальнейших изменений Tk/объектов.
-            saved_res = json.loads(json.dumps(res_snapshot, ensure_ascii=False, default=str))
-            saved_topdf = None
-            if topdf_snapshot is not None and not topdf_snapshot.empty:
-                saved_topdf = topdf_snapshot.copy()
-
-            def worker():
-                try:
-                    class Snapshot:
-                        pass
-                    snap = Snapshot()
-                    snap.res = saved_res
-                    snap.topdf = saved_topdf
-                    snap.cloud_section_name = getattr(self, "cloud_section_name", "")
-                    # Используем метод через временную привязку без изменения UI.
-                    row = App._build_section_status_row(
-                        snap,
-                        stage=stage,
-                        **kwargs,
-                    )
-                    update_section_status_google_sheet(row, endpoint, token, timeout=60)
-                except Exception as e:
-                    try:
-                        self.q.put(("sectionstatuslog", f"Google Sheets: статус раздела не обновлён: {e}"))
-                    except Exception:
-                        pass
-
-            threading.Thread(target=worker, daemon=True).start()
-        except Exception:
-            pass
-
-    def update_section_status_now(self):
-        """Ручное обновление статуса текущего раздела."""
-        if not self.res:
-            messagebox.showwarning("Статус раздела", "Сначала получите категорию.")
-            return
-        cfg = load_cfg()
-        endpoint = str(cfg.get("google_sheet_webapp_url", "") or "").strip()
-        token = str(cfg.get("google_sheet_token", "") or "").strip()
-        if not endpoint or not token:
-            messagebox.showwarning(
-                "Статус раздела",
-                "Сначала один раз настройте Google Sheets через кнопку записи готовых ссылок."
-            )
-            return
-        try:
-            row = self._build_section_status_row()
-            data = update_section_status_google_sheet(row, endpoint, token, timeout=60)
-            self.export_log.insert(
-                "end",
-                f"\nСтатус раздела обновлён: {row['section_name']} | "
-                f"статус={row['status']} | готовых страниц={row['ready_pages']}\n"
-            )
-            self.export_log.see("end")
-            messagebox.showinfo(
-                "Статус раздела",
-                f"Раздел: {row['section_name']}\n"
-                f"Статус: {row['status']}\n"
-                f"Готовых страниц: {row['ready_pages']}\n"
-                f"Всего строк в реестре: {data.get('total', '')}"
-            )
-        except Exception as e:
-            messagebox.showerror("Статус раздела", str(e))
-
-
     def export_generator(self):
         if not self.res:
             messagebox.showwarning("Нет данных","Сначала выполните анализ категории.")
@@ -6961,9 +5848,6 @@ class App(tk.Tk):
             while True:
                 t,x=self.q.get_nowait()
                 if t=="log":self.logtext.insert("end",str(x)+"\n");self.logtext.see("end")
-                elif t=="sectionstatuslog":
-                    self.export_log.insert("end",str(x)+"\n")
-                    self.export_log.see("end")
                 elif t=="cat":
                     self.res=x
                     self.render_filter_checkboxes(x.get("options", []))
@@ -6994,7 +5878,6 @@ class App(tk.Tk):
                     if hasattr(self,"cloud_status"): self.cloud_status.config(text=f"Облако: {x.get('section','готово')}")
                     self.logtext.insert("end",f"Google Drive: раздел синхронизирован. Кэш: {x.get('folder','')}\n")
                     self.logtext.see("end")
-                    self._update_section_status_async("КАТЕГОРИЯ ПОДКЛЮЧЕНА")
                 elif t=="clouderror":
                     self.cloud_sync_running=False
                     self.cloud_ready=False
@@ -7017,10 +5900,8 @@ class App(tk.Tk):
                         + (f"Отчёт: {x.get('report')}\n" if x.get('report') else "")
                     )
                     self.wklog.see("end")
-                    # Миграция старого TOP-10 затрагивает несколько разделов,
-                    # поэтому здесь не обновляем статус текущего окна как одного раздела.
                     messagebox.showinfo(
-                        "Миграция TOP-10",
+                        "Миграция TOP-30",
                         f"Готово.\n\n"
                         f"Всего строк: {x.get('total',0)}\n"
                         f"Распознано: {x.get('matched',0)}\n"
@@ -7031,25 +5912,22 @@ class App(tk.Tk):
                 elif t=="wkmigrateerror":
                     self.wk_migrate_btn.config(state="normal")
                     self.wklog.insert("end",f"ОШИБКА МИГРАЦИИ: {x}\n"); self.wklog.see("end")
-                    messagebox.showerror("Миграция TOP-10",str(x))
+                    messagebox.showerror("Миграция TOP-30",str(x))
                 elif t=="wklog":self.wklog.insert("end",str(x)+"\n");self.wklog.see("end")
                 elif t=="wkdone":
-                    p=x; self.topdf=pd.read_csv(p,encoding="utf-8-sig") if Path(p).exists() and Path(p).stat().st_size else pd.DataFrame(); self.wkstatus.config(text=f"Готово: {Path(p).name} | строк: {len(self.topdf)}"); self.wk_start_btn.config(state="normal"); self.wk_stop_btn.config(state="disabled"); self.wklog.insert("end",f"\nФайл TOP-10: {p}\n")
-                    self._update_section_status_async("TOP-10 ГОТОВ", top10_values_done=len(self.res.get("rows", [])), top10_values_total=len(self.res.get("rows", [])))
+                    p=x; self.topdf=pd.read_csv(p,encoding="utf-8-sig") if Path(p).exists() and Path(p).stat().st_size else pd.DataFrame(); self.wkstatus.config(text=f"Готово: {Path(p).name} | строк: {len(self.topdf)}"); self.wk_start_btn.config(state="normal"); self.wk_stop_btn.config(state="disabled"); self.wklog.insert("end",f"\nФайл TOP-30: {p}\n")
                 elif t=="wkstop":
-                    p=x["path"]; self.topdf=pd.read_csv(p,encoding="utf-8-sig") if Path(p).exists() and Path(p).stat().st_size else pd.DataFrame(); self.wkstatus.config(text=f"ОСТАНОВЛЕНО: {len(self.topdf)} строк | {Path(p).name}"); self.wk_start_btn.config(state="normal"); self.wk_stop_btn.config(state="disabled"); self.wklog.insert("end",f"\nАНАЛИЗ ОСТАНОВЛЕН.\nTOP-10: {p}\nCheckpoint: {x['progress']}\nЗавершено запросов: {x['done']} из {x['total']}\nМожно нажать ПОЛУЧИТЬ TOP-10 снова - продолжит с последнего сохранённого запроса.\n")
+                    p=x["path"]; self.topdf=pd.read_csv(p,encoding="utf-8-sig") if Path(p).exists() and Path(p).stat().st_size else pd.DataFrame(); self.wkstatus.config(text=f"ОСТАНОВЛЕНО: {len(self.topdf)} строк | {Path(p).name}"); self.wk_start_btn.config(state="normal"); self.wk_stop_btn.config(state="disabled"); self.wklog.insert("end",f"\nАНАЛИЗ ОСТАНОВЛЕН.\nTOP-30: {p}\nCheckpoint: {x['progress']}\nЗавершено запросов: {x['done']} из {x['total']}\nМожно нажать ПОЛУЧИТЬ TOP-30 снова - продолжит с последнего сохранённого запроса.\n")
                     if x.get("cloud_sync_error"):
                         self.wklog.insert("end",f"ОБЛАЧНАЯ СИНХРОНИЗАЦИЯ НЕ ВЫПОЛНЕНА: {x['cloud_sync_error']}\n")
                     self.wklog.see("end")
-                    self._update_section_status_async("TOP-10 ОСТАНОВЛЕН", top10_values_done=x.get("done", 0), top10_values_total=x.get("total", 0))
                 elif t=="wkdoneclouderror":
                     p=x["path"]
                     self.topdf=pd.read_csv(p,encoding="utf-8-sig") if Path(p).exists() and Path(p).stat().st_size else pd.DataFrame()
                     self.wkstatus.config(text=f"Готово локально: {len(self.topdf)} строк | облако не обновлено")
                     self.wk_start_btn.config(state="normal"); self.wk_stop_btn.config(state="disabled")
-                    self.wklog.insert("end",f"\nTOP-10 СОХРАНЁН ЛОКАЛЬНО: {p}\nОШИБКА ОБЛАЧНОЙ СИНХРОНИЗАЦИИ: {x['error']}\n")
+                    self.wklog.insert("end",f"\nTOP-30 СОХРАНЁН ЛОКАЛЬНО: {p}\nОШИБКА ОБЛАЧНОЙ СИНХРОНИЗАЦИИ: {x['error']}\n")
                     self.wklog.see("end")
-                    self._update_section_status_async("TOP-10 ГОТОВ (ОБЛАКО НЕ ОБНОВЛЕНО)")
                 elif t=="wkerr":
                     self.wk_running=False; self.wk_start_btn.config(state="normal"); self.wk_stop_btn.config(state="disabled"); messagebox.showerror("WordKeeper",x)
                 elif t=="analysislog":
@@ -7066,7 +5944,6 @@ class App(tk.Tk):
                     else:
                         self.stats.insert("end",f"\nКлассификация сохранена: {cache_txt}\n")
                     self.stats.see("end")
-                    self._update_section_status_async("АНАЛИЗ ОСТАНОВЛЕН" if x.get("stopped") else "АНАЛИЗ ГОТОВ")
                 elif t=="analysiserr":
                     self.analysis_running=False
                     self.compare_btn.config(state="normal")
@@ -7082,7 +5959,6 @@ class App(tk.Tk):
                     if x.get("stopped"): msg += " | ОСТАНОВЛЕНО"
                     self.urlstatus.config(text=msg)
                     self.urllog.insert("end",f"\n{msg}\n")
-                    self._update_section_status_async("URL ОСТАНОВЛЕН" if x.get("stopped") else "URL ПРОВЕРЕН")
                 elif t=="urlerr":
                     self.url_check_running=False
                     self.url_check_btn.config(state="normal")
@@ -7114,7 +5990,7 @@ class App(tk.Tk):
                     audit_path = self._save_ocfilter_audit(results) if results else self.ocfilter_audit_path()
                     try:
                         if results:
-                            self.cloud_push_current_files(["seo_top10_ocfilter_check_audit.json"])
+                            self.cloud_push_current_files(["seo_ocfilter_check_audit.json"])
                     except Exception as cloud_e:
                         self.oclog.insert("end",f"Google Drive: не удалось сохранить OCFilter audit: {cloud_e}\n")
                     self._apply_ocfilter_audit()
@@ -7132,7 +6008,6 @@ class App(tk.Tk):
                         for r in results:self.oclog.insert("end",f"{r.get('keyword')} -> {r.get('oc_status')} | {r.get('target_url','')}\n")
                     self.oclog.insert("end",f"\nСледующий шаг: вкладка 6. Экспорт -> СОХРАНИТЬ CSV ДЛЯ ГЕНЕРАТОРА.\n")
                     self.oclog.see("end")
-                    self._update_section_status_async()
                 elif t=="ocerr":
                     self.oc_running=False
                     self.oc_check_btn.config(state="normal")
