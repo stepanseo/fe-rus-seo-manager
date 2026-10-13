@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-FE-RUS SEO Manager TOP10 v1.29.1
+FE-RUS SEO Manager TOP10 v1.29.2
 
 Экспериментальная отдельная TOP-10 версия Windows-приложения через реальный веб-инструмент WordKeeper:
 1. Категория - получает category_id, OCFilter options и значения.
@@ -1028,18 +1028,22 @@ def parse_top10(html, keyword):
 # -----------------------------------------------------------------------------
 
 def _wk_login_http(login, password, progress=None):
-    """Авторизует requests.Session в WordKeeper без браузера.
+    """Авторизация WordKeeper через обычный HTTP-сеанс, без браузера.
 
-    Мы не храним cookies отдельно: они живут только внутри Session во время
-    текущего сбора. Форма определяется по HTML, поэтому изменения порядка
-    полей на странице не должны ломать авторизацию.
+    ВАЖНО: у формы WordKeeper есть скрытый csrf_token и submit-поле auth.
+    Предыдущая версия правильно собирала hidden-поля, но выбрасывала submit,
+    из-за чего сервер принимал POST как обычный запрос и не создавал
+    авторизованную сессию. Старый рабочий TOP-30-код проекта передавал
+    auth=Войти и csrf_token явно — повторяем это поведение здесь.
     """
     s = requests.Session()
     s.headers.update({
         "User-Agent": UA,
         "Accept-Language": "ru-RU,ru;q=0.9",
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Referer": LOGIN_WK,
     })
+
     r = s.get(LOGIN_WK, timeout=WK_HTTP_LOGIN_TIMEOUT, allow_redirects=True)
     r.raise_for_status()
     soup = BeautifulSoup(r.text, "html.parser")
@@ -1050,14 +1054,24 @@ def _wk_login_http(login, password, progress=None):
     action = urljoin(r.url, form.get("action") or "/login")
     method = str(form.get("method") or "post").lower()
     data = {}
+    submit_added = False
     for inp in form.find_all("input"):
         name = str(inp.get("name") or "").strip()
         if not name:
             continue
         typ = str(inp.get("type") or "text").lower()
-        if typ in {"submit", "button", "image", "file"}:
+        if typ in {"button", "image", "file"}:
+            continue
+        if typ == "submit":
+            # WordKeeper historically ожидает auth=Войти. Если у кнопки
+            # есть собственное name/value, передаём и его.
+            data[name] = str(inp.get("value") or "Войти")
+            submit_added = True
             continue
         data[name] = str(inp.get("value") or "")
+
+    # Совместимость с текущей/старой формой WordKeeper.
+    data.setdefault("auth", "Войти")
 
     inputs = form.find_all("input")
     password_name = ""
@@ -1080,7 +1094,6 @@ def _wk_login_http(login, password, progress=None):
             user_name = name
 
     if not user_name:
-        # На старых версиях формы логин мог быть обычным text без name-маркера.
         for inp in inputs:
             name = str(inp.get("name") or "").strip()
             typ = str(inp.get("type") or "text").lower()
@@ -1097,24 +1110,42 @@ def _wk_login_http(login, password, progress=None):
     data[password_name] = str(password)
 
     if progress:
-        progress(f"TOP-10 HTTP: отправляем авторизацию WordKeeper ({action}).")
+        csrf_present = bool(str(data.get("csrf_token") or "").strip())
+        progress(
+            f"TOP-10 HTTP: авторизация WordKeeper ({action}); "
+            f"csrf={'OK' if csrf_present else 'НЕТ'}; auth={'OK' if 'auth' in data else 'НЕТ'}."
+        )
 
     if method == "get":
         auth = s.get(action, params=data, timeout=WK_HTTP_LOGIN_TIMEOUT, allow_redirects=True)
     else:
-        auth = s.post(action, data=data, timeout=WK_HTTP_LOGIN_TIMEOUT, allow_redirects=True)
+        auth = s.post(
+            action,
+            data=data,
+            headers={"Origin": "https://word-keeper.ru", "Referer": LOGIN_WK},
+            timeout=WK_HTTP_LOGIN_TIMEOUT,
+            allow_redirects=True,
+        )
     auth.raise_for_status()
 
-    # Проверяем именно рабочую страницу, а не просто отсутствие HTTP-ошибки.
+    if progress:
+        progress(f"TOP-10 HTTP: после входа сервер открыл {auth.url} (HTTP {auth.status_code}).")
+
+    # Не требуем конкретно /dashboard: в текущем WordKeeper пользователь может
+    # попасть в личный кабинет. Нам важно, что рабочая страница не редиректит
+    # обратно на /login.
     check = s.get(TOP10_WK_PAGE, timeout=WK_HTTP_LOGIN_TIMEOUT, allow_redirects=True)
     check.raise_for_status()
     if "/login" in check.url:
+        body = re.sub(r"\s+", " ", BeautifulSoup(check.text, "html.parser").get_text(" ", strip=True))
+        hint = body[:220] if body else ""
         raise RuntimeError(
-            "WordKeeper: HTTP-авторизация не прошла — /core/parse_top снова отправил на /login."
+            "WordKeeper: HTTP-авторизация не прошла — /core/parse_top снова отправил на /login. "
+            + (f" Ответ: {hint}" if hint else "")
         )
     if "/core/parse_top" not in check.url:
         raise RuntimeError(
-            f"WordKeeper: после HTTP-авторизации получен неожиданный URL: {check.url}"
+            f"WordKeeper: сессия создана, но /core/parse_top открылся как {check.url}."
         )
     if progress:
         progress("TOP-10 HTTP: авторизация подтверждена, браузер не используется.")
@@ -1221,8 +1252,8 @@ def _wk_response_html_or_rows(response, keyword):
 def collect_wordkeeper_top10_http(login, password, region, queries, stop_event, progress):
     """Собирает TOP-10 напрямую HTTP-запросами, без Chrome/Playwright.
 
-    Используется endpoint /core/ajax_top10, который уже является HTTP-запросом
-    самого веб-инструмента WordKeeper. Для авторизации создаётся обычная
+    Используется HTTP endpoint рабочего инструмента /core/ajax_top10 без запуска браузера.
+    Это не публичный /api/* метод: сессия создаётся обычным HTTP-входом, после чего
     requests.Session. Запросы идут максимум в 4 потока.
     """
     queries = [str(q or "").strip() for q in queries or []]
