@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-FE-RUS SEO Manager TOP10 v1.28.9
+FE-RUS SEO Manager TOP10 v1.28.10
 
 Экспериментальная отдельная TOP-10 версия Windows-приложения через реальный веб-инструмент WordKeeper:
 1. Категория - получает category_id, OCFilter options и значения.
@@ -1499,10 +1499,14 @@ def collect_wordkeeper_top10_real_tool(login, password, region, queries, stop_ev
         page.on('response', on_response)
 
         try:
-            page.goto('https://word-keeper.ru/login', wait_until='domcontentloaded', timeout=WK_TOP10_BROWSER_TIMEOUT)
+            # Сразу открываем реальный инструмент. Не заходим на /login заранее:
+            # у уже авторизованной persistent-сессии /login может отправить
+            # браузер в «Личный кабинет».
+            page.goto(TOP10_WK_PAGE, wait_until='domcontentloaded', timeout=WK_TOP10_BROWSER_TIMEOUT)
             page.wait_for_timeout(1500)
+            progress(f'TOP-10: открыта страница {page.url}')
 
-            # Авторизация только если браузерный профиль ещё не авторизован.
+            # Если именно инструмент потребовал авторизацию — авторизуемся.
             if '/login' in page.url:
                 login_input = _pw_locator_first(page, [
                     'input[name="login"]', 'input[type="email"]', 'input[name*="mail" i]',
@@ -1517,21 +1521,27 @@ def collect_wordkeeper_top10_real_tool(login, password, region, queries, stop_ev
                 pass_input.fill(str(password))
                 if not _pw_click_text(page, [r'войти', r'авторизац']):
                     pass_input.press('Enter')
-                page.wait_for_timeout(2000)
+                page.wait_for_timeout(2500)
+                progress(f'TOP-10: после авторизации открыта страница {page.url}')
                 if '/login' in page.url:
                     raise RuntimeError('Авторизация WordKeeper в браузере не удалась.')
 
-            # Открываем точную страницу реального инструмента.
-            # /dashboard здесь не используем: он может отдавать 404.
-            page.goto(TOP10_WK_PAGE, wait_until='domcontentloaded', timeout=WK_TOP10_BROWSER_TIMEOUT)
-            page.wait_for_timeout(1200)
-            if page.url.rstrip('/').endswith('/login'):
+                # После логина снова явно открываем нужный инструмент.
+                page.goto(TOP10_WK_PAGE, wait_until='domcontentloaded', timeout=WK_TOP10_BROWSER_TIMEOUT)
+                page.wait_for_timeout(1500)
+                progress(f'TOP-10: повторно открыта страница инструмента {page.url}')
+
+            if '/login' in page.url:
                 raise RuntimeError(
                     'WordKeeper вернул страницу авторизации вместо /core/parse_top. '
                     'Проверьте логин/пароль и браузерный профиль.'
                 )
+            if '/core/parse_top' not in page.url:
+                raise RuntimeError(
+                    f'WordKeeper открыл не инструмент TOP-10, а {page.url}. '
+                    'Это похоже на редирект сессии в «Личный кабинет».'
+                )
 
-            # Отдельный инструмент может быть modal/SPA: повторно ищем поле ввода.
             query_input=_pw_find_query_input(page)
             if not query_input:
                 raise RuntimeError(
@@ -4188,7 +4198,7 @@ def migrate_legacy_file_for_section(src, dst, filename, res):
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("FE-RUS SEO Manager TOP10 v1.28.9")
+        self.title("FE-RUS SEO Manager TOP10 v1.28.10")
         self.geometry("1280x860")
         self.q = queue.Queue()
         self.res = None
