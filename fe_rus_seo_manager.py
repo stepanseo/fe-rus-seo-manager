@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-FE-RUS SEO Manager v1.25.1
+FE-RUS SEO Manager v1.25.2
 
 Единое Windows-приложение:
 1. Категория - получает category_id, OCFilter options и значения.
@@ -1980,14 +1980,14 @@ def promotion_type_for_counts(product_domains, seo_domains, article_domains, unk
 
 
 # -----------------------------------------------------------------------------
-# SEO CANDIDATE SELECTION v1.25
+# SEO CANDIDATE SELECTION v1.25.2
 # -----------------------------------------------------------------------------
 
-SEO_SELECTION_VERSION = "1.25.0"
-SEO_CREATE_MIN_SCORE = 6
-SEO_MIN_FILTER_DOMAINS_TEXT = 5
-SEO_MIN_FILTER_DOMAINS_NUMERIC = 7
-SEO_MIN_FILTER_DOMAINS_SMALL = 3
+SEO_SELECTION_VERSION = "1.25.2"
+SEO_CREATE_MIN_SCORE = 4
+SEO_MIN_FILTER_DOMAINS_TEXT = 4
+SEO_MIN_FILTER_DOMAINS_NUMERIC = 5
+SEO_MIN_FILTER_DOMAINS_SMALL = 2
 SEO_CREATE_CAP_NUMERIC = 25
 SEO_CREATE_CAP_TEXT = 20
 
@@ -2085,7 +2085,7 @@ def _seo_candidate_score(row):
 
 
 def _apply_seo_candidate_selection(res, progress=None):
-    """Финальный отбор CREATE-кандидатов v1.25.
+    """Финальный отбор CREATE-кандидатов v1.25.2
 
     Важный принцип: базовая классификация собирает доказательства, а эта функция
     уже решает, сколько реальных SEO-посадочных страниц стоит создавать.
@@ -2134,19 +2134,34 @@ def _apply_seo_candidate_selection(res, progress=None):
             continue
         score = int(r.get("seo_selection_score") or 0)
         fd = int(r.get("filter_domains_count") or 0)
+        top10 = int(r.get("filter_top10_count") or 0)
         if fd < min_domains:
             r["status"] = "SKIP"
             r["reason"] = (
-                f"SEO-отбор v1.25: недостаточно независимых filter-конкурентов "
+                f"SEO-отбор v1.25.2: недостаточно независимых filter-конкурентов "
                 f"({fd}/{min_domains}); значений характеристики={value_count}"
             )
-        elif score < SEO_CREATE_MIN_SCORE:
-            r["status"] = "SKIP"
-            r["reason"] = (
-                f"SEO-отбор v1.25: низкий SEO Score={score}/{SEO_CREATE_MIN_SCORE}; "
-                f"filter-конкурентов={fd}, SEO-доменов={r.get('seo_domains_count',0)}, "
-                f"PRODUCT-доменов={r.get('product_domains_count',0)}"
-            )
+        else:
+            # Базовый порог Score снижен с 6 до 4. Дополнительное исключение
+            # оставляет сильные небольшие кластеры: если уже есть >=5 независимых
+            # filter-доменов и минимум 2 таких конкурента находятся в TOP-10,
+            # кандидат с Score=2-3 тоже проходит. Это позволяет не терять
+            # реальные страницы вроде точных размеров/ячейки, где product- и
+            # SEO-интенты естественно смешиваются.
+            strong_small_cluster = fd >= 5 and top10 >= 2 and score >= 2
+            if score < SEO_CREATE_MIN_SCORE and not strong_small_cluster:
+                r["status"] = "SKIP"
+                r["reason"] = (
+                    f"SEO-отбор v1.25.2: низкий SEO Score={score}/{SEO_CREATE_MIN_SCORE}; "
+                    f"filter-конкурентов={fd}, TOP-10={top10}, "
+                    f"SEO-доменов={r.get('seo_domains_count',0)}, "
+                    f"PRODUCT-доменов={r.get('product_domains_count',0)}"
+                )
+            elif strong_small_cluster and score < SEO_CREATE_MIN_SCORE:
+                r["reason"] = (
+                    f"SEO-отбор v1.25.2: допуск сильного кластера; Score={score}, "
+                    f"filter-конкурентов={fd}, TOP-10={top10}"
+                )
 
     # Одна будущая URL = одна страница. Если одна и та же URL появилась у
     # нескольких характеристик, оставляем самый сильный CREATE-кандидат.
@@ -2178,7 +2193,7 @@ def _apply_seo_candidate_selection(res, progress=None):
                 continue
             r["status"] = "SKIP"
             r["reason"] = (
-                f"SEO-отбор v1.25: дубликат target URL; приоритет у "
+                f"SEO-отбор v1.25.2: дубликат target URL; приоритет у "
                 f"«{winner.get('filter')} = {winner.get('value')}» "
                 f"(Score={winner.get('seo_selection_score')})"
             )
@@ -2210,7 +2225,7 @@ def _apply_seo_candidate_selection(res, progress=None):
         for r in candidates[cap:]:
             r["status"] = "SKIP"
             r["reason"] = (
-                f"SEO-отбор v1.25: превышен лимит характеристики "
+                f"SEO-отбор v1.25.2: превышен лимит характеристики "
                 f"{cap} страниц; кандидат исключён как менее сильный "
                 f"(Score={r.get('seo_selection_score')})"
             )
@@ -2219,7 +2234,7 @@ def _apply_seo_candidate_selection(res, progress=None):
     final_create = sum(1 for r in rows if r.get("status") == "CREATE")
     if progress:
         progress(
-            f"SEO-отбор v1.25: CREATE={final_create} | "
+            f"SEO-отбор v1.25.2: CREATE={final_create} | "
             f"дубликатов URL убрано={duplicate_removed} | "
             f"лишних по лимитам характеристик={capped}"
         )
@@ -2312,7 +2327,7 @@ class Pipeline:
         ТОВАР / SEO-СТРАНИЦА / СМЕШАННЫЙ / ИНФОРМАЦИОННАЯ / НЕДОСТАТОЧНО ДАННЫХ.
 
         Базовый слой собирает доказательства filter-интента. Финальный CREATE
-        определяется отдельным SEO-отбором v1.25: требуется больше независимых
+        определяется отдельным SEO-отбором v1.25.2: требуется больше независимых
         конкурентов (5 для обычных и 7 для числовых характеристик), считается
         SEO Score, удаляются дубли target URL и ограничивается число страниц
         для широких характеристик. Явно ТОВАРНЫЙ интент не переводится в CREATE.
@@ -2925,7 +2940,7 @@ def generator_rows(res):
         if x.get("status") != "CREATE":
             continue
         # СМЕШАННЫЙ также допускается, если кандидат прошёл новый
-        # SEO-отбор v1.25 и все последующие проверки.
+        # SEO-отбор v1.25.2 и все последующие проверки.
         if not is_filter_creation_intent(x):
             continue
         if x.get("url_status") not in ("READY_FOR_OCFILTER", "HTTP_404"):
@@ -3472,7 +3487,7 @@ def migrate_legacy_file_for_section(src, dst, filename, res):
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("FE-RUS SEO Manager v1.25.1")
+        self.title("FE-RUS SEO Manager v1.25.2")
         self.geometry("1280x860")
         self.q = queue.Queue()
         self.res = None
@@ -4947,7 +4962,7 @@ class App(tk.Tk):
         self.stats.insert("end", "\nСТАТУС SEO-СТРАНИЦ:\n")
         for k in ("CREATE","SKIP","EXISTS"):
             self.stats.insert("end",f"{k}: {c[k]}\n")
-        self.stats.insert("end", "\nCREATE = SEO-отбор v1.25: минимум 5 независимых filter-конкурентов (7 для числовых характеристик; 3 для характеристик до 5 значений) + SEO Score. Дубли URL и слабые кандидаты идут в SKIP.\n")
+        self.stats.insert("end", "\nCREATE = SEO-отбор v1.25.2: минимум 4 независимых filter-конкурента (5 для числовых характеристик; 2 для характеристик до 5 значений) + SEO Score от 4. Для сильного кластера допускается Score 2–3 при 5+ независимых filter-конкурентах и 2+ конкурентах в TOP-10. Дубли URL и слабые кандидаты идут в SKIP.\n")
         self.stats.insert("end", "ТОВАР = запрос преимущественно ведет на карточки товаров; отдельную SEO-посадочную не создаем.\n\n")
         self.stats.insert("end", "СПИСОК:\n")
         for x in self.res["rows"]:
