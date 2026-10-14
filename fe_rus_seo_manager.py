@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-FE-RUS SEO Manager v1.25.3
+FE-RUS SEO Manager v1.25.4
 
 Единое Windows-приложение:
 1. Категория - получает category_id, OCFilter options и значения.
@@ -75,6 +75,9 @@ WK_DELAY = 0.5
 # CSV/checkpoint сохраняются пакетно, чтобы не переписывать весь накопительный
 # файл после каждого запроса. При остановке/ошибке пакет принудительно сохраняется.
 WK_SAVE_EVERY = 10
+# WordKeeper рекомендует для позапросных методов 3–4 одновременных потока.
+# Используем 3, чтобы ускорить TOP-30 без агрессивной нагрузки на сервис.
+WK_WORKERS = 3
 
 
 def norm(x):
@@ -3487,7 +3490,7 @@ def migrate_legacy_file_for_section(src, dst, filename, res):
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("FE-RUS SEO Manager v1.25.2")
+        self.title("FE-RUS SEO Manager v1.25.4")
         self.geometry("1280x860")
         self.q = queue.Queue()
         self.res = None
@@ -4816,52 +4819,78 @@ class App(tk.Tk):
                 if str(rr.get("source_query", "")).strip() and str(rr.get("url", "")).strip()
             }
 
-            query_index=0
-            total_pending=pending_queries
+            # Обрабатываем несколько запросов одновременно. Раньше здесь был
+            # строго последовательный цикл: один запрос -> ответ -> sleep -> следующий.
+            # При 300+ запросах это легко превращалось в 20–40 минут.
+            # Для каждого worker используется своя requests.Session.
+            query_tasks=[]
             for canonical, variants in query_plan:
-                if self.wk_stop_event.is_set():
-                    break
-                all_variants_done=True
                 for actual_query in variants:
-                    if self.wk_stop_event.is_set():
-                        all_variants_done=False
-                        break
-                    query_index += 1
+                    query_tasks.append((canonical, actual_query))
+
+            total_pending=len(query_tasks)
+            completed_count=0
+            canonical_remaining={canonical: len(variants) for canonical, variants in query_plan}
+            canonical_failed=set()
+
+            worker_local=threading.local()
+
+            def run_one_top30(task):
+                canonical, actual_query = task
+                sess=getattr(worker_local, "session", None)
+                if sess is None:
+                    sess=requests.Session()
+                    sess.headers.update({"User-Agent": UA, "Accept-Language": "ru-RU,ru;q=0.9"})
+                    worker_local.session=sess
+                rr=wordkeeper_ajax_post(sess, actual_query, region, cookie_header)
+                rr_status=http_status_code(rr)
+                rr_text=http_response_text(rr)
+                if rr_status in (301,302,303,307,308):
+                    location=""
                     try:
-                        rr=wordkeeper_ajax_post(ajax_session, actual_query, region, cookie_header)
-                        rr_status=http_status_code(rr)
-                        rr_text=http_response_text(rr)
-                        if rr_status in (301,302,303,307,308):
-                            location = ""
-                            try:
-                                location = str(rr.headers.get("Location") or "")
-                            except Exception:
-                                pass
-                            if location and "/login" in location:
-                                raise RuntimeError("WordKeeper вернул редирект на /login: сессия авторизации потеряна")
-                        if not rr_text:
-                            raise RuntimeError(
-                                f"WordKeeper вернул пустой ответ (HTTP={rr_status}, тип={type(rr).__name__})"
-                            )
-                        rows=parse_top30(rr_text,canonical)
-                        for rrow in rows:
-                            rrow["source_query"]=actual_query
+                        location=str(rr.headers.get("Location") or "")
+                    except Exception:
+                        pass
+                    if location and "/login" in location:
+                        raise RuntimeError("WordKeeper вернул редирект на /login: сессия авторизации потеряна")
+                if not rr_text:
+                    raise RuntimeError(f"WordKeeper вернул пустой ответ (HTTP={rr_status}, тип={type(rr).__name__})")
+                rows=parse_top30(rr_text,canonical)
+                for rrow in rows:
+                    rrow["source_query"]=actual_query
+                # Небольшая пауза внутри worker сохраняет щадящий режим,
+                # но уже не блокирует остальные параллельные запросы.
+                if WK_DELAY:
+                    time.sleep(WK_DELAY)
+                return canonical, actual_query, rr_status, rows
+
+            self.q.put(("wklog",f"TOP-30: параллельный сбор, потоков: {min(WK_WORKERS, max(1, total_pending))}"))
+            executor=ThreadPoolExecutor(max_workers=min(WK_WORKERS, max(1,total_pending)))
+            futures={executor.submit(run_one_top30, task): task for task in query_tasks}
+            try:
+                for future in as_completed(futures):
+                    canonical, actual_query=futures[future]
+                    if self.wk_stop_event.is_set():
+                        for f in futures:
+                            if not f.done():
+                                f.cancel()
+                        break
+                    completed_count += 1
+                    try:
+                        canonical, actual_query, rr_status, rows=future.result()
                         done_queries.add(actual_query)
                         done_query_keys.add(norm(actual_query))
-                        # Не дублируем одинаковый URL одного и того же source_query.
                         for rr in rows:
-                            key = (str(rr.get("source_query", "")).strip(), str(rr.get("url", "")).strip())
+                            key=(str(rr.get("source_query", "")).strip(), str(rr.get("url", "")).strip())
                             if key not in existing_keys:
                                 results.append(rr)
                                 existing_keys.add(key)
-                        # Не переписываем весь накопительный CSV после каждого
-                        # запроса. Сохраняем каждые WK_SAVE_EVERY запросов, а также
-                        # немедленно при остановке/последнем запросе.
-                        force_save = (
-                            query_index % WK_SAVE_EVERY == 0
-                            or self.wk_stop_event.is_set()
-                            or query_index == total_pending
-                        )
+                        canonical_remaining[canonical]=max(0, canonical_remaining.get(canonical,1)-1)
+                        if canonical_remaining.get(canonical,0)==0 and canonical not in canonical_failed:
+                            done.add(canonical)
+                            self.q.put(("wklog",f"ЗАВЕРШЕНО ЗНАЧЕНИЕ: {canonical} | варианты запроса: {len(current_variants_by_keyword.get(canonical,[]))}"))
+
+                        force_save=(completed_count % WK_SAVE_EVERY == 0 or completed_count == total_pending)
                         if force_save:
                             pd.DataFrame(results).to_csv(out_path,index=False,encoding="utf-8-sig")
                             progress_path.write_text(json.dumps({
@@ -4869,40 +4898,26 @@ class App(tk.Tk):
                                 "done_queries":safe_sorted_strings(done_queries),
                                 "updated_at":time.strftime("%Y-%m-%d %H:%M:%S")
                             },ensure_ascii=False,indent=2),encoding="utf-8")
-                            save_note = " | СОХРАНЕНО"
+                            save_note=" | СОХРАНЕНО"
                         else:
-                            save_note = ""
-                        self.q.put(("wklog",f"[{query_index}/{total_pending}] {canonical} | запрос: {actual_query} | HTTP {rr_status} | результатов: {len(rows)}{save_note}"))
-                        if self.wk_stop_event.is_set():
-                            all_variants_done=False
-                            break
-                        time.sleep(WK_DELAY)
+                            save_note=""
+                        self.q.put(("wklog",f"[{completed_count}/{total_pending}] {canonical} | запрос: {actual_query} | HTTP {rr_status} | результатов: {len(rows)}{save_note}"))
                     except Exception as e:
-                        all_variants_done=False
+                        canonical_failed.add(canonical)
                         pd.DataFrame(results).to_csv(out_path,index=False,encoding="utf-8-sig")
                         progress_path.write_text(json.dumps({
                             "done_keywords":safe_sorted_strings(done),
                             "done_queries":safe_sorted_strings(done_queries),
                             "updated_at":time.strftime("%Y-%m-%d %H:%M:%S")
                         },ensure_ascii=False,indent=2),encoding="utf-8")
-                        error_log = work_dir / "wordkeeper_error.log"
+                        error_log=work_dir / "wordkeeper_error.log"
                         try:
-                            error_log.write_text(
-                                traceback.format_exc(),
-                                encoding="utf-8"
-                            )
+                            error_log.write_text(traceback.format_exc(),encoding="utf-8")
                         except Exception:
                             pass
-                        self.q.put(("wklog",f"ОШИБКА {actual_query}: {e} | текущая категория: обработано {len(set(keywords) & done)} из {len(keywords)} | traceback: {error_log}"))
-                        break
-
-                if all_variants_done:
-                    done.add(canonical)
-                    # CSV/checkpoint сохраняются пакетно выше. Здесь только фиксируем
-                    # завершение canonical keyword в памяти, чтобы не переписывать
-                    # весь файл после каждого значения. Финальное сохранение выполняется
-                    # после цикла, а при ошибке/остановке — принудительно.
-                    self.q.put(("wklog",f"ЗАВЕРШЕНО ЗНАЧЕНИЕ: {canonical} | вариантов запроса: {len(variants)}"))
+                        self.q.put(("wklog",f"ОШИБКА {actual_query}: {e} | traceback: {error_log}"))
+            finally:
+                executor.shutdown(wait=not self.wk_stop_event.is_set(), cancel_futures=True)
 
             pd.DataFrame(results).to_csv(out_path,index=False,encoding="utf-8-sig")
             progress_path.write_text(json.dumps({
