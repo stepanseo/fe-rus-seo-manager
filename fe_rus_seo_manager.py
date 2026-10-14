@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-FE-RUS SEO Manager v1.25.5
+FE-RUS SEO Manager v1.25.6
 
 Единое Windows-приложение:
 1. Категория - получает category_id, OCFilter options и значения.
@@ -3490,7 +3490,7 @@ def migrate_legacy_file_for_section(src, dst, filename, res):
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("FE-RUS SEO Manager v1.25.5")
+        self.title("FE-RUS SEO Manager v1.25.6")
         self.geometry("1280x860")
         self.q = queue.Queue()
         self.res = None
@@ -4679,25 +4679,28 @@ class App(tk.Tk):
             region=int(self.region.get())
             if not login or not password:
                 raise RuntimeError("Заполните логин и пароль WordKeeper.")
-            s=http_session()
-            self.q.put(("wklog","WordKeeper: открываем авторизацию..."))
-            r=s.get(LOGIN_WK,timeout=60); r.raise_for_status(); csrf=get_csrf(r.text)
-            if not csrf:
-                raise RuntimeError("CSRF-токен WordKeeper не найден.")
-            r=s.post(LOGIN_WK,data={"login":login,"password":password,"auth":"Войти","csrf_token":csrf},timeout=60,allow_redirects=True)
-            if "/dashboard" not in r.url:
-                raise RuntimeError("Авторизация WordKeeper не удалась.")
+            self.q.put(("wklog","WordKeeper: авторизация будет выполнена отдельно в каждом из 3 рабочих потоков..."))
 
-            # Отдельная постоянная сессия для AJAX: не трогаем cookie-jar
-            # авторизационной сессии, но переиспользуем HTTP-соединение между
-            # десятками/сотнями TOP-30 запросов.
-            ajax_session = requests.Session()
-            ajax_session.headers.update({"User-Agent": UA, "Accept-Language": "ru-RU,ru;q=0.9"})
-            cookie_header = "; ".join(
-                f"{str(c.name)}={str(c.value)}"
-                for c in s.cookies
-                if getattr(c, "name", None) is not None
-            )
+            def make_authenticated_wk_session():
+                # ВАЖНО: не переносим cookies из одной login-сессии в отдельный
+                # requests.Session. У WordKeeper AJAX endpoint привязан к
+                # полноценной серверной сессии. В старой рабочей версии запрос
+                # выполнялся тем же Session, которым проходил login.
+                sess=http_session()
+                r=sess.get(LOGIN_WK,timeout=60,allow_redirects=True)
+                r.raise_for_status()
+                csrf=get_csrf(r.text)
+                if not csrf:
+                    raise RuntimeError("CSRF-токен WordKeeper не найден.")
+                r=sess.post(
+                    LOGIN_WK,
+                    data={"login":login,"password":password,"auth":"Войти","csrf_token":csrf},
+                    timeout=60,
+                    allow_redirects=True,
+                )
+                if "/dashboard" not in r.url:
+                    raise RuntimeError(f"Авторизация WordKeeper не удалась: {r.url}")
+                return sess
 
             # Запросы именно ТЕКУЩЕЙ категории.
             # CSV/checkpoint являются накопительным кэшем, но для текущей категории
@@ -4839,10 +4842,10 @@ class App(tk.Tk):
                 canonical, actual_query = task
                 sess=getattr(worker_local, "session", None)
                 if sess is None:
-                    sess=requests.Session()
-                    sess.headers.update({"User-Agent": UA, "Accept-Language": "ru-RU,ru;q=0.9"})
+                    sess=make_authenticated_wk_session()
                     worker_local.session=sess
-                rr=wordkeeper_ajax_post(sess, actual_query, region, cookie_header)
+                    self.q.put(("wklog",f"TOP-30: рабочий поток авторизован для запроса «{actual_query}»"))
+                rr=wordkeeper_ajax_post(sess, actual_query, region, "")
                 rr_status=http_status_code(rr)
                 rr_text=http_response_text(rr)
                 if rr_status in (301,302,303,307,308):
@@ -4856,6 +4859,15 @@ class App(tk.Tk):
                 if not rr_text:
                     raise RuntimeError(f"WordKeeper вернул пустой ответ (HTTP={rr_status}, тип={type(rr).__name__})")
                 rows=parse_top30(rr_text,canonical)
+                if rr_status == 200 and not rows:
+                    # Сохраняем реальный ответ WordKeeper, чтобы отличать
+                    # настоящий «0 результатов» от изменения HTML/AJAX-ответа.
+                    try:
+                        empty_path=work_dir / "wordkeeper_empty_response.html"
+                        if not empty_path.exists():
+                            empty_path.write_text(rr_text,encoding="utf-8")
+                    except Exception:
+                        pass
                 for rrow in rows:
                     rrow["source_query"]=actual_query
                 # Небольшая пауза внутри worker сохраняет щадящий режим,
@@ -4937,6 +4949,8 @@ class App(tk.Tk):
             self.wk_running=False
 
             self.q.put(("wklog",f"TOP-30: локальный CSV сохранён: {out_path} | строк: {len(final_df)}"))
+            if final_df.empty and not self.wk_stop_event.is_set():
+                self.q.put(("wklog","ВНИМАНИЕ: WordKeeper вернул HTTP 200, но парсер не нашёл ни одной ссылки. Сохранён wordkeeper_empty_response.html для диагностики."))
             if self.wk_stop_event.is_set():
                 payload={"path":out_path,"progress":progress_path,"done":len(set(keywords) & done),"total":len(keywords),"df":final_df}
                 self.q.put(("wkstop",payload))
