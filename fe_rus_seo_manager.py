@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-FE-RUS SEO Manager v1.25.6
+FE-RUS SEO Manager v1.25.7
 
 Единое Windows-приложение:
 1. Категория - получает category_id, OCFilter options и значения.
@@ -26,6 +26,9 @@ import gzip
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import queue
+import urllib.request
+import urllib.parse
+import urllib.error
 import webbrowser
 import types
 import traceback
@@ -579,32 +582,76 @@ def safe_sorted_strings(values):
 
 
 def wordkeeper_ajax_post(ajax_session, query, region, cookie_header=""):
-    """Выполняет AJAX TOP-30 через постоянную HTTP-сессию.
+    """Отправляет TOP-30 тем же HTTP-сеансом, но через urllib.
 
-    Авторизационные cookies передаются как готовая строка Cookie, поэтому мы
-    не используем проблемный cookie-jar авторизационной сессии WordKeeper.
-    При этом отдельная ajax-сессия переиспользует TCP/TLS-соединение между
-    запросами, что заметно ускоряет большой пакет TOP-30.
+    WordKeeper отдаёт оболочку HTML с HTTP 200, если запрос доходит до
+    ajax_top30, однако в requests-варианте у нас приходила пустая
+    topYandex-ul. В рабочей версии проекта использовался urllib с явным
+    form-urlencoded body и явным Cookie header. Возвращаем объект,
+    совместимый с текущими http_status_code/http_response_text.
     """
     query = str(query or "").strip()
     region = str(region or "").strip()
+
+    data = urllib.parse.urlencode({
+        "word": query,
+        "region": region,
+    }).encode("utf-8")
+
     headers = {
         "User-Agent": UA,
         "Accept-Language": "ru-RU,ru;q=0.9",
         "Accept": "text/html, */*; q=0.01",
         "X-Requested-With": "XMLHttpRequest",
         "Referer": "https://word-keeper.ru/core",
+        "Origin": "https://word-keeper.ru",
+        "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
     }
+
+    # Передаём cookies именно авторизованной requests.Session.
+    # Это повторяет старый рабочий способ WordKeeper TOP-30.
+    if not cookie_header:
+        cookie_parts = []
+        try:
+            for c in ajax_session.cookies:
+                name = str(getattr(c, "name", "") or "").strip()
+                value = str(getattr(c, "value", "") or "")
+                if name:
+                    cookie_parts.append(f"{name}={value}")
+        except Exception:
+            pass
+        cookie_header = "; ".join(cookie_parts)
+
     if cookie_header:
         headers["Cookie"] = cookie_header
 
-    return ajax_session.post(
+    req = urllib.request.Request(
         TOP30_WK,
-        data={"word": query, "region": region},
+        data=data,
         headers=headers,
-        timeout=120,
-        allow_redirects=False,
+        method="POST",
     )
+
+    try:
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            raw = resp.read()
+            charset = resp.headers.get_content_charset() or "utf-8"
+            body = raw.decode(charset, errors="replace")
+            return types.SimpleNamespace(
+                status_code=int(resp.status),
+                text=body,
+                url=str(resp.geturl()),
+                headers=dict(resp.headers.items()),
+            )
+    except urllib.error.HTTPError as e:
+        raw = e.read() if hasattr(e, "read") else b""
+        body = raw.decode("utf-8", errors="replace") if raw else ""
+        return types.SimpleNamespace(
+            status_code=int(e.code),
+            text=body,
+            url=str(getattr(e, "url", TOP30_WK)),
+            headers=dict(e.headers.items()) if getattr(e, "headers", None) else {},
+        )
 
 
 def wordkeeper_query_variants(category, value):
@@ -3490,7 +3537,7 @@ def migrate_legacy_file_for_section(src, dst, filename, res):
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("FE-RUS SEO Manager v1.25.6")
+        self.title("FE-RUS SEO Manager v1.25.7")
         self.geometry("1280x860")
         self.q = queue.Queue()
         self.res = None
@@ -4680,6 +4727,7 @@ class App(tk.Tk):
             if not login or not password:
                 raise RuntimeError("Заполните логин и пароль WordKeeper.")
             self.q.put(("wklog","WordKeeper: авторизация будет выполнена отдельно в каждом из 3 рабочих потоков..."))
+            self.q.put(("wklog","TOP-30: AJAX транспорт = urllib + явные cookies авторизованной сессии"))
 
             def make_authenticated_wk_session():
                 # ВАЖНО: не переносим cookies из одной login-сессии в отдельный
@@ -4844,7 +4892,7 @@ class App(tk.Tk):
                 if sess is None:
                     sess=make_authenticated_wk_session()
                     worker_local.session=sess
-                    self.q.put(("wklog",f"TOP-30: рабочий поток авторизован для запроса «{actual_query}»"))
+                    self.q.put(("wklog",f"TOP-30: рабочий поток авторизован (urllib AJAX) для запроса «{actual_query}»"))
                 rr=wordkeeper_ajax_post(sess, actual_query, region, "")
                 rr_status=http_status_code(rr)
                 rr_text=http_response_text(rr)
@@ -4866,6 +4914,16 @@ class App(tk.Tk):
                         empty_path=work_dir / "wordkeeper_empty_response.html"
                         if not empty_path.exists():
                             empty_path.write_text(rr_text,encoding="utf-8")
+                        meta_path=work_dir / "wordkeeper_empty_response_meta.txt"
+                        if not meta_path.exists():
+                            meta_path.write_text(
+                                f"query={actual_query}\n"
+                                f"region={region}\n"
+                                f"http={rr_status}\n"
+                                f"url={getattr(rr, 'url', '')}\n"
+                                f"transport=urllib\n",
+                                encoding="utf-8",
+                            )
                     except Exception:
                         pass
                 for rrow in rows:
