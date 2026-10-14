@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-FE-RUS SEO Manager v1.25.4
+FE-RUS SEO Manager v1.25.5
 
 Единое Windows-приложение:
 1. Категория - получает category_id, OCFilter options и значения.
@@ -3490,7 +3490,7 @@ def migrate_legacy_file_for_section(src, dst, filename, res):
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("FE-RUS SEO Manager v1.25.4")
+        self.title("FE-RUS SEO Manager v1.25.5")
         self.geometry("1280x860")
         self.q = queue.Queue()
         self.res = None
@@ -4919,28 +4919,32 @@ class App(tk.Tk):
             finally:
                 executor.shutdown(wait=not self.wk_stop_event.is_set(), cancel_futures=True)
 
-            pd.DataFrame(results).to_csv(out_path,index=False,encoding="utf-8-sig")
+            final_df=pd.DataFrame(results)
+            final_df.to_csv(out_path,index=False,encoding="utf-8-sig")
             progress_path.write_text(json.dumps({
                 "done_keywords":safe_sorted_strings(done),
                 "done_queries":safe_sorted_strings(done_queries),
                 "updated_at":time.strftime("%Y-%m-%d %H:%M:%S")
             },ensure_ascii=False,indent=2),encoding="utf-8")
-            # TOP-30 считается завершённым сразу после локального сохранения.
-            # Google Drive НЕ должен блокировать доступ к результату: его загрузка
-            # запускается отдельным daemon-потоком и может продолжаться в фоне.
+
+            # TOP-30 считается завершённым СРАЗУ после локального сохранения.
+            # Передаём уже готовый DataFrame в UI, чтобы финальный статус не
+            # зависел от повторного чтения CSV и не терялся из-за ошибки parser.
             section_id=str(self.cloud_section_id or "")
             section_name=str(self.cloud_section_name or cloud_section_name_from_result(self.res) or "")
             local_dir=Path(work_dir)
             cloud_files=["seo_top30_result.csv","seo_top30_progress.json","wordkeeper_error.log"]
+            self.wk_running=False
 
+            self.q.put(("wklog",f"TOP-30: локальный CSV сохранён: {out_path} | строк: {len(final_df)}"))
             if self.wk_stop_event.is_set():
-                payload={"path":out_path,"progress":progress_path,"done":len(set(keywords) & done),"total":len(keywords)}
+                payload={"path":out_path,"progress":progress_path,"done":len(set(keywords) & done),"total":len(keywords),"df":final_df}
                 self.q.put(("wkstop",payload))
             else:
-                self.q.put(("wkdone",out_path))
+                self.q.put(("wkdone",{"path":out_path,"df":final_df}))
 
-            # Запускаем облачную синхронизацию ПОСЛЕ сообщения о готовности.
-            # Она больше не удерживает worker_wordkeeper и не мешает вкладке «Анализ».
+            # Облако запускаем ПОСЛЕ события готовности. Оно больше не блокирует
+            # TOP-30 и не влияет на доступность результата в UI.
             threading.Thread(
                 target=self.worker_cloud_push_background,
                 args=(local_dir, section_id, section_name, cloud_files),
@@ -4949,6 +4953,8 @@ class App(tk.Tk):
         except Exception as e:
             self.q.put(("wkerr",str(e)))
         finally:
+            # При любой ошибке/остановке поток не должен оставлять кнопку
+            # WordKeeper в состоянии «занято».
             self.wk_running=False
 
     def compare(self):
@@ -5989,12 +5995,46 @@ class App(tk.Tk):
                 elif t=="wkclouderror":
                     self.wklog.insert("end",f"Google Drive: ошибка фоновой синхронизации: {x.get('error','')}\n");self.wklog.see("end")
                 elif t=="wkdone":
-                    p=x; self.topdf=pd.read_csv(p,encoding="utf-8-sig") if Path(p).exists() and Path(p).stat().st_size else pd.DataFrame(); self.wkstatus.config(text=f"Готово: {Path(p).name} | строк: {len(self.topdf)}"); self.wk_start_btn.config(state="normal"); self.wk_stop_btn.config(state="disabled"); self.wklog.insert("end",f"\nФайл TOP-30: {p}\n")
+                    try:
+                        if isinstance(x,dict) and isinstance(x.get("df"),pd.DataFrame):
+                            self.topdf=x["df"]
+                            p=Path(x.get("path") or "")
+                        else:
+                            p=Path(x)
+                            self.topdf=pd.read_csv(p,encoding="utf-8-sig") if p.exists() and p.stat().st_size else pd.DataFrame()
+                        self.wkstatus.config(text=f"Готово: {p.name} | строк: {len(self.topdf)}")
+                        self.wk_start_btn.config(state="normal")
+                        self.wk_stop_btn.config(state="disabled")
+                        self.wklog.insert("end",f"\nTOP-30 ГОТОВ. Файл: {p}\nСтрок загружено в анализ: {len(self.topdf)}\n")
+                        self.wklog.see("end")
+                    except Exception as e:
+                        # Даже если UI не смог прочитать CSV, не оставляем
+                        # WordKeeper в вечном состоянии «идёт».
+                        self.wk_start_btn.config(state="normal")
+                        self.wk_stop_btn.config(state="disabled")
+                        self.wkstatus.config(text="TOP-30 сохранён локально, но UI не смог загрузить CSV")
+                        self.wklog.insert("end",f"\nTOP-30 СОХРАНЁН, но загрузка в UI завершилась ошибкой: {e}\n")
+                        self.wklog.see("end")
                 elif t=="wkstop":
-                    p=x["path"]; self.topdf=pd.read_csv(p,encoding="utf-8-sig") if Path(p).exists() and Path(p).stat().st_size else pd.DataFrame(); self.wkstatus.config(text=f"ОСТАНОВЛЕНО: {len(self.topdf)} строк | {Path(p).name}"); self.wk_start_btn.config(state="normal"); self.wk_stop_btn.config(state="disabled"); self.wklog.insert("end",f"\nАНАЛИЗ ОСТАНОВЛЕН.\nTOP-30: {p}\nCheckpoint: {x['progress']}\nЗавершено запросов: {x['done']} из {x['total']}\nМожно нажать ПОЛУЧИТЬ TOP-30 снова - продолжит с последнего сохранённого запроса.\n")
-                    if x.get("cloud_sync_error"):
-                        self.wklog.insert("end",f"ОБЛАЧНАЯ СИНХРОНИЗАЦИЯ НЕ ВЫПОЛНЕНА: {x['cloud_sync_error']}\n")
-                    self.wklog.see("end")
+                    try:
+                        p=Path(x["path"])
+                        if isinstance(x,dict) and isinstance(x.get("df"),pd.DataFrame):
+                            self.topdf=x["df"]
+                        else:
+                            self.topdf=pd.read_csv(p,encoding="utf-8-sig") if p.exists() and p.stat().st_size else pd.DataFrame()
+                        self.wkstatus.config(text=f"ОСТАНОВЛЕНО: {len(self.topdf)} строк | {p.name}")
+                        self.wk_start_btn.config(state="normal")
+                        self.wk_stop_btn.config(state="disabled")
+                        self.wklog.insert("end",f"\nАНАЛИЗ ОСТАНОВЛЕН.\nTOP-30: {p}\nCheckpoint: {x['progress']}\nЗавершено запросов: {x['done']} из {x['total']}\nМожно нажать ПОЛУЧИТЬ TOP-30 снова - продолжит с последнего сохранённого запроса.\n")
+                        if x.get("cloud_sync_error"):
+                            self.wklog.insert("end",f"ОБЛАЧНАЯ СИНХРОНИЗАЦИЯ НЕ ВЫПОЛНЕНА: {x['cloud_sync_error']}\n")
+                        self.wklog.see("end")
+                    except Exception as e:
+                        self.wk_start_btn.config(state="normal")
+                        self.wk_stop_btn.config(state="disabled")
+                        self.wkstatus.config(text="TOP-30 остановлен")
+                        self.wklog.insert("end",f"\nTOP-30 остановлен. Ошибка отображения результата: {e}\n")
+                        self.wklog.see("end")
                 elif t=="wkdoneclouderror":
                     p=x["path"]
                     self.topdf=pd.read_csv(p,encoding="utf-8-sig") if Path(p).exists() and Path(p).stat().st_size else pd.DataFrame()
@@ -6088,7 +6128,17 @@ class App(tk.Tk):
                     self.oclog.insert("end",f"\nОШИБКА: {x}\n")
                     self.oclog.see("end")
                     messagebox.showerror("OCFilter",x)
-        except queue.Empty:pass
+        except queue.Empty:
+            pass
+        except Exception as e:
+            # Ошибка одного сообщения очереди не должна навсегда остановить
+            # обработку следующих событий UI.
+            try:
+                if hasattr(self, "wklog"):
+                    self.wklog.insert("end", f"\nОШИБКА UI-очереди: {e}\n")
+                    self.wklog.see("end")
+            except Exception:
+                pass
         self.after(100,self.poll)
 
 
