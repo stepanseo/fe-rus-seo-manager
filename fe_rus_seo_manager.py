@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-FE-RUS SEO Manager v1.25.2
+FE-RUS SEO Manager v1.25.3
 
 Единое Windows-приложение:
 1. Категория - получает category_id, OCFilter options и значения.
@@ -4143,18 +4143,23 @@ class App(tk.Tk):
         if info is False:
             raise RuntimeError("Не удалось подключить облачный раздел.")
 
-    def cloud_push_current_files(self,filenames=None):
-        if not self.res:
-            return
+    def cloud_push_section_files(self, local_dir, section_id, section_name, filenames=None):
+        """Загружает файлы конкретного облачного раздела.
+
+        Важно: метод не использует self.res/self.folder, поэтому его безопасно
+        запускать в фоне после завершения TOP-30 — пользователь уже может
+        переходить к анализу или другому разделу.
+        """
         cfg=load_cfg()
         endpoint=str(cfg.get("cloud_csv_webapp_url","") or "").strip()
         token=str(cfg.get("cloud_csv_token","") or "").strip()
         if not endpoint or not token:
             return
-        section_name=self.cloud_section_name or cloud_section_name_from_result(self.res)
+        section_name=str(section_name or "").strip()
         if not section_name:
             return
-        local_dir=cloud_cache_dir(self.cloud_section_id) if self.cloud_section_id else Path(self.folder.get() or os.getcwd())
+        local_dir=Path(local_dir)
+        section_id=str(section_id or "").strip()
         selected=list(filenames or CLOUD_SECTION_FILES)
         upload_files={}
         for filename in selected:
@@ -4172,7 +4177,7 @@ class App(tk.Tk):
             endpoint, token, section_name,
             download_files=[], upload_files=upload_files, timeout=900
         )
-        manifest=load_cloud_manifest(self.cloud_section_id) if self.cloud_section_id else {}
+        manifest=load_cloud_manifest(section_id) if section_id else {}
         for item in (data.get("uploaded") or []):
             filename=str(item.get("file_name") or "")
             if filename in selected:
@@ -4181,8 +4186,33 @@ class App(tk.Tk):
                     "bytes":int(item.get("bytes") or 0),
                     "updated_ms":int(item.get("updated_ms") or 0),
                 }
-        if self.cloud_section_id:
-            save_cloud_manifest(self.cloud_section_id, manifest)
+        if section_id:
+            save_cloud_manifest(section_id, manifest)
+
+    def cloud_push_current_files(self,filenames=None):
+        if not self.res:
+            return
+        section_name=self.cloud_section_name or cloud_section_name_from_result(self.res)
+        local_dir=cloud_cache_dir(self.cloud_section_id) if self.cloud_section_id else Path(self.folder.get() or os.getcwd())
+        self.cloud_push_section_files(
+            local_dir, self.cloud_section_id, section_name, filenames
+        )
+
+    def worker_cloud_push_background(self, local_dir, section_id, section_name, filenames):
+        """Фоновая загрузка файлов в Google Drive без блокировки TOP-30."""
+        try:
+            self.q.put(("wkcloudlog", "Google Drive: фоновая синхронизация TOP-30 запущена..."))
+            self.cloud_push_section_files(local_dir, section_id, section_name, filenames)
+            self.q.put(("wkcloudready", {
+                "section": str(section_name or ""),
+                "folder": str(local_dir),
+            }))
+        except Exception as e:
+            self.q.put(("wkclouderror", {
+                "section": str(section_name or ""),
+                "folder": str(local_dir),
+                "error": str(e),
+            }))
 
     def analyze_category(self):
         # Важно: пользователь мог снять характеристики и сразу нажать кнопку.
@@ -4880,21 +4910,27 @@ class App(tk.Tk):
                 "done_queries":safe_sorted_strings(done_queries),
                 "updated_at":time.strftime("%Y-%m-%d %H:%M:%S")
             },ensure_ascii=False,indent=2),encoding="utf-8")
-            try:
-                self.cloud_push_current_files(["seo_top30_result.csv","seo_top30_progress.json","wordkeeper_error.log"])
-                cloud_sync_error = ""
-            except Exception as e:
-                cloud_sync_error = str(e)
+            # TOP-30 считается завершённым сразу после локального сохранения.
+            # Google Drive НЕ должен блокировать доступ к результату: его загрузка
+            # запускается отдельным daemon-потоком и может продолжаться в фоне.
+            section_id=str(self.cloud_section_id or "")
+            section_name=str(self.cloud_section_name or cloud_section_name_from_result(self.res) or "")
+            local_dir=Path(work_dir)
+            cloud_files=["seo_top30_result.csv","seo_top30_progress.json","wordkeeper_error.log"]
 
             if self.wk_stop_event.is_set():
                 payload={"path":out_path,"progress":progress_path,"done":len(set(keywords) & done),"total":len(keywords)}
-                if cloud_sync_error:
-                    payload["cloud_sync_error"]=cloud_sync_error
                 self.q.put(("wkstop",payload))
-            elif cloud_sync_error:
-                self.q.put(("wkdoneclouderror",{"path":out_path,"error":cloud_sync_error}))
             else:
                 self.q.put(("wkdone",out_path))
+
+            # Запускаем облачную синхронизацию ПОСЛЕ сообщения о готовности.
+            # Она больше не удерживает worker_wordkeeper и не мешает вкладке «Анализ».
+            threading.Thread(
+                target=self.worker_cloud_push_background,
+                args=(local_dir, section_id, section_name, cloud_files),
+                daemon=True,
+            ).start()
         except Exception as e:
             self.q.put(("wkerr",str(e)))
         finally:
@@ -5929,6 +5965,14 @@ class App(tk.Tk):
                     self.wklog.insert("end",f"ОШИБКА МИГРАЦИИ: {x}\n"); self.wklog.see("end")
                     messagebox.showerror("Миграция TOP-30",str(x))
                 elif t=="wklog":self.wklog.insert("end",str(x)+"\n");self.wklog.see("end")
+                elif t=="wkcloudlog":
+                    self.wklog.insert("end",str(x)+"\n");self.wklog.see("end")
+                elif t=="wkcloudready":
+                    self.wklog.insert("end",f"Google Drive: фоновая синхронизация завершена для раздела «{x.get('section','')}».\n");self.wklog.see("end")
+                    if hasattr(self,"cloud_status") and x.get("section") == self.cloud_section_name:
+                        self.cloud_status.config(text=f"Облако: {x.get('section','готово')}")
+                elif t=="wkclouderror":
+                    self.wklog.insert("end",f"Google Drive: ошибка фоновой синхронизации: {x.get('error','')}\n");self.wklog.see("end")
                 elif t=="wkdone":
                     p=x; self.topdf=pd.read_csv(p,encoding="utf-8-sig") if Path(p).exists() and Path(p).stat().st_size else pd.DataFrame(); self.wkstatus.config(text=f"Готово: {Path(p).name} | строк: {len(self.topdf)}"); self.wk_start_btn.config(state="normal"); self.wk_stop_btn.config(state="disabled"); self.wklog.insert("end",f"\nФайл TOP-30: {p}\n")
                 elif t=="wkstop":
